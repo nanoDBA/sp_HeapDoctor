@@ -195,6 +195,55 @@ END
 ELSE
     RAISERROR(N'  *** FAIL 3A-8: HEAP_REBUILD_END missing or no StopReason in ExtendedInfo.', 10, 1) WITH NOWAIT;
 
+-- 3A-9: Per-rebuild entries should have DatabaseName, SchemaName, ObjectName populated
+DECLARE @3a_missing_names int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND (DatabaseName IS NULL OR SchemaName IS NULL OR ObjectName IS NULL)
+);
+IF @3a_missing_names = 0
+    RAISERROR(N'  PASS 3A-9: All rebuild entries have DatabaseName, SchemaName, ObjectName populated.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3a_msg8 nvarchar(200) = N'  *** FAIL 3A-9: ' + CAST(@3a_missing_names AS nvarchar(10)) + N' entries missing name columns.';
+    RAISERROR(@3a_msg8, 10, 1) WITH NOWAIT;
+END
+
+-- 3A-10: CommandLog entries should be in chronological order
+DECLARE @3a_order_bad int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog cl1
+    INNER JOIN dbo.CommandLog cl2
+        ON cl1.ID < cl2.ID
+       AND cl1.StartTime > cl2.StartTime
+    WHERE cl1.CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND cl2.CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+);
+IF @3a_order_bad = 0
+    RAISERROR(N'  PASS 3A-10: CommandLog entries in chronological order.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3a_msg9 nvarchar(200) = N'  *** FAIL 3A-10: ' + CAST(@3a_order_bad AS nvarchar(10)) + N' entry pairs out of chronological order.';
+    RAISERROR(@3a_msg9, 10, 1) WITH NOWAIT;
+END
+
+-- 3A-11: Per-rebuild Command should contain actual SQL (ALTER TABLE or CREATE CLUSTERED INDEX)
+DECLARE @3a_bad_cmds int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND Command NOT LIKE 'ALTER TABLE%'
+      AND Command NOT LIKE 'CREATE CLUSTERED INDEX%'
+);
+IF @3a_bad_cmds = 0
+    RAISERROR(N'  PASS 3A-11: All rebuild commands are ALTER TABLE or CREATE CLUSTERED INDEX.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3a_msg10 nvarchar(200) = N'  *** FAIL 3A-11: ' + CAST(@3a_bad_cmds AS nvarchar(10)) + N' commands have unexpected syntax.';
+    RAISERROR(@3a_msg10, 10, 1) WITH NOWAIT;
+END
+
 -- Display CommandLog for manual review
 RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'CommandLog entries (manual review):', 10, 1) WITH NOWAIT;
@@ -349,6 +398,95 @@ ELSE
 -- Note: On fast hardware, all 3 rebuilds may complete in < 1 second. That's OK.
 -- The test validates the code path runs without error.
 RAISERROR(N'  INFO 3C: On fast hardware, no targets may be skipped. That is expected.', 10, 1) WITH NOWAIT;
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 3D: SKIPPED targets logged to CommandLog (@MaxRunSeconds=0)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Re-create forwarded records so we have targets
+TRUNCATE TABLE dbo.HeapA;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapA (ID, Padding, MoreData)
+SELECT TOP (20000) n, REPLICATE('A', 10), NULL FROM N;
+UPDATE dbo.HeapA SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+
+TRUNCATE TABLE dbo.HeapB;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapB (ID, Code, Padding, MoreData)
+SELECT TOP (20000) n, 'CODE-' + CAST(n AS varchar(10)), REPLICATE('B', 10), NULL FROM N;
+UPDATE dbo.HeapB SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+
+TRUNCATE TABLE dbo.CommandLog;
+GO
+
+-- @MaxRunSeconds=0 forces immediate timeout; all targets should be SKIPPED
+EXEC dbo.sp_HeapDoctor
+    @CpuSource     = 'NONE',
+    @PlanOnly      = 0,
+    @MaxRunSeconds = 0,
+    @LogToTable    = N'Y';
+GO
+
+-- 3D-1: CommandLog should have SKIPPED entries
+DECLARE @3d_skipped int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE ErrorMessage LIKE '%SKIPPED%'
+);
+
+IF @3d_skipped >= 1
+BEGIN
+    DECLARE @3d_msg1 nvarchar(200) = N'  PASS 3D-1: ' + CAST(@3d_skipped AS nvarchar(10)) + N' SKIPPED entries found in CommandLog.';
+    RAISERROR(@3d_msg1, 10, 1) WITH NOWAIT;
+END
+ELSE
+    RAISERROR(N'  *** FAIL 3D-1: No SKIPPED entries in CommandLog when @MaxRunSeconds=0.', 10, 1) WITH NOWAIT;
+
+-- 3D-2: SKIPPED entries should have ExtendedInfo with PageCount
+DECLARE @3d_with_info int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE ErrorMessage LIKE '%SKIPPED%'
+      AND ExtendedInfo IS NOT NULL
+      AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%PageCount%'
+);
+
+IF @3d_with_info >= 1
+    RAISERROR(N'  PASS 3D-2: SKIPPED entries have ExtendedInfo with PageCount.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 3D-2: SKIPPED entries missing or incomplete ExtendedInfo.', 10, 1) WITH NOWAIT;
+
+-- 3D-3: No actual rebuilds should have happened (all skipped)
+DECLARE @3d_rebuilt int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ErrorMessage NOT LIKE '%SKIPPED%'
+);
+
+IF @3d_rebuilt = 0
+    RAISERROR(N'  PASS 3D-3: No actual rebuilds executed (all targets skipped as expected).', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3d_msg3 nvarchar(200) = N'  *** FAIL 3D-3: ' + CAST(@3d_rebuilt AS nvarchar(10)) + N' targets were rebuilt despite @MaxRunSeconds=0.';
+    RAISERROR(@3d_msg3, 10, 1) WITH NOWAIT;
+END
+
+-- 3D-4: HEAP_REBUILD_END should have StopReason = TIME_LIMIT or similar
+DECLARE @3d_stop nvarchar(100);
+SELECT @3d_stop = ExtendedInfo.value('(/Summary/StopReason)[1]', 'nvarchar(100)')
+FROM dbo.CommandLog
+WHERE CommandType = 'HEAP_REBUILD_END';
+
+IF @3d_stop IS NOT NULL
+BEGIN
+    DECLARE @3d_msg4 nvarchar(200) = N'  PASS 3D-4: StopReason = ' + @3d_stop;
+    RAISERROR(@3d_msg4, 10, 1) WITH NOWAIT;
+END
+ELSE
+    RAISERROR(N'  *** FAIL 3D-4: HEAP_REBUILD_END missing or no StopReason.', 10, 1) WITH NOWAIT;
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;

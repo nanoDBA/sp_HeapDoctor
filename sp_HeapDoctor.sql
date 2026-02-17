@@ -50,9 +50,13 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.2.2026.0216
+Version:    1.3.2026.0216
 
-History:    1.2.2026.0216 - Test-driven bug fixes
+History:    1.3.2026.0216 - Input validation, SKIPPED logging, test hardening
+                          - @LockTimeoutMs and @MaxRunSeconds reject negative values
+                          - ExecLog output ordered by start_time (not target_id)
+                          - SKIPPED targets (from @MaxRunSeconds) logged to CommandLog with ExtendedInfo
+            1.2.2026.0216 - Test-driven bug fixes
                           - @Debug parameter now functional (database list, target details)
                           - @OnlinePreference='ON' warns when edition forces offline fallback
                           - SizeMB in CommandLog ExtendedInfo uses decimal instead of integer division
@@ -293,7 +297,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.2.2026.0216';
+    DECLARE @Version nvarchar(20) = N'1.3.2026.0216';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -375,6 +379,18 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
     IF @Maxdop IS NOT NULL AND @Maxdop < 0
     BEGIN
         RAISERROR(N'@Maxdop cannot be negative.', 16, 1);
+        RETURN;
+    END
+
+    IF @LockTimeoutMs IS NOT NULL AND @LockTimeoutMs < 0
+    BEGIN
+        RAISERROR(N'@LockTimeoutMs cannot be negative. Use NULL for no timeout.', 16, 1);
+        RETURN;
+    END
+
+    IF @MaxRunSeconds IS NOT NULL AND @MaxRunSeconds < 0
+    BEGIN
+        RAISERROR(N'@MaxRunSeconds cannot be negative.', 16, 1);
         RETURN;
     END
 

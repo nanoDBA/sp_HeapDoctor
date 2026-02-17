@@ -245,5 +245,35 @@ END CATCH
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4P: Negative @LockTimeoutMs', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @LockTimeoutMs = -1, @PlanOnly = 1;
+    RAISERROR(N'*** FAIL: Should have raised error for negative LockTimeoutMs ***', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4P nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4P, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4Q: Negative @MaxRunSeconds', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @MaxRunSeconds = -1, @PlanOnly = 1;
+    RAISERROR(N'*** FAIL: Should have raised error for negative MaxRunSeconds ***', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4Q nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4Q, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'Negative tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
 GO
