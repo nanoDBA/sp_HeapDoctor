@@ -50,9 +50,10 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.4.2026.0216
+Version:    1.5.2026.0216
 
-History:    1.4.2026.0216 - Lock timeout restore on failure, CI swap DROP MAXDOP
+History:    1.5.2026.0216 - CI swap DROP failure handling, lock timeout restore
+                          - CI swap DROP failure: skips post-rebuild verification, sets @post_fwd_count=0
                           - Lock timeout now restored in CATCH blocks (main rebuild + CI swap DROP)
                           - CI swap DROP INDEX now respects @Maxdop (was only on CREATE)
             1.3.2026.0216 - Input validation, SKIPPED logging, test hardening
@@ -300,7 +301,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.4.2026.0216';
+    DECLARE @Version nvarchar(20) = N'1.5.2026.0216';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -1337,7 +1338,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @err_number          int,
             @err_message         nvarchar(4000),
             @verify_sql          nvarchar(max),
-            @post_fwd_count      bigint;
+            @post_fwd_count      bigint,
+            @ci_drop_failed      bit;
 
         /*
         Build LOCK_TIMEOUT prefix/suffix to prepend/append to each command.
@@ -1509,6 +1511,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 We log success for the forwarded-record fix (the CREATE did the work)
                 but warn loudly so the DBA can manually drop the temp CI.
                 */
+                SET @ci_drop_failed = 0;
                 IF @ci_drop IS NOT NULL
                 BEGIN
                     SET @Msg = N'  Dropping temp clustered index on ' + @full + N'...';
@@ -1522,6 +1525,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END TRY
                     BEGIN CATCH
+                        SET @ci_drop_failed = 1;
+
                         SET @Msg = N'  WARNING: CI swap CREATE succeeded but DROP FAILED on ' + @full
                                  + N'. Error ' + CAST(ERROR_NUMBER() AS nvarchar(10))
                                  + N': ' + LEFT(ERROR_MESSAGE(), 300)
@@ -1540,30 +1545,42 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 /*
                 Post-rebuild verification: confirm forwarded records are gone.
                 Uses SAMPLED mode for speed. This is a spot-check, not a guarantee.
+                Skipped when CI swap DROP failed (table is now clustered, index_id = 1 not 0).
                 */
                 SET @post_fwd_count = NULL;
-                BEGIN TRY
-                    SET @verify_sql = N'SELECT @fwd_out = forwarded_record_count
-                        FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, ''SAMPLED'')
-                        WHERE index_id = 0;';
-                    EXEC sys.sp_executesql @verify_sql,
-                        N'@db_param sysname, @full_param nvarchar(512), @fwd_out bigint OUTPUT',
-                        @db_param = @db, @full_param = @full, @fwd_out = @post_fwd_count OUTPUT;
-                END TRY
-                BEGIN CATCH
-                    SET @post_fwd_count = NULL; -- verification failed, don't block
-                END CATCH
-
-                IF @post_fwd_count IS NOT NULL AND @post_fwd_count > 0
+                IF @ci_drop_failed = 1
                 BEGIN
-                    SET @Msg = N'  WARNING: Post-rebuild check found ' + CAST(@post_fwd_count AS nvarchar(20))
-                             + N' forwarded records still present on ' + @full + N'.';
+                    -- CI DROP failed; table is now clustered (index_id=1), not heap.
+                    -- Forwarded records are eliminated by the CREATE, but we can't verify via index_id=0.
+                    SET @Msg = N'  Skipping post-rebuild verification (table is now clustered due to DROP failure).';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    SET @post_fwd_count = 0; -- forwarded records ARE gone (CREATE eliminated them)
                 END
-                ELSE IF @post_fwd_count = 0
+                ELSE
                 BEGIN
-                    SET @Msg = N'  Verified: 0 forwarded records.';
-                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    BEGIN TRY
+                        SET @verify_sql = N'SELECT @fwd_out = forwarded_record_count
+                            FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, ''SAMPLED'')
+                            WHERE index_id = 0;';
+                        EXEC sys.sp_executesql @verify_sql,
+                            N'@db_param sysname, @full_param nvarchar(512), @fwd_out bigint OUTPUT',
+                            @db_param = @db, @full_param = @full, @fwd_out = @post_fwd_count OUTPUT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @post_fwd_count = NULL; -- verification failed, don't block
+                    END CATCH
+
+                    IF @post_fwd_count IS NOT NULL AND @post_fwd_count > 0
+                    BEGIN
+                        SET @Msg = N'  WARNING: Post-rebuild check found ' + CAST(@post_fwd_count AS nvarchar(20))
+                                 + N' forwarded records still present on ' + @full + N'.';
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END
+                    ELSE IF @post_fwd_count = 0
+                    BEGIN
+                        SET @Msg = N'  Verified: 0 forwarded records.';
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END
                 END
 
                 /*
