@@ -91,7 +91,7 @@ EXEC dbo.sp_HeapDoctor
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@OnlinePreference` | `'AUTO'` | `AUTO` (edition-based), `ON` (require), `OFF` (force offline) |
+| `@OnlinePreference` | `'AUTO'` | `AUTO` (edition-based), `ON` (prefer; falls back to offline with warning), `OFF` (force offline) |
 | `@AllowCiSwap` | `0` | Enable CI swap path |
 | `@PreferCiSwap` | `0` | Prefer CI swap when safe key exists + online allowed |
 
@@ -144,6 +144,7 @@ When `@LogToTable = 'Y'` and `dbo.CommandLog` exists:
 
 - **`HEAP_REBUILD_START`** - logged at run start with parameters XML
 - **Per-rebuild entries** - logged with `CommandType` = `HEAP_REBUILD_ONLINE` / `HEAP_REBUILD_OFFLINE` / `CI_SWAP_ONLINE`
+- **Skipped entries** - when `@MaxRunSeconds` is reached, remaining targets are logged with `ErrorMessage = 'SKIPPED: @MaxRunSeconds reached.'`
 - **`HEAP_REBUILD_END`** - logged at run end with summary XML (succeeded/failed/skipped counts)
 
 Each per-rebuild entry includes `ExtendedInfo` XML:
