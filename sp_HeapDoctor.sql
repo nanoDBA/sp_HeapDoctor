@@ -50,9 +50,17 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.5.2026.0216
+Version:    1.6.2026.0216
 
-History:    1.5.2026.0216 - CI swap DROP failure handling, lock timeout restore
+History:    1.6.2026.0216 - Remediation throughput estimation
+                          - @EstimateTime: historical + live rebuild time estimates per target
+                          - @EstimateLookbackDays: configurable CommandLog history window (days)
+                          - Historical throughput from CommandLog, grouped by rebuild type
+                          - Live calibration: accumulates actual rate during execution
+                          - est_pages_per_sec, est_seconds, est_duration in target output
+                          - Remaining time display during execution loop
+                          - TotalPagesRebuilt, AvgPagesPerSec in HEAP_REBUILD_END XML
+            1.5.2026.0216 - CI swap DROP failure handling, lock timeout restore
                           - CI swap DROP failure: skips post-rebuild verification, sets @post_fwd_count=0
                           - Lock timeout now restored in CATCH blocks (main rebuild + CI swap DROP)
                           - CI swap DROP INDEX now respects @Maxdop (was only on CREATE)
@@ -1342,7 +1350,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             WHERE est_pages_per_sec IS NOT NULL;
 
             UPDATE #Targets
-            SET est_duration = RIGHT('00' + CAST(est_seconds / 3600 AS varchar(10)), 2) + ':'
+            SET est_duration = CASE WHEN est_seconds / 3600 < 10
+                                    THEN '0' + CAST(est_seconds / 3600 AS varchar(10))
+                                    ELSE CAST(est_seconds / 3600 AS varchar(10))
+                               END + ':'
                              + RIGHT('00' + CAST((est_seconds % 3600) / 60 AS varchar(2)), 2) + ':'
                              + RIGHT('00' + CAST(est_seconds % 60 AS varchar(2)), 2)
             WHERE est_seconds IS NOT NULL;
@@ -1354,7 +1365,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IF @total_est_sec IS NOT NULL
             BEGIN
                 SET @Msg = N'EstimateTime: Total estimated remediation: '
-                         + RIGHT('00' + CAST(@total_est_sec / 3600 AS varchar(10)), 2) + ':'
+                         + CASE WHEN @total_est_sec / 3600 < 10
+                                THEN '0' + CAST(@total_est_sec / 3600 AS varchar(10))
+                                ELSE CAST(@total_est_sec / 3600 AS varchar(10))
+                           END + ':'
                          + RIGHT('00' + CAST((@total_est_sec % 3600) / 60 AS varchar(2)), 2) + ':'
                          + RIGHT('00' + CAST(@total_est_sec % 60 AS varchar(2)), 2)
                          + N' (' + CAST(@total_est_sec AS nvarchar(20)) + N's) based on '
@@ -1725,7 +1739,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         WHERE sort_order > @i;
 
                         UPDATE #Targets
-                        SET est_duration = RIGHT('00' + CAST(est_seconds / 3600 AS varchar(10)), 2) + ':'
+                        SET est_duration = CASE WHEN est_seconds / 3600 < 10
+                                                THEN '0' + CAST(est_seconds / 3600 AS varchar(10))
+                                                ELSE CAST(est_seconds / 3600 AS varchar(10))
+                                           END + ':'
                                          + RIGHT('00' + CAST((est_seconds % 3600) / 60 AS varchar(2)), 2) + ':'
                                          + RIGHT('00' + CAST(est_seconds % 60 AS varchar(2)), 2)
                         WHERE sort_order > @i AND est_seconds IS NOT NULL;
@@ -1739,7 +1756,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                             SET @Msg = N'  Live rate: ' + CAST(CAST(@live_pps AS int) AS nvarchar(20)) + N' pages/sec'
                                      + N'  |  Remaining: ~'
-                                     + RIGHT('00' + CAST(@remaining_est_sec / 3600 AS varchar(10)), 2) + ':'
+                                     + CASE WHEN @remaining_est_sec / 3600 < 10
+                                            THEN '0' + CAST(@remaining_est_sec / 3600 AS varchar(10))
+                                            ELSE CAST(@remaining_est_sec / 3600 AS varchar(10))
+                                       END + ':'
                                      + RIGHT('00' + CAST((@remaining_est_sec % 3600) / 60 AS varchar(2)), 2) + ':'
                                      + RIGHT('00' + CAST(@remaining_est_sec % 60 AS varchar(2)), 2);
                             RAISERROR(@Msg, 10, 1) WITH NOWAIT;

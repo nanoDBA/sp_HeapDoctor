@@ -495,13 +495,39 @@ RAISERROR(N' TEST 3E: @EstimateTime with CommandLog history', 10, 1) WITH NOWAIT
 RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
 
 /*
-  This test relies on CommandLog entries from TEST 3A/3B/3C/3D above.
-  We do NOT truncate CommandLog here - the history IS the test input.
-  Re-create forwarded records so there are targets, then run PlanOnly
-  with @EstimateTime=1 to verify estimates are populated from history.
+  This test needs CommandLog history with successful rebuilds.
+  Test 3D truncated CommandLog and only created SKIPPED entries (0ms duration,
+  filtered out by the >500ms threshold). So we must run a real rebuild first
+  to seed CommandLog with valid throughput data, then re-create forwarded
+  records and run PlanOnly with @EstimateTime=1 to verify estimates.
 */
 
--- Re-create forwarded records
+-- Step 1: Create forwarded records and run a real rebuild to seed CommandLog history
+TRUNCATE TABLE dbo.CommandLog;
+
+TRUNCATE TABLE dbo.HeapA;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapA (ID, Padding, MoreData)
+SELECT TOP (20000) n, REPLICATE('A', 10), NULL FROM N;
+UPDATE dbo.HeapA SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+
+TRUNCATE TABLE dbo.HeapB;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapB (ID, Code, Padding, MoreData)
+SELECT TOP (20000) n, 'CODE-' + CAST(n AS varchar(10)), REPLICATE('B', 10), NULL FROM N;
+UPDATE dbo.HeapB SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+GO
+
+RAISERROR(N'  3E-setup: Running real rebuild to seed CommandLog history...', 10, 1) WITH NOWAIT;
+
+EXEC dbo.sp_HeapDoctor
+    @CpuSource     = 'NONE',
+    @MinPages      = 1000,
+    @PlanOnly      = 0,
+    @LogToTable    = N'Y';
+GO
+
+-- Step 2: Re-create forwarded records so there are targets for the estimate test
 TRUNCATE TABLE dbo.HeapA;
 ;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
 INSERT dbo.HeapA (ID, Padding, MoreData)

@@ -362,6 +362,9 @@ RAISERROR(N'================================================================', 1
 RAISERROR(N' TEST 2I: PlanOnly, @EstimateTime=1 (no history)', 10, 1) WITH NOWAIT;
 RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
 
+-- Ensure no leftover CommandLog history from prior test runs
+TRUNCATE TABLE dbo.CommandLog;
+
 TRUNCATE TABLE #Results;
 INSERT #Results
 EXEC dbo.sp_HeapDoctor
