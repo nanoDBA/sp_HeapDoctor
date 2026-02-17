@@ -62,6 +62,12 @@ EXEC dbo.sp_HeapDoctor
     @PlanOnly      = 0,
     @MaxRunSeconds = 3600,
     @Maxdop        = 2;
+
+-- 5) Plan-only with time estimates (uses CommandLog history)
+EXEC dbo.sp_HeapDoctor
+    @Databases     = 'USER_DATABASES',
+    @EstimateTime  = 1,
+    @PlanOnly      = 1;
 ```
 
 ## Parameters
@@ -109,6 +115,8 @@ EXEC dbo.sp_HeapDoctor
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | `Y` = log to `dbo.CommandLog`, `N` = no logging |
+| `@EstimateTime` | `0` | Show estimated rebuild time per target based on CommandLog history and live calibration |
+| `@EstimateLookbackDays` | `90` | CommandLog history window for throughput rates (days) |
 | `@Debug` | `0` | Extra diagnostic output (database list, target details, environment info) |
 | `@Help` | `0` | Print parameter documentation and return |
 

@@ -44,7 +44,10 @@ CREATE TABLE #Results
     ranking_basis          varchar(20)   NOT NULL,
     nci_count              int           NOT NULL,
     key_source_index       sysname       NULL,
-    action_chosen          varchar(32)   NOT NULL
+    action_chosen          varchar(32)   NOT NULL,
+    est_pages_per_sec      float         NULL,
+    est_seconds            int           NULL,
+    est_duration           nvarchar(20)  NULL
 );
 GO
 
@@ -351,6 +354,48 @@ BEGIN
     DECLARE @2h_msg nvarchar(200) = N'  *** FAIL 2H-1: Expected >= 3 targets with @Debug=1, found ' + CAST(@2h_count AS nvarchar(10));
     RAISERROR(@2h_msg, 10, 1) WITH NOWAIT;
 END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 2I: PlanOnly, @EstimateTime=1 (no history)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @CpuSource     = 'NONE',
+    @EstimateTime  = 1,
+    @PlanOnly      = 1;
+
+-- 2I-1: Targets should still be found
+DECLARE @2i_count int = (SELECT COUNT(*) FROM #Results WHERE table_name IN ('HeapA','HeapB','HeapC'));
+IF @2i_count = 3
+    RAISERROR(N'  PASS 2I-1: Found all 3 expected heaps with @EstimateTime=1.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2i_msg nvarchar(200) = N'  *** FAIL 2I-1: Expected 3 heaps, found ' + CAST(@2i_count AS nvarchar(10));
+    RAISERROR(@2i_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 2I-2: est_pages_per_sec should be NULL (no CommandLog history)
+IF NOT EXISTS (SELECT 1 FROM #Results WHERE est_pages_per_sec IS NOT NULL)
+    RAISERROR(N'  PASS 2I-2: est_pages_per_sec is NULL (no history available).', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 2I-2: est_pages_per_sec should be NULL without CommandLog history.', 10, 1) WITH NOWAIT;
+
+-- 2I-3: est_seconds should be NULL
+IF NOT EXISTS (SELECT 1 FROM #Results WHERE est_seconds IS NOT NULL)
+    RAISERROR(N'  PASS 2I-3: est_seconds is NULL (no history available).', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 2I-3: est_seconds should be NULL without CommandLog history.', 10, 1) WITH NOWAIT;
+
+-- 2I-4: est_duration should be NULL
+IF NOT EXISTS (SELECT 1 FROM #Results WHERE est_duration IS NOT NULL)
+    RAISERROR(N'  PASS 2I-4: est_duration is NULL (no history available).', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 2I-4: est_duration should be NULL without CommandLog history.', 10, 1) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

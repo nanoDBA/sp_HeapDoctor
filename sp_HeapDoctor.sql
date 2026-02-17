@@ -295,13 +295,17 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @LogToTable              nvarchar(1)    = N'Y',            -- Y = log to dbo.CommandLog (current DB), N = no logging
 
     -- Output verbosity
-    @Debug                   bit            = 0
+    @Debug                   bit            = 0,
+
+    -- Throughput estimation
+    @EstimateTime            bit            = 0,               -- 1 = show estimated rebuild time per target
+    @EstimateLookbackDays    int            = 90               -- CommandLog history window for throughput rates
 )
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.5.2026.0216';
+    DECLARE @Version nvarchar(20) = N'1.6.2026.0216';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -341,6 +345,8 @@ PARAMETERS:
 
   @LogToTable        nvarchar(1) = Y   Y=log to dbo.CommandLog, N=no logging.
   @Debug             bit     = 0       Extra diagnostic output.
+  @EstimateTime      bit     = 0       Show estimated rebuild time per target.
+  @EstimateLookbackDays int  = 90      CommandLog history window for throughput rates (days).
 
 REQUIREMENTS: SQL Server 2017+ (STRING_AGG). Enterprise/Developer for ONLINE.
 COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pattern).
@@ -713,6 +719,9 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
         action_chosen            varchar(32)    NOT NULL,
         command_text             nvarchar(max)  NOT NULL,
         ci_drop_command          nvarchar(max)  NULL,
+        est_pages_per_sec        float          NULL,
+        est_seconds              int            NULL,
+        est_duration             nvarchar(20)   NULL,
         sort_order               int            NOT NULL DEFAULT 0
     );
 
@@ -1267,6 +1276,96 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     END
 
     ----------------------------------------------------------------------------
+    -- Throughput estimation (history-based)
+    ----------------------------------------------------------------------------
+    DECLARE @hist_online_pps    float = NULL;
+    DECLARE @hist_offline_pps   float = NULL;
+    DECLARE @hist_ciswap_pps    float = NULL;
+    DECLARE @hist_any_pps       float = NULL;
+    DECLARE @hist_source        varchar(20) = 'NONE';
+
+    IF @EstimateTime = 1 AND @commandlog_exists = 1
+    BEGIN
+        ;WITH HistRates AS
+        (
+            SELECT
+                CommandType,
+                AVG(
+                    CAST(ExtendedInfo.value('(/ExtendedInfo/PageCount)[1]', 'bigint') AS float)
+                    / NULLIF(DATEDIFF(MILLISECOND, StartTime, EndTime) / 1000.0, 0)
+                ) AS avg_pps,
+                COUNT(*) AS sample_count
+            FROM dbo.CommandLog
+            WHERE CommandType IN ('HEAP_REBUILD_ONLINE', 'HEAP_REBUILD_OFFLINE', 'CI_SWAP_ONLINE')
+              AND ISNULL(ErrorNumber, 0) = 0
+              AND EndTime IS NOT NULL
+              AND DATEDIFF(MILLISECOND, StartTime, EndTime) > 500
+              AND DATEDIFF(DAY, StartTime, SYSDATETIME()) <= @EstimateLookbackDays
+            GROUP BY CommandType
+        )
+        SELECT
+            @hist_online_pps  = MAX(CASE WHEN CommandType = 'HEAP_REBUILD_ONLINE'  THEN avg_pps END),
+            @hist_offline_pps = MAX(CASE WHEN CommandType = 'HEAP_REBUILD_OFFLINE' THEN avg_pps END),
+            @hist_ciswap_pps  = MAX(CASE WHEN CommandType = 'CI_SWAP_ONLINE'       THEN avg_pps END),
+            @hist_any_pps     = AVG(avg_pps)
+        FROM HistRates;
+
+        IF @hist_any_pps IS NOT NULL
+            SET @hist_source = 'HISTORY';
+    END
+
+    IF @EstimateTime = 1
+    BEGIN
+        IF @hist_source = 'NONE'
+        BEGIN
+            RAISERROR(N'EstimateTime: No historical rebuild data found in CommandLog. Estimates unavailable until first execution with @LogToTable=''Y''.', 10, 1) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            SET @Msg = N'EstimateTime: Historical throughput (pages/sec):'
+                     + CASE WHEN @hist_online_pps  IS NOT NULL THEN N'  ONLINE='  + CAST(CAST(@hist_online_pps  AS int) AS nvarchar(20)) ELSE N'' END
+                     + CASE WHEN @hist_offline_pps IS NOT NULL THEN N'  OFFLINE=' + CAST(CAST(@hist_offline_pps AS int) AS nvarchar(20)) ELSE N'' END
+                     + CASE WHEN @hist_ciswap_pps  IS NOT NULL THEN N'  CI_SWAP=' + CAST(CAST(@hist_ciswap_pps  AS int) AS nvarchar(20)) ELSE N'' END;
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+            -- Populate estimate columns on #Targets
+            UPDATE #Targets
+            SET est_pages_per_sec = CASE action_chosen
+                    WHEN 'HEAP_REBUILD_ONLINE'  THEN COALESCE(@hist_online_pps,  @hist_any_pps)
+                    WHEN 'HEAP_REBUILD_OFFLINE' THEN COALESCE(@hist_offline_pps, @hist_any_pps)
+                    WHEN 'CI_SWAP_ONLINE'       THEN COALESCE(@hist_ciswap_pps,  @hist_any_pps)
+                    ELSE @hist_any_pps
+                END;
+
+            UPDATE #Targets
+            SET est_seconds = CEILING(page_count / NULLIF(est_pages_per_sec, 0))
+            WHERE est_pages_per_sec IS NOT NULL;
+
+            UPDATE #Targets
+            SET est_duration = RIGHT('00' + CAST(est_seconds / 3600 AS varchar(10)), 2) + ':'
+                             + RIGHT('00' + CAST((est_seconds % 3600) / 60 AS varchar(2)), 2) + ':'
+                             + RIGHT('00' + CAST(est_seconds % 60 AS varchar(2)), 2)
+            WHERE est_seconds IS NOT NULL;
+
+            -- Print total estimate summary
+            DECLARE @total_est_sec int;
+            SELECT @total_est_sec = SUM(est_seconds) FROM #Targets WHERE est_seconds IS NOT NULL;
+
+            IF @total_est_sec IS NOT NULL
+            BEGIN
+                SET @Msg = N'EstimateTime: Total estimated remediation: '
+                         + RIGHT('00' + CAST(@total_est_sec / 3600 AS varchar(10)), 2) + ':'
+                         + RIGHT('00' + CAST((@total_est_sec % 3600) / 60 AS varchar(2)), 2) + ':'
+                         + RIGHT('00' + CAST(@total_est_sec % 60 AS varchar(2)), 2)
+                         + N' (' + CAST(@total_est_sec AS nvarchar(20)) + N's) based on '
+                         + CAST(@EstimateLookbackDays AS nvarchar(10)) + N'-day history';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+        END
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+    END
+
+    ----------------------------------------------------------------------------
     -- Output: target list (always shown)
     ----------------------------------------------------------------------------
     SELECT
@@ -1284,7 +1383,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         ranking_basis,
         nci_count,
         key_source_index,
-        action_chosen
+        action_chosen,
+        est_pages_per_sec,
+        est_seconds,
+        est_duration
     FROM #Targets
     ORDER BY sort_order;
 
@@ -1339,7 +1441,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @err_message         nvarchar(4000),
             @verify_sql          nvarchar(max),
             @post_fwd_count      bigint,
-            @ci_drop_failed      bit;
+            @ci_drop_failed      bit,
+            -- Live calibration for throughput estimation
+            @live_pages_rebuilt   bigint = 0,
+            @live_elapsed_ms     bigint = 0,
+            @live_pps            float  = NULL,
+            @remaining_pages     bigint,
+            @remaining_est_sec   int,
+            @rebuild_elapsed_ms  bigint;
 
         /*
         Build LOCK_TIMEOUT prefix/suffix to prepend/append to each command.
@@ -1481,6 +1590,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             */
             SET @Msg = N'[' + CAST(@succeeded_cnt + @failed_cnt + 1 AS nvarchar(10)) + N'/' + CAST(@TargetCount AS nvarchar(10)) + N'] '
                      + @action + N' on ' + @full;
+
+            -- Append per-target estimate if available
+            IF @EstimateTime = 1
+            BEGIN
+                SET @remaining_est_sec = NULL;
+                SELECT @remaining_est_sec = est_seconds FROM #Targets WHERE target_id = @tid;
+
+                IF @remaining_est_sec IS NOT NULL
+                    SET @Msg = @Msg + N'  (est: ' + CAST(@remaining_est_sec AS nvarchar(10)) + N's)';
+            END
+
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
             SET @start = SYSDATETIME();
@@ -1584,6 +1704,50 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 END
 
                 /*
+                Live calibration: accumulate throughput data from this rebuild.
+                Only counts rebuilds that took > 500ms (sub-500ms are too fast for meaningful rate).
+                */
+                IF @EstimateTime = 1
+                BEGIN
+                    SET @rebuild_elapsed_ms = DATEDIFF(MILLISECOND, @start, @end);
+
+                    IF @rebuild_elapsed_ms > 500
+                    BEGIN
+                        SET @live_pages_rebuilt += @cur_page_count;
+                        SET @live_elapsed_ms   += @rebuild_elapsed_ms;
+                        SET @live_pps = CAST(@live_pages_rebuilt AS float)
+                                      / NULLIF(@live_elapsed_ms / 1000.0, 0);
+
+                        -- Update remaining targets with live rate
+                        UPDATE #Targets
+                        SET est_pages_per_sec = @live_pps,
+                            est_seconds       = CEILING(page_count / NULLIF(@live_pps, 0))
+                        WHERE sort_order > @i;
+
+                        UPDATE #Targets
+                        SET est_duration = RIGHT('00' + CAST(est_seconds / 3600 AS varchar(10)), 2) + ':'
+                                         + RIGHT('00' + CAST((est_seconds % 3600) / 60 AS varchar(2)), 2) + ':'
+                                         + RIGHT('00' + CAST(est_seconds % 60 AS varchar(2)), 2)
+                        WHERE sort_order > @i AND est_seconds IS NOT NULL;
+
+                        -- Compute and display remaining time estimate
+                        SELECT @remaining_pages = SUM(page_count) FROM #Targets WHERE sort_order > @i;
+
+                        IF @remaining_pages IS NOT NULL AND @remaining_pages > 0
+                        BEGIN
+                            SET @remaining_est_sec = CEILING(@remaining_pages / NULLIF(@live_pps, 0));
+
+                            SET @Msg = N'  Live rate: ' + CAST(CAST(@live_pps AS int) AS nvarchar(20)) + N' pages/sec'
+                                     + N'  |  Remaining: ~'
+                                     + RIGHT('00' + CAST(@remaining_est_sec / 3600 AS varchar(10)), 2) + ':'
+                                     + RIGHT('00' + CAST((@remaining_est_sec % 3600) / 60 AS varchar(2)), 2) + ':'
+                                     + RIGHT('00' + CAST(@remaining_est_sec % 60 AS varchar(2)), 2);
+                            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                        END
+                    END
+                END
+
+                /*
                 Log success to CommandLog
                 */
                 IF @commandlog_exists = 1
@@ -1668,7 +1832,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                  + CASE WHEN @discovery_errors > 0
                         THEN N'  ScanErrors: ' + CAST(@discovery_errors AS nvarchar(10))
                         ELSE N'' END
-                 + N'  Elapsed: ' + CAST(DATEDIFF(SECOND, @RunStart, SYSDATETIME()) AS nvarchar(10)) + N's';
+                 + N'  Elapsed: ' + CAST(DATEDIFF(SECOND, @RunStart, SYSDATETIME()) AS nvarchar(10)) + N's'
+                 + CASE WHEN @EstimateTime = 1 AND @live_pps IS NOT NULL
+                        THEN N'  AvgRate: ' + CAST(CAST(@live_pps AS int) AS nvarchar(20)) + N' pages/sec'
+                        ELSE N'' END;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
 
@@ -1705,7 +1872,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             WHEN @discovery_errors > 0 THEN N'COMPLETED_WITH_SCAN_ERRORS'
                             WHEN @skipped_cnt > 0 THEN N'COMPLETED_WITH_SKIPS'
                             ELSE N'SUCCESS'
-                        END AS StopReason
+                        END AS StopReason,
+                        CASE WHEN @EstimateTime = 1 THEN @live_pages_rebuilt END AS TotalPagesRebuilt,
+                        CASE WHEN @EstimateTime = 1 THEN CAST(@live_pps AS int) END AS AvgPagesPerSec
                     FOR XML RAW(N'Summary'), ELEMENTS
                 )
             );

@@ -490,5 +490,106 @@ ELSE
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 3E: @EstimateTime with CommandLog history', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+/*
+  This test relies on CommandLog entries from TEST 3A/3B/3C/3D above.
+  We do NOT truncate CommandLog here - the history IS the test input.
+  Re-create forwarded records so there are targets, then run PlanOnly
+  with @EstimateTime=1 to verify estimates are populated from history.
+*/
+
+-- Re-create forwarded records
+TRUNCATE TABLE dbo.HeapA;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapA (ID, Padding, MoreData)
+SELECT TOP (20000) n, REPLICATE('A', 10), NULL FROM N;
+UPDATE dbo.HeapA SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+
+TRUNCATE TABLE dbo.HeapB;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapB (ID, Code, Padding, MoreData)
+SELECT TOP (20000) n, 'CODE-' + CAST(n AS varchar(10)), REPLICATE('B', 10), NULL FROM N;
+UPDATE dbo.HeapB SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+GO
+
+-- Capture result set with @EstimateTime=1
+IF OBJECT_ID('tempdb..#Est') IS NOT NULL DROP TABLE #Est;
+CREATE TABLE #Est
+(
+    version                nvarchar(20)  NULL,
+    target_id              int           NOT NULL,
+    sort_order             int           NOT NULL,
+    database_name          sysname       NOT NULL,
+    schema_name            sysname       NOT NULL,
+    table_name             sysname       NOT NULL,
+    page_count             bigint        NOT NULL,
+    record_count           bigint        NULL,
+    forwarded_record_count bigint        NOT NULL,
+    forwarded_pct          decimal(6,2)  NOT NULL,
+    total_cpu_ms           bigint        NULL,
+    ranking_basis          varchar(20)   NOT NULL,
+    nci_count              int           NOT NULL,
+    key_source_index       sysname       NULL,
+    action_chosen          varchar(32)   NOT NULL,
+    est_pages_per_sec      float         NULL,
+    est_seconds            int           NULL,
+    est_duration           nvarchar(20)  NULL
+);
+
+INSERT #Est
+EXEC dbo.sp_HeapDoctor
+    @CpuSource     = 'NONE',
+    @EstimateTime  = 1,
+    @PlanOnly      = 1;
+GO
+
+-- 3E-1: est_pages_per_sec should be populated (history exists from earlier tests)
+DECLARE @3e_with_est int = (SELECT COUNT(*) FROM #Est WHERE est_pages_per_sec IS NOT NULL);
+IF @3e_with_est >= 1
+BEGIN
+    DECLARE @3e_msg1 nvarchar(200) = N'  PASS 3E-1: ' + CAST(@3e_with_est AS nvarchar(10)) + N' target(s) have est_pages_per_sec from CommandLog history.';
+    RAISERROR(@3e_msg1, 10, 1) WITH NOWAIT;
+END
+ELSE
+    RAISERROR(N'  *** FAIL 3E-1: est_pages_per_sec is NULL despite CommandLog history.', 10, 1) WITH NOWAIT;
+
+-- 3E-2: est_seconds should be populated where est_pages_per_sec is
+DECLARE @3e_with_sec int = (SELECT COUNT(*) FROM #Est WHERE est_seconds IS NOT NULL);
+IF @3e_with_sec >= 1
+    RAISERROR(N'  PASS 3E-2: est_seconds populated from history.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 3E-2: est_seconds is NULL despite having est_pages_per_sec.', 10, 1) WITH NOWAIT;
+
+-- 3E-3: est_duration should be in HH:MM:SS format
+DECLARE @3e_dur nvarchar(20) = (SELECT TOP 1 est_duration FROM #Est WHERE est_duration IS NOT NULL);
+IF @3e_dur IS NOT NULL AND @3e_dur LIKE '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+    RAISERROR(N'  PASS 3E-3: est_duration is in HH:MM:SS format.', 10, 1) WITH NOWAIT;
+ELSE IF @3e_dur IS NULL
+    RAISERROR(N'  *** FAIL 3E-3: est_duration is NULL despite having history.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3e_msg3 nvarchar(200) = N'  *** FAIL 3E-3: est_duration has unexpected format: ' + @3e_dur;
+    RAISERROR(@3e_msg3, 10, 1) WITH NOWAIT;
+END
+
+-- 3E-4: est_pages_per_sec should be > 0
+DECLARE @3e_bad_rate int = (SELECT COUNT(*) FROM #Est WHERE est_pages_per_sec IS NOT NULL AND est_pages_per_sec <= 0);
+IF @3e_bad_rate = 0
+    RAISERROR(N'  PASS 3E-4: All est_pages_per_sec values are > 0.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 3E-4: Some est_pages_per_sec values are <= 0.', 10, 1) WITH NOWAIT;
+
+-- Display estimates for manual review
+SELECT table_name, page_count, action_chosen, est_pages_per_sec, est_seconds, est_duration
+FROM #Est
+ORDER BY sort_order;
+
+IF OBJECT_ID('tempdb..#Est') IS NOT NULL DROP TABLE #Est;
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'Execution tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
 GO
