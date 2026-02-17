@@ -50,44 +50,9 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.6.2026.0216
+Version:    1.0.2026.0216
 
-History:    1.6.2026.0216 - Remediation throughput estimation
-                          - @EstimateTime: historical + live rebuild time estimates per target
-                          - @EstimateLookbackDays: configurable CommandLog history window (days)
-                          - Historical throughput from CommandLog, grouped by rebuild type
-                          - Live calibration: accumulates actual rate during execution
-                          - est_pages_per_sec, est_seconds, est_duration in target output
-                          - Remaining time display during execution loop
-                          - TotalPagesRebuilt, AvgPagesPerSec in HEAP_REBUILD_END XML
-            1.5.2026.0216 - CI swap DROP failure handling, lock timeout restore
-                          - CI swap DROP failure: skips post-rebuild verification, sets @post_fwd_count=0
-                          - Lock timeout now restored in CATCH blocks (main rebuild + CI swap DROP)
-                          - CI swap DROP INDEX now respects @Maxdop (was only on CREATE)
-            1.3.2026.0216 - Input validation, SKIPPED logging, test hardening
-                          - @LockTimeoutMs and @MaxRunSeconds reject negative values
-                          - ExecLog output ordered by start_time (not target_id)
-                          - SKIPPED targets (from @MaxRunSeconds) logged to CommandLog with ExtendedInfo
-            1.2.2026.0216 - Test-driven bug fixes
-                          - @Debug parameter now functional (database list, target details)
-                          - @OnlinePreference='ON' warns when edition forces offline fallback
-                          - SizeMB in CommandLog ExtendedInfo uses decimal instead of integer division
-                          - QUICKIESTORE path re-ranks targets after CPU update
-            1.1.2026.0216 - Pre-release hardening
-                          - Azure SQL DB / Managed Instance edition detection via EngineEdition
-                          - XPath filter: Table Scan RelOps only (no false CPU from index seeks)
-                          - QS XML pre-filter: LIKE on plan text before TRY_CONVERT(xml)
-                          - Mixed ranking: CPU + (forwarded_pct * page_count), NULL CPU no longer
-                            penalized vs low CPU
-                          - ranking_basis column in output (QS_CPU / QS_NO_DATA / FWD_PCT)
-                          - nci_count column in output (warns about CI swap NCI rebuild cost)
-                          - Post-rebuild verification via dm_db_index_physical_stats
-                          - PostRebuildForwardedRecords in CommandLog ExtendedInfo XML
-                          - Memory-optimized table guard (is_memory_optimized = 0)
-                          - Columnstore index guard (skip heaps with NCI columnstore)
-                          - @LogToTable case-insensitive (UPPER before compare)
-                          - Version in target list result set
-            1.0.2026.0216 - Initial release
+History:    1.0.2026.0216 - Initial release
                           - Query Store CPU ranking via showplan XML object mapping
                           - sp_QuickieStore integration as alternative CPU source
                           - CI swap: auto-detects safe unique NC key, LOB-aware guard
@@ -101,6 +66,19 @@ History:    1.6.2026.0216 - Remediation throughput estimation
                           - @MaxRunSeconds time limit with SKIPPED logging
                           - 3-part names on all generated commands
                           - RAISERROR WITH NOWAIT progress throughout
+                          - Azure SQL DB / Managed Instance edition detection
+                          - XPath filter: Table Scan RelOps only (no false CPU from index seeks)
+                          - QS XML pre-filter: LIKE on plan text before TRY_CONVERT(xml)
+                          - Mixed ranking: CPU + (forwarded_pct * page_count)
+                          - ranking_basis, nci_count columns in output
+                          - Post-rebuild verification via dm_db_index_physical_stats
+                          - Memory-optimized table and columnstore index guards
+                          - @Debug parameter (database list, target details)
+                          - @OnlinePreference='ON' warns on offline fallback
+                          - Input validation (@LockTimeoutMs, @MaxRunSeconds, @EstimateLookbackDays)
+                          - SKIPPED targets logged to CommandLog with ExtendedInfo
+                          - CI swap DROP failure handling, lock timeout restore in CATCH blocks
+                          - Remediation time estimation via CommandLog history + live calibration
 
 Key Features:
     - CPU-prioritized rebuilds via Query Store showplan XML
@@ -314,7 +292,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.6.2026.0216';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0216';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
