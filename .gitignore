@@ -1,0 +1,10 @@
+# Whitelist approach: ignore everything, then allow specific files
+*
+
+# Allow these files
+!.gitignore
+!README.md
+!LICENSE
+!sp_HeapDoctor.sql
+!tests/
+!tests/*.sql
