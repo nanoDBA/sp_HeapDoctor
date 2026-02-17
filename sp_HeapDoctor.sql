@@ -112,6 +112,7 @@ Key Features:
     - Per-rebuild lock timeout with session restore
     - @MaxRunSeconds time limit (remaining targets logged as SKIPPED)
     - @PlanOnly dry-run mode (default) with target list + command output
+    - Remediation time estimation via CommandLog history + live calibration
 
 DROP-IN COMPATIBILITY with Ola Hallengren's SQL Server Maintenance Solution:
     https://ola.hallengren.com
