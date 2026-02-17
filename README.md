@@ -22,6 +22,12 @@ Most DBAs fix this manually: run `dm_db_index_physical_stats`, squint at the res
 - **Per-rebuild lock timeout** - `SET LOCK_TIMEOUT` prefix/suffix with session restore.  Your blocking chain will thank you.
 - **Time limit** - `@MaxRunSeconds` with graceful stop (remaining targets logged as `SKIPPED`).  Maintenance windows end whether you're done or not.
 - **Plan-only mode** - `@PlanOnly = 1` (default) shows targets and commands without executing.  Look before you leap.  This is the default for a reason.
+- **Query Store performance snapshot** - captures before-rebuild QS runtime stats (logical reads, physical reads, duration, executions) and `query_hash` list per heap.  Persisted in CommandLog `ExtendedInfo` XML for before/after trending.  `query_hash` is stable across plan recompilation and CI_SWAP DDL changes, so you can find the same queries in current QS data regardless of what happened to plan_id.
+- **Forwarded fetch counters** - `forwarded_fetch_count` from `dm_db_index_operational_stats` shows how many times forwarded record pointers were actually traversed at runtime, not just how many exist.  A heap with 50% forwarded records but zero fetches isn't hurting anyone.
+- **Heap-only discovery** - materializes heap `object_id`s first via `sys.indexes WHERE type = 0`, then scans only those with `dm_db_index_physical_stats`.  On databases with thousands of tables, this skips all non-heap objects instead of asking the DMF to evaluate every table.
+- **Write-heavy heap detection** - `usage_hint` column flags heaps with more writes than reads via `dm_db_index_usage_stats`.  `WRITE_ONLY` means zero reads (staging table), `WRITE_HEAVY` means more updates than scans+seeks.  Forwarded records will come right back on these tables; consider adding a clustered index instead of rebuilding.
+- **Scan phase time limit** - when `@MaxRunSeconds` is set, the discovery loop checks elapsed time between databases.  If time is exhausted during scanning, remaining databases are skipped so the execution phase can still process whatever targets were found.
+- **Pre-flight lock check** - before each rebuild, checks `dm_tran_locks` for other sessions holding locks on the target table.  If found, emits a warning that Sch-M acquisition may block or be blocked.  Does not prevent the rebuild.
 
 ## Requirements
 
@@ -106,6 +112,7 @@ EXEC dbo.sp_HeapDoctor
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@PlanOnly` | `1` | `1` = print commands only, `0` = execute |
+| `@Execute` | `NULL` | Ola Hallengren convention: `Y` = execute (`@PlanOnly=0`), `N` = plan only (`@PlanOnly=1`). Overrides `@PlanOnly` when set |
 | `@Maxdop` | `NULL` | MAXDOP on index operations (`NULL` = omit) |
 | `@LockTimeoutMs` | `NULL` | Per-rebuild lock timeout in ms |
 | `@MaxRunSeconds` | `NULL` | Stop after N seconds (`NULL` = no limit) |
@@ -128,7 +135,7 @@ EXEC dbo.sp_HeapDoctor
 ## How It Works
 
 1. **Database selection** - parses `@Databases` using the Ola Hallengren pattern (wildcards, exclusions, AG awareness).  AG secondaries are automatically skipped because you can't rebuild on a read-only replica, no matter how badly you want to.
-2. **Heap discovery** - `dm_db_index_physical_stats` with `SAMPLED` mode finds heaps with forwarded records above thresholds.  Memory-optimized tables and tables with columnstore indexes are excluded because they're a different animal entirely.
+2. **Heap discovery** - heap `object_id`s are materialized first from `sys.indexes WHERE type = 0`, then each heap is scanned individually via `dm_db_index_physical_stats` with `SAMPLED` mode.  This skips all non-heap objects.  Memory-optimized tables and tables with columnstore indexes are excluded.  Runtime `forwarded_fetch_count` from `dm_db_index_operational_stats` is captured alongside the physical stats.
 3. **CPU ranking** - Query Store runtime stats are mapped to heap objects via showplan XML, but only for `Table Scan` operators.  A query that does an index seek on your heap's NCI doesn't touch forwarded records, so it doesn't count.  The `ranking_basis` column tells you whether each target was ranked by QS CPU (`QS_CPU`), had no QS data (`QS_NO_DATA`), or you skipped CPU entirely (`FWD_PCT`).
 4. **Key detection** - for CI swap, finds the smallest safe unique non-nullable NC index with no LOB key columns and total key size <= 900 bytes.  The `nci_count` column shows how many NCIs will get rebuilt twice if you go the CI swap route.
 5. **LOB guard** - CI swap is skipped if the table has `text`, `ntext`, `image`, `xml`, or `MAX`-length columns (`DROP INDEX ONLINE` doesn't support LOB).
@@ -156,7 +163,7 @@ This eliminates forwarded records by physically reordering the data.  The temp C
 When `@LogToTable = 'Y'` and `dbo.CommandLog` exists:
 
 - **`HEAP_REBUILD_START`** - logged at run start with parameters XML
-- **Per-rebuild entries** - logged with `CommandType` = `HEAP_REBUILD_ONLINE` / `HEAP_REBUILD_OFFLINE` / `CI_SWAP_ONLINE`
+- **Per-rebuild entries** - logged with `CommandType` = `HEAP_REBUILD_ONLINE` / `HEAP_REBUILD_OFFLINE` / `CI_SWAP_ONLINE`, `IndexType = 0` (heap), and `IndexName` (temp CI name for CI_SWAP, NULL for heap rebuilds)
 - **Skipped entries** - when `@MaxRunSeconds` is reached, remaining targets are logged with `ErrorMessage = 'SKIPPED: @MaxRunSeconds reached.'`
 - **`HEAP_REBUILD_END`** - logged at run end with summary XML (succeeded/failed/skipped counts)
 
@@ -168,9 +175,21 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
   <ForwardedRecords>5000</ForwardedRecords>
   <ForwardedPct>3.50</ForwardedPct>
   <TotalCpuMs>150000</TotalCpuMs>
+  <ForwardedFetchCount>85000</ForwardedFetchCount>
   <PostRebuildForwardedRecords>0</PostRebuildForwardedRecords>
+  <QsSnapshotTimeUtc>2026-02-17T04:30:00.123</QsSnapshotTimeUtc>
+  <QsTotalLogicalReads>2500000</QsTotalLogicalReads>
+  <QsTotalPhysicalReads>1200</QsTotalPhysicalReads>
+  <QsTotalDurationMs>85000</QsTotalDurationMs>
+  <QsTotalExecutions>4500</QsTotalExecutions>
+  <QsPlanCount>3</QsPlanCount>
+  <QsQueryCount>2</QsQueryCount>
+  <QsQueryHashes>0xABC123,0xDEF456</QsQueryHashes>
+  <UsageHint>WRITE_HEAVY</UsageHint>
 </ExtendedInfo>
 ```
+
+The `Qs*` elements are populated when `@CpuSource` is `QUERY_STORE` or `QUICKIESTORE` and the heap has Query Store data.  They are omitted when `@CpuSource = 'NONE'`.  The `QsQueryHashes` list contains distinct `query_hash` values (hex format) for queries whose plans reference the heap via Table Scan operators.  These hashes are stable across plan recompilation and CI_SWAP DDL changes, making them suitable for before/after comparison in Query Store.
 
 Query rebuild history:
 ```sql
@@ -178,6 +197,45 @@ SELECT * FROM dbo.CommandLog
 WHERE CommandType LIKE 'HEAP_REBUILD%'
 ORDER BY StartTime DESC;
 ```
+
+## Known Limitations and Notes
+
+### Heap rebuild side effects
+
+`ALTER TABLE ... REBUILD` does more than eliminate forwarded records.  It also reclaims ghost records, compacts pages, and can change the physical page ordering.  After a rebuild, you may see space usage increase or decrease depending on pre-rebuild page density.  A heap with many half-empty pages will compact into fewer, fuller pages, but a heap where forwarded records pointed to overflow pages may appear to grow in page count once those rows are consolidated.  The `avg_page_space_used_in_percent` value in the target list helps anticipate this.
+
+### Lock behavior
+
+Online heap rebuilds (Enterprise/Developer/Azure SQL DB) acquire a Sch-M (schema modification) lock at the start and end of the operation.  `@LockTimeoutMs` applies to the entire `ALTER TABLE ... REBUILD` command, not separately to the Sch-M acquisition phase.  This means you cannot distinguish "timed out acquiring Sch-M at the start" from "timed out during the actual rebuild" in the error message.
+
+The pre-flight lock check (`dm_tran_locks`) warns when other sessions hold locks on the target table before the rebuild attempt, which helps anticipate Sch-M contention.  However, the check is advisory only and does not prevent the rebuild.
+
+### Online-to-offline fallback
+
+In rare edge cases, SQL Server may change the execution mode of an online rebuild.  The proc trusts the `ErrorNumber` from `sp_executesql`: if a rebuild completes with `ErrorNumber = 0`, it is logged as a success.  The proc cannot detect whether the operation actually ran online or offline.  If this distinction matters, check `sys.dm_exec_requests` from a separate session during execution.
+
+### @Databases parser
+
+The `@Databases` parameter implements a simplified version of the [Ola Hallengren](https://ola.hallengren.com) parsing pattern.  It supports `USER_DATABASES`, `ALL_DATABASES`, `SYSTEM_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%`), exclusions (`-`), and comma-separated lists.  It escapes `_` wildcards in LIKE patterns.  However, it has not been tested against every edge case in Ola's full implementation (e.g., escaped brackets in database names, complex AG topologies).  If you encounter a parsing difference, please file an issue.
+
+### XE observability
+
+During execution (`@PlanOnly = 0`), the proc raises `sp_trace_generateevent` events (User Configurable:0, event_class 82) at rebuild start, success/failure, and run completion.  These are visible to Extended Events sessions and monitoring tools (SentryOne, DPA, etc.) without parsing SSMS output.  The events are silently skipped if the caller does not have `ALTER TRACE` permission.
+
+To capture these events:
+
+```sql
+CREATE EVENT SESSION HeapDoctorMonitor ON SERVER
+ADD EVENT sqlserver.user_event(
+    WHERE sqlserver.like_i_sql_unicode_string(user_info, N'sp_HeapDoctor%')
+)
+ADD TARGET package0.ring_buffer;
+ALTER EVENT SESSION HeapDoctorMonitor ON SERVER STATE = START;
+```
+
+### Platform support
+
+The proc is pure T-SQL and works on Windows, Linux, and container deployments of SQL Server.  Test scripts use `sqlcmd` with flags for both Windows auth (`-E`) and SQL auth (`-U`/`-P`).  On Linux or container deployments, use SQL auth or Azure AD (`-G`), and add `-C` to trust self-signed certificates if needed.
 
 ## Credits
 

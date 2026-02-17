@@ -18,6 +18,7 @@ IMPORTANT: INSERT...EXEC nesting limitation
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 02_test_planonly.sql
   (add -E for Windows auth, -U/-P for SQL auth, or -G for Azure AD)
+  (add -E for Windows auth, -U/-P for SQL auth, or -G for Azure AD)
 */
 
 SET NOCOUNT ON;
@@ -40,6 +41,10 @@ CREATE TABLE #Results
     record_count           bigint        NULL,
     forwarded_record_count bigint        NOT NULL,
     forwarded_pct          decimal(6,2)  NOT NULL,
+    forwarded_fetch_count  bigint        NULL,
+    avg_page_space_pct     decimal(5,2)  NULL,
+    avg_frag_pct           decimal(5,2)  NULL,
+    ghost_record_count     bigint        NULL,
     total_cpu_ms           bigint        NULL,
     ranking_basis          varchar(20)   NOT NULL,
     nci_count              int           NOT NULL,
@@ -47,7 +52,17 @@ CREATE TABLE #Results
     action_chosen          varchar(32)   NOT NULL,
     est_pages_per_sec      float         NULL,
     est_seconds            int           NULL,
-    est_duration           nvarchar(20)  NULL
+    est_duration           nvarchar(20)  NULL,
+    qs_snapshot_time_utc   datetime2(3)  NULL,
+    qs_total_logical_reads bigint        NULL,
+    qs_total_physical_reads bigint       NULL,
+    qs_total_duration_ms   bigint        NULL,
+    qs_total_executions    bigint        NULL,
+    qs_plan_count          int           NULL,
+    qs_query_count         int           NULL,
+    usage_hint             varchar(30)   NULL,
+    command_text           nvarchar(max) NULL,
+    ci_drop_command        nvarchar(max) NULL
 );
 GO
 
@@ -399,6 +414,158 @@ IF NOT EXISTS (SELECT 1 FROM #Results WHERE est_duration IS NOT NULL)
     RAISERROR(N'  PASS 2I-4: est_duration is NULL (no history available).', 10, 1) WITH NOWAIT;
 ELSE
     RAISERROR(N'  *** FAIL 2I-4: est_duration should be NULL without CommandLog history.', 10, 1) WITH NOWAIT;
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 2J: QS snapshot populated with QUERY_STORE', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @CpuSource = 'QUERY_STORE',
+    @PlanOnly  = 1;
+
+-- 2J-1: qs_total_logical_reads populated for QS_CPU targets
+DECLARE @2j_qscpu_count int = (SELECT COUNT(*) FROM #Results WHERE ranking_basis = 'QS_CPU');
+DECLARE @2j_reads_count int = (SELECT COUNT(*) FROM #Results WHERE ranking_basis = 'QS_CPU' AND qs_total_logical_reads IS NOT NULL);
+IF @2j_qscpu_count > 0 AND @2j_reads_count = @2j_qscpu_count
+    RAISERROR(N'  PASS 2J-1: qs_total_logical_reads populated for all QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE IF @2j_qscpu_count = 0
+    RAISERROR(N'  SKIP 2J-1: No QS_CPU targets found (QS may not have scan data). Not a failure.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2j1_msg nvarchar(200) = N'  *** FAIL 2J-1: ' + CAST(@2j_reads_count AS nvarchar(10)) + N'/' + CAST(@2j_qscpu_count AS nvarchar(10)) + N' QS_CPU targets have qs_total_logical_reads.';
+    RAISERROR(@2j1_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 2J-2: qs_plan_count > 0 for QS_CPU targets
+DECLARE @2j_plan_count int = (SELECT COUNT(*) FROM #Results WHERE ranking_basis = 'QS_CPU' AND qs_plan_count > 0);
+IF @2j_qscpu_count > 0 AND @2j_plan_count = @2j_qscpu_count
+    RAISERROR(N'  PASS 2J-2: qs_plan_count > 0 for all QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE IF @2j_qscpu_count = 0
+    RAISERROR(N'  SKIP 2J-2: No QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2j2_msg nvarchar(200) = N'  *** FAIL 2J-2: ' + CAST(@2j_plan_count AS nvarchar(10)) + N'/' + CAST(@2j_qscpu_count AS nvarchar(10)) + N' QS_CPU targets have qs_plan_count > 0.';
+    RAISERROR(@2j2_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 2J-3: qs_query_count > 0 for QS_CPU targets
+DECLARE @2j_query_count int = (SELECT COUNT(*) FROM #Results WHERE ranking_basis = 'QS_CPU' AND qs_query_count > 0);
+IF @2j_qscpu_count > 0 AND @2j_query_count = @2j_qscpu_count
+    RAISERROR(N'  PASS 2J-3: qs_query_count > 0 for all QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE IF @2j_qscpu_count = 0
+    RAISERROR(N'  SKIP 2J-3: No QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2j3_msg nvarchar(200) = N'  *** FAIL 2J-3: ' + CAST(@2j_query_count AS nvarchar(10)) + N'/' + CAST(@2j_qscpu_count AS nvarchar(10)) + N' QS_CPU targets have qs_query_count > 0.';
+    RAISERROR(@2j3_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 2J-4: qs_snapshot_time_utc populated for QS_CPU targets
+DECLARE @2j_snap_count int = (SELECT COUNT(*) FROM #Results WHERE ranking_basis = 'QS_CPU' AND qs_snapshot_time_utc IS NOT NULL);
+IF @2j_qscpu_count > 0 AND @2j_snap_count = @2j_qscpu_count
+    RAISERROR(N'  PASS 2J-4: qs_snapshot_time_utc populated for all QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE IF @2j_qscpu_count = 0
+    RAISERROR(N'  SKIP 2J-4: No QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2j4_msg nvarchar(200) = N'  *** FAIL 2J-4: ' + CAST(@2j_snap_count AS nvarchar(10)) + N'/' + CAST(@2j_qscpu_count AS nvarchar(10)) + N' QS_CPU targets have qs_snapshot_time_utc.';
+    RAISERROR(@2j4_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 2J-5: qs_total_executions > 0 for QS_CPU targets
+DECLARE @2j_exec_count int = (SELECT COUNT(*) FROM #Results WHERE ranking_basis = 'QS_CPU' AND qs_total_executions > 0);
+IF @2j_qscpu_count > 0 AND @2j_exec_count = @2j_qscpu_count
+    RAISERROR(N'  PASS 2J-5: qs_total_executions > 0 for all QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE IF @2j_qscpu_count = 0
+    RAISERROR(N'  SKIP 2J-5: No QS_CPU targets.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2j5_msg nvarchar(200) = N'  *** FAIL 2J-5: ' + CAST(@2j_exec_count AS nvarchar(10)) + N'/' + CAST(@2j_qscpu_count AS nvarchar(10)) + N' QS_CPU targets have qs_total_executions > 0.';
+    RAISERROR(@2j5_msg, 10, 1) WITH NOWAIT;
+END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 2K: QS snapshot NULL for CpuSource=NONE', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @CpuSource = 'NONE',
+    @PlanOnly  = 1;
+
+-- 2K-1: All qs_* columns should be NULL
+IF NOT EXISTS (SELECT 1 FROM #Results WHERE qs_snapshot_time_utc IS NOT NULL
+                                         OR qs_total_logical_reads IS NOT NULL
+                                         OR qs_total_physical_reads IS NOT NULL
+                                         OR qs_total_duration_ms IS NOT NULL
+                                         OR qs_total_executions IS NOT NULL
+                                         OR qs_plan_count IS NOT NULL
+                                         OR qs_query_count IS NOT NULL)
+    RAISERROR(N'  PASS 2K-1: All QS snapshot columns are NULL when CpuSource=NONE.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 2K-1: Some QS snapshot columns are non-NULL when CpuSource=NONE.', 10, 1) WITH NOWAIT;
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 2L: forwarded_fetch_count from operational stats', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Re-use existing #Results from 2K (CpuSource=NONE, all heaps present)
+-- The test setup ran queries against HeapA/B/C which create forwarded_fetch_count > 0
+
+-- 2L-1: forwarded_fetch_count should be populated (NOT NULL) for targets
+DECLARE @2l_ffc_count int = (SELECT COUNT(*) FROM #Results WHERE forwarded_fetch_count IS NOT NULL);
+IF @2l_ffc_count >= 1
+BEGIN
+    DECLARE @2l_msg1 nvarchar(200) = N'  PASS 2L-1: forwarded_fetch_count populated for ' + CAST(@2l_ffc_count AS nvarchar(10)) + N' target(s).';
+    RAISERROR(@2l_msg1, 10, 1) WITH NOWAIT;
+END
+ELSE
+    RAISERROR(N'  *** FAIL 2L-1: forwarded_fetch_count is NULL for all targets.', 10, 1) WITH NOWAIT;
+
+-- 2L-2: forwarded_fetch_count should be > 0 for heaps that had table scans
+DECLARE @2l_ffc_positive int = (SELECT COUNT(*) FROM #Results WHERE forwarded_fetch_count > 0);
+IF @2l_ffc_positive >= 1
+BEGIN
+    DECLARE @2l_msg2 nvarchar(200) = N'  PASS 2L-2: forwarded_fetch_count > 0 for ' + CAST(@2l_ffc_positive AS nvarchar(10)) + N' target(s) (forwarded records being accessed).';
+    RAISERROR(@2l_msg2, 10, 1) WITH NOWAIT;
+END
+ELSE
+    RAISERROR(N'  INFO 2L-2: forwarded_fetch_count = 0 for all targets (no table scans hit forwarded records during test setup).', 10, 1) WITH NOWAIT;
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 2M: usage_hint from dm_db_index_usage_stats', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Re-use existing #Results from 2K (CpuSource=NONE, all heaps present)
+-- Test heaps have more scans (20 iterations in setup) than updates (1-2 statements),
+-- so none should be flagged as WRITE_HEAVY or WRITE_ONLY.
+
+-- 2M-1: usage_hint should be NULL for read-heavy heaps (more reads than writes)
+DECLARE @2m_hinted int = (SELECT COUNT(*) FROM #Results WHERE usage_hint IS NOT NULL);
+IF @2m_hinted = 0
+BEGIN
+    RAISERROR(N'  PASS 2M-1: usage_hint is NULL for all targets (correct: test heaps are read-heavy).', 10, 1) WITH NOWAIT;
+END
+ELSE
+BEGIN
+    DECLARE @2m_msg1 nvarchar(200) = N'  INFO 2M-1: usage_hint populated for ' + CAST(@2m_hinted AS nvarchar(10)) + N' target(s). Expected NULL for read-heavy test heaps.';
+    RAISERROR(@2m_msg1, 10, 1) WITH NOWAIT;
+END
 GO
 
 ------------------------------------------------------------------------

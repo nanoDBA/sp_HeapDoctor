@@ -305,5 +305,69 @@ END CATCH
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4T: @Execute = Y (Ola convention for @PlanOnly=0)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- @Execute='Y' should run without error (equivalent to @PlanOnly=0)
+-- Use @LogToTable=N and @MaxRunSeconds=0 so it skips all rebuilds immediately
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @CpuSource = 'NONE', @Execute = N'Y', @MaxRunSeconds = 0, @LogToTable = N'N';
+    RAISERROR(N'  PASS 4T: @Execute=''Y'' accepted (equivalent to @PlanOnly=0).', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4T nvarchar(4000) = N'  *** FAIL 4T: @Execute=''Y'' raised unexpected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4T, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4U: @Execute = N (Ola convention for @PlanOnly=1)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- @Execute='N' should run plan-only without error
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @CpuSource = 'NONE', @Execute = N'N';
+    RAISERROR(N'  PASS 4U: @Execute=''N'' accepted (equivalent to @PlanOnly=1).', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4U nvarchar(4000) = N'  *** FAIL 4U: @Execute=''N'' raised unexpected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4U, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4V: Invalid @Execute value', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @Execute = N'X', @CpuSource = 'NONE';
+    RAISERROR(N'*** FAIL: Should have raised error for invalid @Execute ***', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4V nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4V, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4W: Case insensitive @Execute', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Lowercase 'y' should work the same as 'Y'
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @CpuSource = 'NONE', @Execute = N'y', @MaxRunSeconds = 0, @LogToTable = N'N';
+    RAISERROR(N'  PASS 4W: @Execute=''y'' (lowercase) accepted.', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4W nvarchar(4000) = N'  *** FAIL 4W: @Execute=''y'' raised error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4W, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'Negative tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
 GO

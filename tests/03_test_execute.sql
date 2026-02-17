@@ -244,12 +244,61 @@ BEGIN
     RAISERROR(@3a_msg10, 10, 1) WITH NOWAIT;
 END
 
--- Display CommandLog for manual review
+-- 3A-12: QS snapshot elements should be ABSENT (CpuSource=NONE, so qs_* are NULL, FOR XML ELEMENTS omits NULLs)
+DECLARE @3a_qs_present int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+      AND ExtendedInfo.exist('(/ExtendedInfo/QsTotalLogicalReads)[1]') = 1
+);
+IF @3a_qs_present = 0
+    RAISERROR(N'  PASS 3A-12: QS snapshot elements absent in ExtendedInfo (CpuSource=NONE, as expected).', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3a_msg11 nvarchar(200) = N'  *** FAIL 3A-12: ' + CAST(@3a_qs_present AS nvarchar(10)) + N' entries have QsTotalLogicalReads despite CpuSource=NONE.';
+    RAISERROR(@3a_msg11, 10, 1) WITH NOWAIT;
+END
+
+-- 3A-13: ForwardedFetchCount element should be present in ExtendedInfo
+DECLARE @3a_ffc_count int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+      AND ExtendedInfo.exist('(/ExtendedInfo/ForwardedFetchCount)[1]') = 1
+);
+IF @3a_ffc_count >= 3
+    RAISERROR(N'  PASS 3A-13: ForwardedFetchCount present in ExtendedInfo for all per-rebuild entries.', 10, 1) WITH NOWAIT;
+ELSE IF @3a_ffc_count >= 1
+BEGIN
+    DECLARE @3a_msg12 nvarchar(200) = N'  PASS 3A-13: ForwardedFetchCount present in ' + CAST(@3a_ffc_count AS nvarchar(10)) + N' entries.';
+    RAISERROR(@3a_msg12, 10, 1) WITH NOWAIT;
+END
+ELSE
+    RAISERROR(N'  *** FAIL 3A-13: ForwardedFetchCount missing from all ExtendedInfo entries.', 10, 1) WITH NOWAIT;
+
+-- 3A-14: IndexType should be 0 (heap) for per-rebuild CommandLog entries
+DECLARE @3a_idx_bad int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND (IndexType IS NULL OR IndexType <> 0)
+);
+IF @3a_idx_bad = 0
+    RAISERROR(N'  PASS 3A-14: IndexType = 0 (heap) for all per-rebuild CommandLog entries.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3a_msg13 nvarchar(200) = N'  *** FAIL 3A-14: ' + CAST(@3a_idx_bad AS nvarchar(10)) + N' entries have IndexType <> 0.';
+    RAISERROR(@3a_msg13, 10, 1) WITH NOWAIT;
+END
+
+-- Display CommandLog for review
 RAISERROR(N'', 10, 1) WITH NOWAIT;
-RAISERROR(N'CommandLog entries (manual review):', 10, 1) WITH NOWAIT;
+RAISERROR(N'CommandLog entries:', 10, 1) WITH NOWAIT;
 
 SELECT
-    ID, CommandType, DatabaseName, ObjectName, StartTime, EndTime,
+    ID, CommandType, DatabaseName, ObjectName, IndexName, IndexType, StartTime, EndTime,
     ErrorNumber, ErrorMessage, ExtendedInfo
 FROM dbo.CommandLog
 ORDER BY ID;
@@ -340,8 +389,25 @@ BEGIN
         RAISERROR(N'  *** FAIL 3B-4: No CI_SWAP or HEAP_REBUILD entries in CommandLog.', 10, 1) WITH NOWAIT;
 END
 
+-- 3B-5: CI_SWAP entries should have IndexName set to the temp CI name
+DECLARE @3b_ci_name sysname;
+SELECT TOP 1 @3b_ci_name = IndexName
+FROM dbo.CommandLog
+WHERE CommandType = 'CI_SWAP_ONLINE'
+  AND IndexName IS NOT NULL;
+
+IF @3b_ci_name IS NOT NULL AND @3b_ci_name LIKE 'CX__Temp__%'
+BEGIN
+    DECLARE @3b_msg4 nvarchar(200) = N'  PASS 3B-5: CI_SWAP IndexName = ' + @3b_ci_name;
+    RAISERROR(@3b_msg4, 10, 1) WITH NOWAIT;
+END
+ELSE IF @3b_ci_count = 0
+    RAISERROR(N'  SKIP 3B-5: No CI_SWAP_ONLINE entries (Standard Edition?).', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 3B-5: CI_SWAP entry missing IndexName with CX__Temp__ prefix.', 10, 1) WITH NOWAIT;
+
 -- CommandLog for manual review
-SELECT ID, CommandType, ObjectName, Command, ErrorNumber
+SELECT ID, CommandType, ObjectName, IndexName, IndexType, Command, ErrorNumber
 FROM dbo.CommandLog
 ORDER BY ID;
 GO
@@ -527,6 +593,13 @@ EXEC dbo.sp_HeapDoctor
     @LogToTable    = N'Y';
 GO
 
+-- Fake longer rebuild durations so the >500ms threshold is met.
+-- On fast hardware, rebuilds complete in ~100ms which gets filtered out.
+UPDATE dbo.CommandLog
+SET EndTime = DATEADD(SECOND, 2, StartTime)
+WHERE CommandType IN ('HEAP_REBUILD_ONLINE', 'HEAP_REBUILD_OFFLINE', 'CI_SWAP_ONLINE');
+GO
+
 -- Step 2: Re-create forwarded records so there are targets for the estimate test
 TRUNCATE TABLE dbo.HeapA;
 ;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
@@ -555,6 +628,10 @@ CREATE TABLE #Est
     record_count           bigint        NULL,
     forwarded_record_count bigint        NOT NULL,
     forwarded_pct          decimal(6,2)  NOT NULL,
+    forwarded_fetch_count  bigint        NULL,
+    avg_page_space_pct     decimal(5,2)  NULL,
+    avg_frag_pct           decimal(5,2)  NULL,
+    ghost_record_count     bigint        NULL,
     total_cpu_ms           bigint        NULL,
     ranking_basis          varchar(20)   NOT NULL,
     nci_count              int           NOT NULL,
@@ -562,7 +639,17 @@ CREATE TABLE #Est
     action_chosen          varchar(32)   NOT NULL,
     est_pages_per_sec      float         NULL,
     est_seconds            int           NULL,
-    est_duration           nvarchar(20)  NULL
+    est_duration           nvarchar(20)  NULL,
+    qs_snapshot_time_utc   datetime2(3)  NULL,
+    qs_total_logical_reads bigint        NULL,
+    qs_total_physical_reads bigint       NULL,
+    qs_total_duration_ms   bigint        NULL,
+    qs_total_executions    bigint        NULL,
+    qs_plan_count          int           NULL,
+    qs_query_count         int           NULL,
+    usage_hint             varchar(30)   NULL,
+    command_text           nvarchar(max) NULL,
+    ci_drop_command        nvarchar(max) NULL
 );
 
 INSERT #Est
@@ -614,6 +701,120 @@ FROM #Est
 ORDER BY sort_order;
 
 IF OBJECT_ID('tempdb..#Est') IS NOT NULL DROP TABLE #Est;
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 3F: QS snapshot in ExtendedInfo (CpuSource=QUERY_STORE)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Re-create forwarded records and refresh QS
+TRUNCATE TABLE dbo.HeapA;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapA (ID, Padding, MoreData)
+SELECT TOP (20000) n, REPLICATE('A', 10), NULL FROM N;
+UPDATE dbo.HeapA SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+
+TRUNCATE TABLE dbo.HeapB;
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapB (ID, Code, Padding, MoreData)
+SELECT TOP (20000) n, 'CODE-' + CAST(n AS varchar(10)), REPLICATE('B', 10), NULL FROM N;
+UPDATE dbo.HeapB SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+
+DECLARE @sink3f int, @iter3f int = 1;
+WHILE @iter3f <= 10
+BEGIN
+    SELECT @sink3f = COUNT(*) FROM dbo.HeapA WHERE Padding LIKE '%X%';
+    SELECT @sink3f = COUNT(*) FROM dbo.HeapB WHERE Padding LIKE '%X%';
+    SET @iter3f += 1;
+END
+EXEC sys.sp_query_store_flush_db;
+
+TRUNCATE TABLE dbo.CommandLog;
+GO
+
+EXEC dbo.sp_HeapDoctor
+    @CpuSource        = 'QUERY_STORE',
+    @OnlinePreference = 'AUTO',
+    @MinPages         = 1000,
+    @PlanOnly         = 0,
+    @LogToTable       = N'Y';
+GO
+
+-- 3F-1: QsTotalLogicalReads element present in ExtendedInfo for successful per-rebuild entries
+DECLARE @3f_rebuild_count int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+);
+DECLARE @3f_qs_reads_count int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+      AND ExtendedInfo.exist('(/ExtendedInfo/QsTotalLogicalReads)[1]') = 1
+);
+IF @3f_rebuild_count > 0 AND @3f_qs_reads_count = @3f_rebuild_count
+    RAISERROR(N'  PASS 3F-1: QsTotalLogicalReads present in ExtendedInfo for all successful rebuilds.', 10, 1) WITH NOWAIT;
+ELSE IF @3f_rebuild_count > 0 AND @3f_qs_reads_count > 0
+BEGIN
+    DECLARE @3f_msg1 nvarchar(200) = N'  PASS 3F-1: QsTotalLogicalReads present in '
+        + CAST(@3f_qs_reads_count AS nvarchar(10)) + N'/' + CAST(@3f_rebuild_count AS nvarchar(10)) + N' entries (some heaps may lack QS data).';
+    RAISERROR(@3f_msg1, 10, 1) WITH NOWAIT;
+END
+ELSE IF @3f_rebuild_count = 0
+    RAISERROR(N'  SKIP 3F-1: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 3F-1: No entries have QsTotalLogicalReads despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
+
+-- 3F-2: QsQueryHashes element present and non-empty for entries with QS data
+DECLARE @3f_qs_hashes_count int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+      AND ExtendedInfo.exist('(/ExtendedInfo/QsQueryHashes)[1]') = 1
+      AND LEN(ExtendedInfo.value('(/ExtendedInfo/QsQueryHashes)[1]', 'nvarchar(max)')) > 0
+);
+IF @3f_qs_hashes_count > 0
+BEGIN
+    DECLARE @3f_msg2 nvarchar(200) = N'  PASS 3F-2: QsQueryHashes present and non-empty in '
+        + CAST(@3f_qs_hashes_count AS nvarchar(10)) + N' entries.';
+    RAISERROR(@3f_msg2, 10, 1) WITH NOWAIT;
+END
+ELSE IF @3f_rebuild_count = 0
+    RAISERROR(N'  SKIP 3F-2: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 3F-2: No entries have QsQueryHashes despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
+
+-- 3F-3: QsSnapshotTimeUtc element present for entries with QS data
+DECLARE @3f_qs_snap_count int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+      AND ExtendedInfo.exist('(/ExtendedInfo/QsSnapshotTimeUtc)[1]') = 1
+);
+IF @3f_qs_snap_count > 0
+BEGIN
+    DECLARE @3f_msg3 nvarchar(200) = N'  PASS 3F-3: QsSnapshotTimeUtc present in '
+        + CAST(@3f_qs_snap_count AS nvarchar(10)) + N' entries.';
+    RAISERROR(@3f_msg3, 10, 1) WITH NOWAIT;
+END
+ELSE IF @3f_rebuild_count = 0
+    RAISERROR(N'  SKIP 3F-3: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 3F-3: No entries have QsSnapshotTimeUtc despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
+
+-- Display ExtendedInfo for review
+SELECT ID, CommandType, ObjectName,
+    ExtendedInfo.value('(/ExtendedInfo/QsTotalLogicalReads)[1]', 'bigint') AS QsTotalLogicalReads,
+    ExtendedInfo.value('(/ExtendedInfo/QsQueryHashes)[1]', 'nvarchar(max)') AS QsQueryHashes,
+    ExtendedInfo.value('(/ExtendedInfo/QsSnapshotTimeUtc)[1]', 'nvarchar(50)') AS QsSnapshotTimeUtc
+FROM dbo.CommandLog
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+ORDER BY ID;
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;

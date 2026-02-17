@@ -50,9 +50,38 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0216
+Version:    1.0.2026.0217e
 
-History:    1.0.2026.0216 - Initial release
+History:    1.0.2026.0217e - forwarded_fetch_count in ranking, XE observability
+                          - Ranking formula now incorporates forwarded_fetch_count as
+                            runtime impact signal alongside CPU and structural severity.
+                            Formula: COALESCE(cpu,0) + ISNULL(fwd_fetch,0)/1000 + fwd_pct*pages
+                          - XE observability via sp_trace_generateevent
+                          - Raises User Configurable:0 events (event_class 82) at rebuild
+                            start, success, failure, and run completion
+                          - Monitoring tools (SentryOne, DPA, custom XE sessions) can track
+                            progress by capturing user_event filtered on 'sp_HeapDoctor%'
+                          - Silently skipped if ALTER TRACE permission is not available
+            1.0.2026.0217c - @Execute alias, documentation improvements
+                          - @Execute nvarchar(1) parameter: Ola Hallengren convention alias
+                            for @PlanOnly (Y=execute, N=plan only). Overrides @PlanOnly when set.
+                          - README: heap rebuild side effects, Sch-M lock behavior, Linux awareness,
+                            @Databases parser simplification note, online-to-offline limitation
+            1.0.2026.0217b - Usage pattern detection, scan phase time check, pre-flight lock check
+                          - usage_hint column: flags WRITE_ONLY / WRITE_HEAVY heaps via
+                            dm_db_index_usage_stats (Kendra Little: staging/ETL identification)
+                          - Scan phase elapsed check: stops scanning remaining databases
+                            when @MaxRunSeconds is exceeded during discovery
+                          - Pre-flight active session check: warns when other sessions hold
+                            locks on the target table before attempting Sch-M acquisition
+            1.0.2026.0217 - Query Store performance snapshot capture
+                          - Before-snapshot of QS runtime stats per heap: logical reads,
+                            physical reads, duration, executions, plan/query counts
+                          - query_hash list per heap for stable before/after tracking
+                            (survives plan recompilation and CI_SWAP DDL changes)
+                          - Snapshot data persisted in CommandLog ExtendedInfo XML
+                          - Works with both QUERY_STORE and QUICKIESTORE CPU sources
+            1.0.2026.0216 - Initial release
                           - Query Store CPU ranking via showplan XML object mapping
                           - sp_QuickieStore integration as alternative CPU source
                           - CI swap: auto-detects safe unique NC key, LOB-aware guard
@@ -91,6 +120,8 @@ Key Features:
     - @MaxRunSeconds time limit (remaining targets logged as SKIPPED)
     - @PlanOnly dry-run mode (default) with target list + command output
     - Remediation time estimation via CommandLog history + live calibration
+    - Query Store performance snapshot (logical reads, duration, executions, query_hashes)
+      persisted in ExtendedInfo XML for before/after trending
 
 DROP-IN COMPATIBILITY with Ola Hallengren's SQL Server Maintenance Solution:
     https://ola.hallengren.com
@@ -186,7 +217,14 @@ EXEC dbo.sp_HeapDoctor
     @PlanOnly          = 0,
     @LogToTable        = N'N';
 
-10) Query CommandLog for rebuild history
+10) Execute using Ola Hallengren convention (@Execute = Y/N)
+
+EXEC dbo.sp_HeapDoctor
+    @Execute           = N'Y',
+    @OnlinePreference  = 'AUTO',
+    @LockTimeoutMs     = 5000;
+
+11) Query CommandLog for rebuild history
 
 SELECT *
 FROM dbo.CommandLog
@@ -274,6 +312,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 
     -- Execution
     @PlanOnly                bit            = 1,               -- 1 = print commands only, 0 = execute
+    @Execute                 nvarchar(1)    = NULL,            -- Ola Hallengren convention: Y = execute (@PlanOnly=0), N = plan only (@PlanOnly=1)
     @Maxdop                  int            = NULL,            -- optional MAXDOP on index ops (NULL = omit)
     @LockTimeoutMs           int            = NULL,            -- NULL = don't set; milliseconds for SET LOCK_TIMEOUT per rebuild
     @MaxRunSeconds           int            = NULL,            -- when PlanOnly=0, stop after N seconds (NULL = no limit)
@@ -292,7 +331,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0216';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0217e';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -326,6 +365,7 @@ PARAMETERS:
   @PreferCiSwap      bit     = 0       Prefer CI swap when safe key exists + online allowed.
 
   @PlanOnly          bit     = 1       1=print commands only, 0=execute.
+  @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
   @Maxdop            int     = NULL    MAXDOP on index ops (NULL=omit, 0=unlimited).
   @LockTimeoutMs     int     = NULL    Per-rebuild lock timeout in ms (NULL=don''t set).
   @MaxRunSeconds     int     = NULL    Stop after N seconds (NULL=no limit).
@@ -340,6 +380,24 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
               https://ola.hallengren.com/scripts/CommandLog.sql
 ', 10, 1, @Version) WITH NOWAIT;
         RETURN;
+    END
+
+    ----------------------------------------------------------------------------
+    -- @Execute alias (Ola Hallengren convention): Y = execute, N = plan only
+    -- When provided, overrides @PlanOnly.
+    ----------------------------------------------------------------------------
+    IF @Execute IS NOT NULL
+    BEGIN
+        SET @Execute = UPPER(@Execute);
+        IF @Execute = N'Y'
+            SET @PlanOnly = 0;
+        ELSE IF @Execute = N'N'
+            SET @PlanOnly = 1;
+        ELSE
+        BEGIN
+            RAISERROR(N'Invalid @Execute value. Use Y or N.', 16, 1);
+            RETURN;
+        END
     END
 
     /*
@@ -469,6 +527,7 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     SET @Msg = N'Mode:        ' + CASE WHEN @PlanOnly = 1 THEN N'PLAN ONLY' ELSE N'EXECUTE' END;
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    RAISERROR(N'Scan mode:   SAMPLED (forwarded record counts are estimates)', 10, 1) WITH NOWAIT;
 
     ----------------------------------------------------------------------------
     -- Parse @Databases (Ola Hallengren pattern)
@@ -667,7 +726,8 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
     IF @Debug = 1
     BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
-        RAISERROR(N'[DEBUG] EngineEdition = %d, CanOnline = %d, Online = %d', 10, 1, @EngineEdition, @CanOnline, @Online) WITH NOWAIT;
+        DECLARE @dbg_CanOnline int = CAST(@CanOnline AS int), @dbg_Online int = CAST(@Online AS int);
+        RAISERROR(N'[DEBUG] EngineEdition = %d, CanOnline = %d, Online = %d', 10, 1, @EngineEdition, @dbg_CanOnline, @dbg_Online) WITH NOWAIT;
         RAISERROR(N'[DEBUG] Selected databases:', 10, 1) WITH NOWAIT;
 
         DECLARE @dbg_cursor sysname;
@@ -703,6 +763,10 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
         record_count             bigint         NULL,
         forwarded_record_count   bigint         NOT NULL,
         forwarded_pct            decimal(6,2)   NOT NULL,
+        forwarded_fetch_count    bigint         NULL,
+        avg_page_space_pct       decimal(5,2)   NULL,
+        avg_frag_pct             decimal(5,2)   NULL,
+        ghost_record_count       bigint         NULL,
         total_cpu_ms             bigint         NULL,
         ranking_basis            varchar(20)    NOT NULL DEFAULT 'FWD_PCT',
         nci_count                int            NOT NULL DEFAULT 0,
@@ -715,6 +779,15 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
         est_pages_per_sec        float          NULL,
         est_seconds              int            NULL,
         est_duration             nvarchar(20)   NULL,
+        qs_snapshot_time_utc     datetime2(3)   NULL,
+        qs_total_logical_reads   bigint         NULL,
+        qs_total_physical_reads  bigint         NULL,
+        qs_total_duration_ms     bigint         NULL,
+        qs_total_executions      bigint         NULL,
+        qs_plan_count            int            NULL,
+        qs_query_count           int            NULL,
+        qs_query_hashes          nvarchar(max)  NULL,
+        usage_hint               varchar(30)    NULL,
         sort_order               int            NOT NULL DEFAULT 0
     );
 
@@ -778,45 +851,100 @@ CREATE TABLE #Heaps
     page_count             bigint        NOT NULL,
     record_count           bigint        NULL,
     forwarded_record_count bigint        NOT NULL,
-    forwarded_pct          decimal(6,2)  NOT NULL
+    forwarded_pct          decimal(6,2)  NOT NULL,
+    avg_page_space_pct     decimal(5,2)  NULL,
+    avg_frag_pct           decimal(5,2)  NULL,
+    ghost_record_count     bigint        NULL,
+    forwarded_fetch_count  bigint        NULL,
+    user_seeks             bigint        NULL,
+    user_scans             bigint        NULL,
+    user_lookups           bigint        NULL,
+    user_updates           bigint        NULL
 );
 
 CREATE TABLE #CpuByPlan
 (
-    plan_id       bigint NOT NULL PRIMARY KEY,
-    total_cpu_ms  bigint NOT NULL
+    plan_id              bigint NOT NULL PRIMARY KEY,
+    total_cpu_ms         bigint NOT NULL,
+    total_logical_reads  bigint NOT NULL,
+    total_physical_reads bigint NOT NULL,
+    total_duration_ms    bigint NOT NULL,
+    total_executions     bigint NOT NULL
 );
 
 CREATE TABLE #CpuByObject
 (
-    object_id    int    NOT NULL PRIMARY KEY,
-    total_cpu_ms bigint NOT NULL
+    object_id            int            NOT NULL PRIMARY KEY,
+    total_cpu_ms         bigint         NOT NULL,
+    total_logical_reads  bigint         NOT NULL DEFAULT 0,
+    total_physical_reads bigint         NOT NULL DEFAULT 0,
+    total_duration_ms    bigint         NOT NULL DEFAULT 0,
+    total_executions     bigint         NOT NULL DEFAULT 0,
+    plan_count           int            NOT NULL DEFAULT 0,
+    query_count          int            NOT NULL DEFAULT 0,
+    query_hashes         nvarchar(max)  NULL
 );
 
 -- 1) Find heaps with forwarded records
-INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct)
+-- Pre-filter: materialize heap object_ids first, then CROSS APPLY physical stats
+-- only for heaps. This avoids scanning non-heap objects (Tara Kizer optimization).
+DECLARE @Msg_inner nvarchar(4000);
+
+CREATE TABLE #HeapObjects
+(
+    object_id   int     NOT NULL PRIMARY KEY,
+    schema_name sysname NOT NULL,
+    table_name  sysname NOT NULL
+);
+
+INSERT #HeapObjects (object_id, schema_name, table_name)
+SELECT o.object_id, s.name, o.name
+FROM sys.tables o
+JOIN sys.schemas s ON o.schema_id = s.schema_id
+JOIN sys.indexes ix ON ix.object_id = o.object_id AND ix.type = 0
+WHERE o.is_memory_optimized = 0
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes ci WHERE ci.object_id = o.object_id AND ci.type IN (5,6));
+
+DECLARE @HeapTableCount int = (SELECT COUNT(*) FROM #HeapObjects);
+SET @Msg_inner = N''  '' + CAST(@HeapTableCount AS nvarchar(10)) + N'' heap table(s) to scan (non-heap objects skipped).'';
+RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+
+INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates)
 SELECT
-    o.object_id,
-    s.name,
-    o.name,
+    ho.object_id,
+    ho.schema_name,
+    ho.table_name,
     ips.page_count,
     ips.record_count,
     ips.forwarded_record_count,
-    CAST(100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0) AS decimal(6,2))
-FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''SAMPLED'') ips
-JOIN sys.objects o ON ips.object_id = o.object_id
-JOIN sys.schemas s ON o.schema_id = s.schema_id
-WHERE o.type = ''U''
-  AND o.is_memory_optimized = 0
-  AND ips.index_id = 0
-  AND ips.forwarded_record_count > 0
+    CAST(100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0) AS decimal(6,2)),
+    CAST(ips.avg_page_space_used_in_percent AS decimal(5,2)),
+    CAST(ips.avg_fragmentation_in_percent AS decimal(5,2)),
+    ips.ghost_record_count,
+    os.forwarded_fetch_count,
+    us.user_seeks,
+    us.user_scans,
+    us.user_lookups,
+    us.user_updates
+FROM #HeapObjects ho
+CROSS APPLY sys.dm_db_index_physical_stats(DB_ID(), ho.object_id, 0, NULL, ''SAMPLED'') ips
+OUTER APPLY (
+    SELECT SUM(forwarded_fetch_count) AS forwarded_fetch_count
+    FROM sys.dm_db_index_operational_stats(DB_ID(), ho.object_id, 0, NULL)
+) os
+OUTER APPLY (
+    SELECT user_seeks, user_scans, user_lookups, user_updates
+    FROM sys.dm_db_index_usage_stats
+    WHERE database_id = DB_ID() AND object_id = ho.object_id AND index_id = 0
+) us
+WHERE ips.forwarded_record_count > 0
   AND ips.page_count >= @MinPages_param
   AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param)
-  AND (100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0)) >= @MinForwardedPct_param
-  AND NOT EXISTS (SELECT 1 FROM sys.indexes ci WHERE ci.object_id = o.object_id AND ci.type IN (5,6));
+  AND (100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0)) >= @MinForwardedPct_param;
+
+DROP TABLE #HeapObjects;
 
 DECLARE @HeapCount_inner int = (SELECT COUNT(*) FROM #Heaps);
-DECLARE @Msg_inner nvarchar(4000);
 SET @Msg_inner = N''  Found '' + CAST(@HeapCount_inner AS nvarchar(10)) + N'' heap(s) with forwarded records.'';
 RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
@@ -828,9 +956,37 @@ IF @HeapCount_inner = 0 RETURN;
         BEGIN
             SET @discovery_sql += N'
 -- 2) CPU from Query Store
-DECLARE @QsRw bit =
-    CASE WHEN EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state_desc = ''READ_WRITE'')
-         THEN 1 ELSE 0 END;
+DECLARE @QsActualState nvarchar(60);
+DECLARE @QsDesiredState nvarchar(60);
+DECLARE @QsRetentionDays int;
+DECLARE @QsRw bit;
+
+SELECT
+    @QsActualState  = actual_state_desc,
+    @QsDesiredState = desired_state_desc,
+    @QsRetentionDays = stale_query_threshold_days
+FROM sys.database_query_store_options;
+
+SET @QsRw = CASE WHEN @QsActualState = ''READ_WRITE'' THEN 1 ELSE 0 END;
+
+-- Warn if QS is READ_ONLY (data may be stale)
+IF @QsActualState = ''READ_ONLY'' AND @QsDesiredState = ''READ_WRITE''
+BEGIN
+    RAISERROR(N''  WARNING: Query Store is READ_ONLY (desired READ_WRITE). Data may be stale - check MAX_STORAGE_SIZE_MB.'', 10, 1) WITH NOWAIT;
+    SET @QsRw = 1; -- still read QS data, just warn
+END
+ELSE IF @QsActualState NOT IN (''READ_WRITE'', ''READ_ONLY'')
+BEGIN
+    RAISERROR(N''  WARNING: Query Store is not active (state: %s). CPU data unavailable.'', 10, 1, @QsActualState) WITH NOWAIT;
+END
+
+-- Warn if lookback exceeds retention policy
+IF @QsRw = 1 AND @QsRetentionDays IS NOT NULL AND @LookbackDays_param > @QsRetentionDays
+BEGIN
+    DECLARE @QsRetMsg nvarchar(200) = N''  WARNING: @LookbackDays ('' + CAST(@LookbackDays_param AS nvarchar(10))
+        + N'') exceeds QS retention ('' + CAST(@QsRetentionDays AS nvarchar(10)) + N'' days). Results limited to actual retention.'';
+    RAISERROR(@QsRetMsg, 10, 1) WITH NOWAIT;
+END
 
 IF @QsRw = 1
 BEGIN
@@ -838,52 +994,106 @@ BEGIN
     (
         SELECT
             rs.plan_id,
-            total_cpu_us = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_cpu_time))
+            total_cpu_us = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_cpu_time)),
+            total_logical_reads = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_logical_io_reads)),
+            total_physical_reads = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_physical_io_reads)),
+            total_duration_us = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_duration)),
+            total_executions = SUM(CONVERT(bigint, rs.count_executions))
         FROM sys.query_store_runtime_stats rs
         JOIN sys.query_store_runtime_stats_interval rsi
           ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
         WHERE rsi.start_time >= DATEADD(DAY, -@LookbackDays_param, SYSUTCDATETIME())
         GROUP BY rs.plan_id
     )
-    INSERT #CpuByPlan(plan_id, total_cpu_ms)
-    SELECT plan_id, CONVERT(bigint, total_cpu_us / 1000)
+    INSERT #CpuByPlan(plan_id, total_cpu_ms, total_logical_reads, total_physical_reads, total_duration_ms, total_executions)
+    SELECT plan_id,
+        CONVERT(bigint, total_cpu_us / 1000),
+        total_logical_reads,
+        total_physical_reads,
+        CONVERT(bigint, total_duration_us / 1000),
+        total_executions
     FROM CpuByPlan
     WHERE total_cpu_us > 0;
 
     -- 3) Map plan CPU to heap objects via showplan XML
     IF EXISTS (SELECT 1 FROM #CpuByPlan)
     BEGIN
+        -- Persist plan-to-object mapping to avoid re-parsing XML for query_hash collection
+        CREATE TABLE #PlanObjMap
+        (
+            plan_id      bigint   NOT NULL,
+            query_id     bigint   NOT NULL,
+            query_hash   binary(8) NOT NULL,
+            schema_name  sysname  NOT NULL,
+            table_name   sysname  NOT NULL
+        );
+
         ;WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan''),
         HeapPlans AS
         (
             -- Pre-filter: only parse plans whose text contains a heap table name
-            SELECT p.plan_id, TRY_CONVERT(xml, p.query_plan) AS plan_xml
+            SELECT p.plan_id, p.query_id, q.query_hash,
+                TRY_CONVERT(xml, p.query_plan) AS plan_xml
             FROM sys.query_store_plan p
             JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
+            JOIN sys.query_store_query q ON p.query_id = q.query_id
             WHERE EXISTS (SELECT 1 FROM #Heaps h WHERE p.query_plan LIKE N''%'' + h.table_name + N''%'')
-        ),
-        PlanObj AS
-        (
-            -- Filter to Table Scan RelOps only. These are the operations that traverse
-            -- forwarded record pointers. Index Seeks/Scans on NCIs don''t hit them.
-            SELECT DISTINCT
-                hp.plan_id,
-                REPLACE(REPLACE(obj.value(''@Schema'',''sysname''), N''['', N''''), N'']'', N'''') AS schema_name,
-                REPLACE(REPLACE(obj.value(''@Table'', ''sysname''), N''['', N''''), N'']'', N'''') AS table_name
-            FROM HeapPlans hp
-            CROSS APPLY hp.plan_xml.nodes(''//RelOp[@PhysicalOp="Table Scan"]/*/Object[@Schema and @Table]'') AS n(obj)
-            WHERE hp.plan_xml IS NOT NULL
-        ),
-        CpuByObj AS
-        (
-            SELECT h.object_id, SUM(cp.total_cpu_ms) AS total_cpu_ms
-            FROM #Heaps h
-            JOIN PlanObj po ON po.schema_name = h.schema_name AND po.table_name = h.table_name
-            JOIN #CpuByPlan cp ON cp.plan_id = po.plan_id
-            GROUP BY h.object_id
         )
-        INSERT #CpuByObject(object_id, total_cpu_ms)
-        SELECT object_id, total_cpu_ms FROM CpuByObj;
+        -- Filter to Table Scan RelOps only. These are the operations that traverse
+        -- forwarded record pointers. Index Seeks/Scans on NCIs don''t hit them.
+        INSERT #PlanObjMap (plan_id, query_id, query_hash, schema_name, table_name)
+        SELECT DISTINCT
+            hp.plan_id,
+            hp.query_id,
+            hp.query_hash,
+            REPLACE(REPLACE(obj.value(''@Schema'',''sysname''), N''['', N''''), N'']'', N'''') AS schema_name,
+            REPLACE(REPLACE(obj.value(''@Table'', ''sysname''), N''['', N''''), N'']'', N'''') AS table_name
+        FROM HeapPlans hp
+        CROSS APPLY hp.plan_xml.nodes(''//RelOp[@PhysicalOp="Table Scan"]/*/Object[@Schema and @Table]'') AS n(obj)
+        WHERE hp.plan_xml IS NOT NULL;
+
+        -- Aggregate metrics by object
+        INSERT #CpuByObject(object_id, total_cpu_ms, total_logical_reads, total_physical_reads, total_duration_ms, total_executions, plan_count, query_count)
+        SELECT h.object_id,
+            SUM(cp.total_cpu_ms),
+            SUM(cp.total_logical_reads),
+            SUM(cp.total_physical_reads),
+            SUM(cp.total_duration_ms),
+            SUM(cp.total_executions),
+            COUNT(DISTINCT pm.plan_id),
+            COUNT(DISTINCT pm.query_id)
+        FROM #Heaps h
+        JOIN #PlanObjMap pm ON pm.schema_name = h.schema_name AND pm.table_name = h.table_name
+        JOIN #CpuByPlan cp ON cp.plan_id = pm.plan_id
+        GROUP BY h.object_id;
+
+        -- Collect distinct query_hash values per heap object (for performance tracking)
+        ;WITH DistinctHashes AS
+        (
+            SELECT DISTINCT h.object_id, pm.query_hash
+            FROM #Heaps h
+            JOIN #PlanObjMap pm ON pm.schema_name = h.schema_name AND pm.table_name = h.table_name
+        )
+        UPDATE cbo
+        SET cbo.query_hashes = sub.query_hashes
+        FROM #CpuByObject cbo
+        JOIN (
+            SELECT object_id, STRING_AGG(CONVERT(varchar(18), query_hash, 1), '','') AS query_hashes
+            FROM DistinctHashes
+            GROUP BY object_id
+        ) sub ON cbo.object_id = sub.object_id;
+        -- Report unmatchable plan coverage
+        DECLARE @qs_total_plans int = (SELECT COUNT(*) FROM #CpuByPlan);
+        DECLARE @qs_matched_plans int = (SELECT COUNT(DISTINCT plan_id) FROM #PlanObjMap);
+        DECLARE @qs_unmatched int = @qs_total_plans - @qs_matched_plans;
+
+        IF @qs_unmatched > 0
+        BEGIN
+            DECLARE @qs_cov_msg nvarchar(200) = N''  QS coverage: '' + CAST(@qs_matched_plans AS nvarchar(10))
+                + N''/'' + CAST(@qs_total_plans AS nvarchar(10)) + N'' plans mapped to heaps (''
+                + CAST(@qs_unmatched AS nvarchar(10)) + N'' had NULL XML or no Table Scan on target heaps).'';
+            RAISERROR(@qs_cov_msg, 10, 1) WITH NOWAIT;
+        END
     END
 END
 ELSE
@@ -952,6 +1162,8 @@ Ranked AS
     SELECT
         h.object_id, h.schema_name, h.table_name,
         h.page_count, h.record_count, h.forwarded_record_count, h.forwarded_pct,
+        h.avg_page_space_pct, h.avg_frag_pct, h.ghost_record_count,
+        h.forwarded_fetch_count,
         cbo.total_cpu_ms,
         CASE
             WHEN @CpuSource_param = ''NONE'' THEN ''FWD_PCT''
@@ -962,10 +1174,32 @@ Ranked AS
         bk.index_name AS key_source_index,
         bk.key_cols AS temp_key_cols,
         CASE WHEN lt.object_id IS NOT NULL THEN 1 ELSE 0 END AS has_lob_columns,
+        -- QS performance snapshot (NULL when CpuSource=NONE or QS not available)
+        CASE WHEN cbo.object_id IS NOT NULL THEN SYSUTCDATETIME() ELSE NULL END AS qs_snapshot_time_utc,
+        cbo.total_logical_reads  AS qs_total_logical_reads,
+        cbo.total_physical_reads AS qs_total_physical_reads,
+        cbo.total_duration_ms    AS qs_total_duration_ms,
+        cbo.total_executions     AS qs_total_executions,
+        cbo.plan_count           AS qs_plan_count,
+        cbo.query_count          AS qs_query_count,
+        cbo.query_hashes         AS qs_query_hashes,
+        -- Usage pattern hint (Kendra Little: identify staging/ETL heaps)
+        CASE
+            WHEN h.user_scans IS NULL AND h.user_seeks IS NULL AND h.user_updates IS NULL THEN NULL
+            WHEN ISNULL(h.user_updates, 0) > 0
+                 AND (ISNULL(h.user_scans, 0) + ISNULL(h.user_seeks, 0) + ISNULL(h.user_lookups, 0)) = 0
+                THEN ''WRITE_ONLY''
+            WHEN ISNULL(h.user_updates, 0) > (ISNULL(h.user_scans, 0) + ISNULL(h.user_seeks, 0) + ISNULL(h.user_lookups, 0))
+                THEN ''WRITE_HEAVY''
+            ELSE NULL
+        END AS usage_hint,
         ROW_NUMBER() OVER (ORDER BY
-            -- Mixed ranking: use CPU when available, fall back to forwarded_pct.
-            -- NULL CPU no longer penalized vs low CPU.
-            COALESCE(cbo.total_cpu_ms, 0) + CAST(h.forwarded_pct * h.page_count AS bigint) DESC
+            -- Mixed ranking: CPU + runtime fetch impact + structural severity.
+            -- forwarded_fetch_count/1000 normalizes cumulative counters to a similar
+            -- scale as CPU ms and fwd_pct*page_count. All three signals contribute.
+            COALESCE(cbo.total_cpu_ms, 0)
+            + ISNULL(h.forwarded_fetch_count, 0) / 1000
+            + CAST(h.forwarded_pct * h.page_count AS bigint) DESC
         ) AS target_rank
     FROM #Heaps h
     LEFT JOIN #CpuByObject cbo ON h.object_id = cbo.object_id
@@ -976,14 +1210,21 @@ Ranked AS
 INSERT #Targets
 (
     database_name, object_id, schema_name, table_name, page_count, record_count,
-    forwarded_record_count, forwarded_pct, total_cpu_ms, ranking_basis, nci_count,
+    forwarded_record_count, forwarded_pct, forwarded_fetch_count,
+    avg_page_space_pct, avg_frag_pct, ghost_record_count,
+    total_cpu_ms, ranking_basis, nci_count,
     key_source_index, temp_key_cols, has_lob_columns,
-    action_chosen, command_text, ci_drop_command
+    action_chosen, command_text, ci_drop_command,
+    qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
+    qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count, qs_query_hashes,
+    usage_hint
 )
 SELECT TOP (@TopN_param)
     DB_NAME(),
     r.object_id, r.schema_name, r.table_name,
-    r.page_count, r.record_count, r.forwarded_record_count, r.forwarded_pct, r.total_cpu_ms,
+    r.page_count, r.record_count, r.forwarded_record_count, r.forwarded_pct,
+    r.forwarded_fetch_count,
+    r.avg_page_space_pct, r.avg_frag_pct, r.ghost_record_count, r.total_cpu_ms,
     r.ranking_basis, r.nci_count,
     r.key_source_index, r.temp_key_cols, r.has_lob_columns,
     -- action_chosen
@@ -1025,7 +1266,17 @@ SELECT TOP (@TopN_param)
             N'' WITH (ONLINE = ON'' +
             COALESCE(N'', MAXDOP = '' + CAST(@Maxdop_param AS nvarchar(10)), N'''') + N'');''
         ELSE NULL
-    END
+    END,
+    -- QS performance snapshot
+    r.qs_snapshot_time_utc,
+    r.qs_total_logical_reads,
+    r.qs_total_physical_reads,
+    r.qs_total_duration_ms,
+    r.qs_total_executions,
+    r.qs_plan_count,
+    r.qs_query_count,
+    r.qs_query_hashes,
+    r.usage_hint
 FROM Ranked r
 ORDER BY r.target_rank;
 
@@ -1067,6 +1318,23 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
         -- Mark database as completed
         UPDATE @tmpDatabases SET Completed = 1 WHERE ID = @CurrentDatabaseID;
+
+        -- Scan phase time check: stop scanning if @MaxRunSeconds is exceeded
+        -- (Tara Kizer: preserve execution time when scan phase is slow)
+        IF @MaxRunSeconds IS NOT NULL
+           AND DATEDIFF(SECOND, @start_time, SYSDATETIME()) >= @MaxRunSeconds
+        BEGIN
+            DECLARE @scan_remaining_dbs int;
+            SELECT @scan_remaining_dbs = COUNT(*) FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0;
+
+            IF @scan_remaining_dbs > 0
+            BEGIN
+                SET @Msg = N'Time limit reached during scan phase. Skipping '
+                         + CAST(@scan_remaining_dbs AS nvarchar(10)) + N' remaining database(s).';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+            BREAK;
+        END
     END
 
     /*
@@ -1091,8 +1359,12 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
         CREATE TABLE #CpuByPlan
         (
-            plan_id       bigint NOT NULL PRIMARY KEY,
-            total_cpu_ms  bigint NOT NULL
+            plan_id              bigint NOT NULL PRIMARY KEY,
+            total_cpu_ms         bigint NOT NULL,
+            total_logical_reads  bigint NOT NULL DEFAULT 0,
+            total_physical_reads bigint NOT NULL DEFAULT 0,
+            total_duration_ms    bigint NOT NULL DEFAULT 0,
+            total_executions     bigint NOT NULL DEFAULT 0
         );
 
         DECLARE @ddl nvarchar(max) = N'CREATE TABLE #Quickie(';
@@ -1161,13 +1433,40 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
         IF @QueryStoreRW = 1 AND EXISTS (SELECT 1 FROM #CpuByPlan)
         BEGIN
+            -- Enrich #CpuByPlan with full QS metrics for QUICKIESTORE path
+            -- (QUICKIESTORE only provides CPU; we supplement from QS runtime stats)
+            ;WITH PlanMetrics AS
+            (
+                SELECT
+                    rs.plan_id,
+                    SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_logical_io_reads)) AS total_logical_reads,
+                    SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_physical_io_reads)) AS total_physical_reads,
+                    SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_duration)) / 1000 AS total_duration_ms,
+                    SUM(CONVERT(bigint, rs.count_executions)) AS total_executions
+                FROM sys.query_store_runtime_stats rs
+                JOIN sys.query_store_runtime_stats_interval rsi
+                  ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+                WHERE rsi.start_time >= DATEADD(DAY, -@LookbackDays, SYSUTCDATETIME())
+                  AND rs.plan_id IN (SELECT plan_id FROM #CpuByPlan)
+                GROUP BY rs.plan_id
+            )
+            UPDATE cp
+            SET cp.total_logical_reads  = ISNULL(pm.total_logical_reads, 0),
+                cp.total_physical_reads = ISNULL(pm.total_physical_reads, 0),
+                cp.total_duration_ms    = ISNULL(pm.total_duration_ms, 0),
+                cp.total_executions     = ISNULL(pm.total_executions, 0)
+            FROM #CpuByPlan cp
+            LEFT JOIN PlanMetrics pm ON cp.plan_id = pm.plan_id;
+
             ;WITH XMLNAMESPACES (DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan'),
             HeapPlans AS
             (
                 -- Pre-filter: only parse plans whose text contains a target table name
-                SELECT p.plan_id, TRY_CONVERT(xml, p.query_plan) AS plan_xml
+                SELECT p.plan_id, p.query_id, q.query_hash,
+                    TRY_CONVERT(xml, p.query_plan) AS plan_xml
                 FROM sys.query_store_plan p
                 JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
+                JOIN sys.query_store_query q ON p.query_id = q.query_id
                 WHERE EXISTS (SELECT 1 FROM #Targets t2 WHERE t2.database_name = DB_NAME()
                               AND p.query_plan LIKE N'%' + t2.table_name + N'%')
             ),
@@ -1176,6 +1475,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 -- Filter to Table Scan RelOps only
                 SELECT DISTINCT
                     hp.plan_id,
+                    hp.query_id,
+                    hp.query_hash,
                     REPLACE(REPLACE(obj.value('@Schema','sysname'), N'[', N''), N']', N'') AS schema_name,
                     REPLACE(REPLACE(obj.value('@Table','sysname'),  N'[', N''), N']', N'') AS table_name
                 FROM HeapPlans hp
@@ -1183,16 +1484,37 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 WHERE hp.plan_xml IS NOT NULL
             )
             UPDATE t
-            SET t.total_cpu_ms = sub.total_cpu_ms,
-                t.ranking_basis = 'QS_CPU'
+            SET t.total_cpu_ms          = sub.total_cpu_ms,
+                t.ranking_basis         = 'QS_CPU',
+                t.qs_snapshot_time_utc  = SYSUTCDATETIME(),
+                t.qs_total_logical_reads  = sub.total_logical_reads,
+                t.qs_total_physical_reads = sub.total_physical_reads,
+                t.qs_total_duration_ms    = sub.total_duration_ms,
+                t.qs_total_executions     = sub.total_executions,
+                t.qs_plan_count           = sub.plan_count,
+                t.qs_query_count          = sub.query_count,
+                t.qs_query_hashes         = sub.query_hashes
             FROM #Targets t
             JOIN (
-                SELECT t2.target_id, SUM(cp.total_cpu_ms) AS total_cpu_ms
+                SELECT t2.target_id,
+                    SUM(cp.total_cpu_ms) AS total_cpu_ms,
+                    SUM(cp.total_logical_reads) AS total_logical_reads,
+                    SUM(cp.total_physical_reads) AS total_physical_reads,
+                    SUM(cp.total_duration_ms) AS total_duration_ms,
+                    SUM(cp.total_executions) AS total_executions,
+                    COUNT(DISTINCT po.plan_id) AS plan_count,
+                    COUNT(DISTINCT po.query_id) AS query_count,
+                    (
+                        SELECT STRING_AGG(CONVERT(varchar(18), dh.query_hash, 1), ',')
+                        FROM (SELECT DISTINCT po2.query_hash
+                              FROM PlanObj po2
+                              WHERE po2.schema_name = t2.schema_name AND po2.table_name = t2.table_name) dh
+                    ) AS query_hashes
                 FROM #Targets t2
                 JOIN PlanObj po ON po.schema_name = t2.schema_name AND po.table_name = t2.table_name
                 JOIN #CpuByPlan cp ON cp.plan_id = po.plan_id
                 WHERE t2.database_name = DB_NAME()
-                GROUP BY t2.target_id
+                GROUP BY t2.target_id, t2.schema_name, t2.table_name
             ) sub ON t.target_id = sub.target_id;
         END
 
@@ -1208,7 +1530,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 target_id,
                 sort_order,
                 ROW_NUMBER() OVER (
-                    ORDER BY COALESCE(total_cpu_ms, 0) + CAST(forwarded_pct * page_count AS bigint) DESC
+                    ORDER BY COALESCE(total_cpu_ms, 0) + ISNULL(forwarded_fetch_count, 0) / 1000 + CAST(forwarded_pct * page_count AS bigint) DESC
                 ) AS new_rank
             FROM #Targets
         )
@@ -1257,7 +1579,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                      + N' ' + @dbg_db + N'.' + @dbg_tbl
                      + N' | ' + @dbg_action
                      + N' | pages=' + CAST(@dbg_pages AS nvarchar(20))
-                     + N' fwd=' + CAST(@dbg_fwd AS nvarchar(10)) + N'%'
+                     + N' fwd=' + CAST(@dbg_fwd AS nvarchar(10)) + N'%%'
                      + N' cpu=' + ISNULL(CAST(@dbg_cpu AS nvarchar(20)), N'NULL')
                      + N' basis=' + @dbg_basis;
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -1364,8 +1686,19 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END
 
+    -- Warn about write-heavy heaps (Kendra Little: rebuilding is a band-aid for staging/ETL tables)
+    IF EXISTS (SELECT 1 FROM #Targets WHERE usage_hint IS NOT NULL)
+    BEGIN
+        DECLARE @write_cnt int = (SELECT COUNT(*) FROM #Targets WHERE usage_hint IS NOT NULL);
+        SET @Msg = N'WARNING: ' + CAST(@write_cnt AS nvarchar(10))
+                 + N' target(s) flagged as write-heavy (more updates than reads). '
+                 + N'Forwarded records may recur. Consider adding a clustered index.';
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+    END
+
     ----------------------------------------------------------------------------
-    -- Output: target list (always shown)
+    -- Output: target list + commands (single result set for INSERT...EXEC compatibility)
     ----------------------------------------------------------------------------
     SELECT
         @Version AS version,
@@ -1378,6 +1711,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         record_count,
         forwarded_record_count,
         forwarded_pct,
+        forwarded_fetch_count,
+        avg_page_space_pct,
+        avg_frag_pct,
+        ghost_record_count,
         total_cpu_ms,
         ranking_basis,
         nci_count,
@@ -1385,18 +1722,15 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         action_chosen,
         est_pages_per_sec,
         est_seconds,
-        est_duration
-    FROM #Targets
-    ORDER BY sort_order;
-
-    ----------------------------------------------------------------------------
-    -- Output: commands (always shown)
-    ----------------------------------------------------------------------------
-    SELECT
-        target_id,
-        sort_order,
-        database_name,
-        action_chosen,
+        est_duration,
+        qs_snapshot_time_utc,
+        qs_total_logical_reads,
+        qs_total_physical_reads,
+        qs_total_duration_ms,
+        qs_total_executions,
+        qs_plan_count,
+        qs_query_count,
+        usage_hint,
         command_text,
         ci_drop_command
     FROM #Targets
@@ -1434,6 +1768,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_page_count      bigint,
             @cur_fwd_count       bigint,
             @cur_fwd_pct         decimal(6,2),
+            @cur_fwd_fetch_count bigint,
+            @cur_page_space_pct  decimal(5,2),
+            @cur_frag_pct        decimal(5,2),
+            @cur_ghost_count     bigint,
             @cur_cpu_ms          bigint,
             @extended_info       xml,
             @err_number          int,
@@ -1441,6 +1779,19 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @verify_sql          nvarchar(max),
             @post_fwd_count      bigint,
             @ci_drop_failed      bit,
+            @cur_index_name      sysname,
+            -- QS performance snapshot (per-target, from #Targets)
+            @cur_qs_snapshot_utc    datetime2(3),
+            @cur_qs_logical_reads   bigint,
+            @cur_qs_physical_reads  bigint,
+            @cur_qs_duration_ms     bigint,
+            @cur_qs_executions      bigint,
+            @cur_qs_plan_count      int,
+            @cur_qs_query_count     int,
+            @cur_qs_query_hashes    nvarchar(max),
+            @cur_usage_hint         varchar(30),
+            @preflight_sessions     int,
+            @trace_msg              nvarchar(128),
             -- Live calibration for throughput estimation
             @live_pages_rebuilt   bigint = 0,
             @live_elapsed_ms     bigint = 0,
@@ -1488,9 +1839,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         @TargetCount AS TargetCount,
                         @CpuSourceUpper AS CpuSource,
                         CASE WHEN @Online = 1 THEN N'ON' ELSE N'OFF' END AS OnlineMode,
+                        @LookbackDays AS LookbackDays,
+                        @TopN AS TopN,
+                        @MinPages AS MinPages,
+                        @MaxPages AS MaxPages,
+                        @MinForwardedPct AS MinForwardedPct,
                         @Maxdop AS Maxdop,
                         @LockTimeoutMs AS LockTimeoutMs,
-                        @MaxRunSeconds AS MaxRunSeconds
+                        @MaxRunSeconds AS MaxRunSeconds,
+                        CASE WHEN @AllowCiSwap = 1 THEN N'Y' ELSE N'N' END AS AllowCiSwap,
+                        CASE WHEN @PreferCiSwap = 1 THEN N'Y' ELSE N'N' END AS PreferCiSwap,
+                        CASE WHEN @EstimateTime = 1 THEN N'Y' ELSE N'N' END AS EstimateTime
                     FOR XML RAW(N'Parameters'), ELEMENTS
                 )
             );
@@ -1513,10 +1872,23 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @action         = action_chosen,
                 @cmd            = command_text,
                 @ci_drop        = ci_drop_command,
-                @cur_page_count = page_count,
-                @cur_fwd_count  = forwarded_record_count,
-                @cur_fwd_pct    = forwarded_pct,
-                @cur_cpu_ms     = total_cpu_ms
+                @cur_page_count    = page_count,
+                @cur_fwd_count     = forwarded_record_count,
+                @cur_fwd_pct       = forwarded_pct,
+                @cur_fwd_fetch_count = forwarded_fetch_count,
+                @cur_page_space_pct = avg_page_space_pct,
+                @cur_frag_pct      = avg_frag_pct,
+                @cur_ghost_count   = ghost_record_count,
+                @cur_cpu_ms        = total_cpu_ms,
+                @cur_qs_snapshot_utc   = qs_snapshot_time_utc,
+                @cur_qs_logical_reads  = qs_total_logical_reads,
+                @cur_qs_physical_reads = qs_total_physical_reads,
+                @cur_qs_duration_ms    = qs_total_duration_ms,
+                @cur_qs_executions     = qs_total_executions,
+                @cur_qs_plan_count     = qs_plan_count,
+                @cur_qs_query_count    = qs_query_count,
+                @cur_qs_query_hashes   = qs_query_hashes,
+                @cur_usage_hint        = usage_hint
             FROM #Targets
             WHERE sort_order > @i
             ORDER BY sort_order;
@@ -1524,6 +1896,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IF @@ROWCOUNT = 0 BREAK;
 
             SET @i = @cur_sort;
+
+            SET @cur_index_name = CASE WHEN @action = 'CI_SWAP_ONLINE'
+                                       THEN N'CX__Temp__' + LEFT(@tbl, 108)
+                                       ELSE NULL END;
 
             /*
             Time limit check
@@ -1555,13 +1931,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 IF @commandlog_exists = 1
                 BEGIN
                     INSERT INTO dbo.CommandLog
-                        (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
+                        (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
+                         Command, CommandType,
                          StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
                     SELECT
                         database_name,
                         schema_name,
                         table_name,
                         N'U',
+                        CASE WHEN action_chosen = 'CI_SWAP_ONLINE' THEN N'CX__Temp__' + LEFT(table_name, 108) ELSE NULL END,
+                        0,
                         command_text,
                         action_chosen,
                         SYSDATETIME(),
@@ -1574,7 +1953,20 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                 CAST(page_count AS decimal(18,2)) / 128.0 AS SizeMB,
                                 forwarded_record_count AS ForwardedRecords,
                                 forwarded_pct AS ForwardedPct,
-                                total_cpu_ms AS TotalCpuMs
+                                forwarded_fetch_count AS ForwardedFetchCount,
+                                avg_page_space_pct AS AvgPageSpacePct,
+                                avg_frag_pct AS AvgFragPct,
+                                ghost_record_count AS GhostRecordCount,
+                                total_cpu_ms AS TotalCpuMs,
+                                qs_snapshot_time_utc AS QsSnapshotTimeUtc,
+                                qs_total_logical_reads AS QsTotalLogicalReads,
+                                qs_total_physical_reads AS QsTotalPhysicalReads,
+                                qs_total_duration_ms AS QsTotalDurationMs,
+                                qs_total_executions AS QsTotalExecutions,
+                                qs_plan_count AS QsPlanCount,
+                                qs_query_count AS QsQueryCount,
+                                qs_query_hashes AS QsQueryHashes,
+                                usage_hint AS UsageHint
                             FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                         )
                     FROM #Targets
@@ -1602,9 +1994,55 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
+            -- XE observability: raise user event with key metrics
+            BEGIN TRY
+                SET @trace_msg = LEFT(
+                    N'sp_HeapDoctor: [' + CAST(@succeeded_cnt + @failed_cnt + 1 AS nvarchar(10))
+                    + N'/' + CAST(@TargetCount AS nvarchar(10)) + N'] '
+                    + @action + N' ' + @full
+                    + N' ' + CAST(@cur_page_count AS nvarchar(10)) + N'p'
+                    + N' ' + CAST(@cur_fwd_pct AS nvarchar(10)) + N'%fwd'
+                    + ISNULL(N' fc=' + CAST(@cur_fwd_fetch_count AS nvarchar(15)), N'')
+                    + ISNULL(N' cpu=' + CAST(@cur_cpu_ms AS nvarchar(15)), N''), 128);
+                EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+            END TRY
+            BEGIN CATCH
+                -- ALTER TRACE permission may not be available; silently continue
+            END CATCH
+
             SET @start = SYSDATETIME();
             INSERT @ExecLog(target_id, database_name, full_name, action, start_time)
             VALUES (@tid, @db, @full, @action, @start);
+
+            /*
+            Pre-flight: check for active sessions with locks on the target table.
+            Sch-M acquisition will block (and be blocked by) these sessions.
+            (Pam Lahoud: warn before wasting a lock timeout cycle)
+            */
+            SET @preflight_sessions = 0;
+            BEGIN TRY
+                SET @verify_sql = N'SELECT @cnt = COUNT(DISTINCT request_session_id)
+                    FROM sys.dm_tran_locks
+                    WHERE resource_database_id = DB_ID(@db_param)
+                      AND resource_type = N''OBJECT''
+                      AND resource_associated_entity_id = OBJECT_ID(@full_param)
+                      AND request_session_id <> @@SPID
+                      AND request_status = N''GRANT'';';
+                EXEC sys.sp_executesql @verify_sql,
+                    N'@db_param sysname, @full_param nvarchar(512), @cnt int OUTPUT',
+                    @db_param = @db, @full_param = @full, @cnt = @preflight_sessions OUTPUT;
+            END TRY
+            BEGIN CATCH
+                SET @preflight_sessions = 0; -- don't block on pre-flight errors
+            END CATCH
+
+            IF ISNULL(@preflight_sessions, 0) > 0
+            BEGIN
+                SET @Msg = N'  NOTE: ' + CAST(@preflight_sessions AS nvarchar(10))
+                         + N' active session(s) hold locks on ' + @full
+                         + N'. Sch-M acquisition may block or be blocked.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
 
             /*
             Execute the main command (with lock timeout prefix/suffix)
@@ -1702,6 +2140,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END
                 END
 
+                -- XE observability: rebuild succeeded with key metrics
+                BEGIN TRY
+                    SET @trace_msg = LEFT(N'sp_HeapDoctor: OK ' + @full
+                        + N' ' + CAST(@elapsed_sec AS nvarchar(10)) + N's'
+                        + N' ' + CAST(@cur_page_count AS nvarchar(10)) + N'p'
+                        + ISNULL(N' fc=' + CAST(@cur_fwd_fetch_count AS nvarchar(15)), N'')
+                        + N' post=' + ISNULL(CAST(@post_fwd_count AS nvarchar(10)), N'?'), 128);
+                    EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+                END TRY
+                BEGIN CATCH END CATCH
+
                 /*
                 Live calibration: accumulate throughput data from this rebuild.
                 Only counts rebuilds that took > 500ms (sub-500ms are too fast for meaningful rate).
@@ -1763,16 +2212,31 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             CAST(@cur_page_count AS decimal(18,2)) / 128.0 AS SizeMB,
                             @cur_fwd_count AS ForwardedRecords,
                             @cur_fwd_pct AS ForwardedPct,
+                            @cur_fwd_fetch_count AS ForwardedFetchCount,
+                            @cur_page_space_pct AS AvgPageSpacePct,
+                            @cur_frag_pct AS AvgFragPct,
+                            @cur_ghost_count AS GhostRecordCount,
                             @cur_cpu_ms AS TotalCpuMs,
-                            @post_fwd_count AS PostRebuildForwardedRecords
+                            @post_fwd_count AS PostRebuildForwardedRecords,
+                            @cur_qs_snapshot_utc AS QsSnapshotTimeUtc,
+                            @cur_qs_logical_reads AS QsTotalLogicalReads,
+                            @cur_qs_physical_reads AS QsTotalPhysicalReads,
+                            @cur_qs_duration_ms AS QsTotalDurationMs,
+                            @cur_qs_executions AS QsTotalExecutions,
+                            @cur_qs_plan_count AS QsPlanCount,
+                            @cur_qs_query_count AS QsQueryCount,
+                            @cur_qs_query_hashes AS QsQueryHashes,
+                            @cur_usage_hint AS UsageHint
                         FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                     );
 
                     INSERT INTO dbo.CommandLog
-                        (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
+                        (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
+                         Command, CommandType,
                          StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
                     VALUES
-                        (@db, @schema, @tbl, N'U', @cmd, @action,
+                        (@db, @schema, @tbl, N'U', @cur_index_name, 0,
+                         @cmd, @action,
                          @start, @end, 0, NULL, @extended_info);
                 END
             END TRY
@@ -1799,6 +2263,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          + LEFT(@err_message, 300);
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
+                -- XE observability: rebuild failed
+                BEGIN TRY
+                    SET @trace_msg = LEFT(N'sp_HeapDoctor: FAILED ' + @full + N' E' + CAST(@err_number AS nvarchar(10)), 128);
+                    EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+                END TRY
+                BEGIN CATCH END CATCH
+
                 SET @failed_cnt += 1;
 
                 /*
@@ -1812,15 +2283,30 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             CAST(@cur_page_count AS decimal(18,2)) / 128.0 AS SizeMB,
                             @cur_fwd_count AS ForwardedRecords,
                             @cur_fwd_pct AS ForwardedPct,
-                            @cur_cpu_ms AS TotalCpuMs
+                            @cur_fwd_fetch_count AS ForwardedFetchCount,
+                            @cur_page_space_pct AS AvgPageSpacePct,
+                            @cur_frag_pct AS AvgFragPct,
+                            @cur_ghost_count AS GhostRecordCount,
+                            @cur_cpu_ms AS TotalCpuMs,
+                            @cur_qs_snapshot_utc AS QsSnapshotTimeUtc,
+                            @cur_qs_logical_reads AS QsTotalLogicalReads,
+                            @cur_qs_physical_reads AS QsTotalPhysicalReads,
+                            @cur_qs_duration_ms AS QsTotalDurationMs,
+                            @cur_qs_executions AS QsTotalExecutions,
+                            @cur_qs_plan_count AS QsPlanCount,
+                            @cur_qs_query_count AS QsQueryCount,
+                            @cur_qs_query_hashes AS QsQueryHashes,
+                            @cur_usage_hint AS UsageHint
                         FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                     );
 
                     INSERT INTO dbo.CommandLog
-                        (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
+                        (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
+                         Command, CommandType,
                          StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
                     VALUES
-                        (@db, @schema, @tbl, N'U', @cmd, @action,
+                        (@db, @schema, @tbl, N'U', @cur_index_name, 0,
+                         @cmd, @action,
                          @start, @end, @err_number, @err_message, @extended_info);
                 END
             END CATCH;
@@ -1843,6 +2329,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         ELSE N'' END;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+
+        -- XE observability: run complete
+        BEGIN TRY
+            SET @trace_msg = LEFT(N'sp_HeapDoctor: Done S=' + CAST(@succeeded_cnt AS nvarchar(10))
+                + N' F=' + CAST(@failed_cnt AS nvarchar(10))
+                + N' K=' + CAST(@skipped_cnt AS nvarchar(10))
+                + N' ' + CAST(DATEDIFF(SECOND, @RunStart, SYSDATETIME()) AS nvarchar(10)) + N's', 128);
+            EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+        END TRY
+        BEGIN CATCH END CATCH
 
         /*
         Log run END to CommandLog
@@ -1888,4 +2384,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         SELECT * FROM @ExecLog ORDER BY start_time, target_id;
     END
 END
+GO
+
+EXEC sp_MS_marksystemobject 'sp_HeapDoctor';
 GO
