@@ -50,9 +50,12 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.3.2026.0216
+Version:    1.4.2026.0216
 
-History:    1.3.2026.0216 - Input validation, SKIPPED logging, test hardening
+History:    1.4.2026.0216 - Lock timeout restore on failure, CI swap DROP MAXDOP
+                          - Lock timeout now restored in CATCH blocks (main rebuild + CI swap DROP)
+                          - CI swap DROP INDEX now respects @Maxdop (was only on CREATE)
+            1.3.2026.0216 - Input validation, SKIPPED logging, test hardening
                           - @LockTimeoutMs and @MaxRunSeconds reject negative values
                           - ExecLog output ordered by start_time (not target_id)
                           - SKIPPED targets (from @MaxRunSeconds) logged to CommandLog with ExtendedInfo
@@ -297,7 +300,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.3.2026.0216';
+    DECLARE @Version nvarchar(20) = N'1.4.2026.0216';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -1016,7 +1019,8 @@ SELECT TOP (@TopN_param)
             N''DROP INDEX '' +
             QUOTENAME(N''CX__Temp__'' + LEFT(r.table_name, 108)) +
             N'' ON '' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) +
-            N'' WITH (ONLINE = ON);''
+            N'' WITH (ONLINE = ON'' +
+            COALESCE(N'', MAXDOP = '' + CAST(@Maxdop_param AS nvarchar(10)), N'''') + N'');''
         ELSE NULL
     END
 FROM Ranked r
@@ -1524,6 +1528,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                  + N'. The table is now a clustered table, NOT a heap.'
                                  + N' Forwarded records are eliminated, but you must manually drop the temp index.';
                         RAISERROR(@Msg, 16, 1) WITH NOWAIT;
+
+                        -- Restore lock timeout (prefix ran but suffix did not due to error)
+                        IF @LockTimeoutMs IS NOT NULL
+                            EXEC sys.sp_executesql @LockSuffix;
                     END CATCH
                 END
 
@@ -1588,6 +1596,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 SET @err_number = ERROR_NUMBER();
                 SET @err_message = ERROR_MESSAGE();
+
+                -- Restore lock timeout (prefix ran but suffix did not due to error)
+                IF @LockTimeoutMs IS NOT NULL
+                    EXEC sys.sp_executesql @LockSuffix;
 
                 UPDATE @ExecLog
                   SET end_time = @end,

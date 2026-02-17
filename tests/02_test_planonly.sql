@@ -220,6 +220,31 @@ GO
 ------------------------------------------------------------------------
 RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 2D2: PlanOnly, @MaxPages filter (low cap)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @CpuSource = 'NONE',
+    @MaxPages  = 100,
+    @MinPages  = 1,
+    @PlanOnly  = 1;
+
+-- 2D2-1: Should return 0 targets (all test heaps > 100 pages)
+DECLARE @2d2_count int = (SELECT COUNT(*) FROM #Results);
+IF @2d2_count = 0
+    RAISERROR(N'  PASS 2D2-1: Zero targets returned (all heaps above 100 page cap).', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2d2_msg nvarchar(200) = N'  *** FAIL 2D2-1: Expected 0 targets with @MaxPages=100, found ' + CAST(@2d2_count AS nvarchar(10));
+    RAISERROR(@2d2_msg, 10, 1) WITH NOWAIT;
+END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
 RAISERROR(N' TEST 2E: PlanOnly, @OnlinePreference = OFF', 10, 1) WITH NOWAIT;
 RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
 
