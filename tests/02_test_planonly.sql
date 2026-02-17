@@ -5,6 +5,16 @@ Tests @PlanOnly = 1 across all CPU source modes and action preferences.
 Uses INSERT...EXEC to capture the target list result set and runs automated
 PASS/FAIL assertions against it.
 
+IMPORTANT: INSERT...EXEC nesting limitation
+  SQL Server does not allow nested INSERT...EXEC.  These tests use
+  INSERT #Results EXEC dbo.sp_HeapDoctor ... to capture output.  If
+  @CpuSource = 'QUICKIESTORE' is active, sp_HeapDoctor internally does
+  INSERT #Quickie EXEC sp_executesql @InnerSql, which creates a nested
+  INSERT...EXEC and will fail with:
+    "An INSERT EXEC statement cannot be nested."
+  Therefore, QUICKIESTORE tests in this file must NOT use the INSERT...EXEC
+  capture pattern.  Use direct EXEC (visual inspection) instead.
+
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 02_test_planonly.sql
   (add -E for Windows auth, -U/-P for SQL auth, or -G for Azure AD)

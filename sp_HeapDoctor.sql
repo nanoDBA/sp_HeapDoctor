@@ -1405,7 +1405,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 SET @Msg = N'Time limit (' + CAST(@MaxRunSeconds AS nvarchar(10)) + N' seconds) reached. Stopping gracefully.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
-                -- Log all remaining targets as SKIPPED
+                -- Log all remaining targets as SKIPPED (both in-memory and CommandLog)
                 INSERT @ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
                 SELECT
                     target_id,
@@ -1420,6 +1420,37 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 WHERE sort_order >= @cur_sort;
 
                 SET @skipped_cnt += (SELECT COUNT(*) FROM #Targets WHERE sort_order >= @cur_sort);
+
+                -- Persist SKIPPED entries to CommandLog
+                IF @commandlog_exists = 1
+                BEGIN
+                    INSERT INTO dbo.CommandLog
+                        (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
+                         StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+                    SELECT
+                        database_name,
+                        schema_name,
+                        table_name,
+                        N'U',
+                        command_text,
+                        action_chosen,
+                        SYSDATETIME(),
+                        SYSDATETIME(),
+                        NULL,
+                        N'SKIPPED: @MaxRunSeconds reached.',
+                        (
+                            SELECT
+                                page_count AS PageCount,
+                                CAST(page_count AS decimal(18,2)) / 128.0 AS SizeMB,
+                                forwarded_record_count AS ForwardedRecords,
+                                forwarded_pct AS ForwardedPct,
+                                total_cpu_ms AS TotalCpuMs
+                            FOR XML RAW(N'ExtendedInfo'), ELEMENTS
+                        )
+                    FROM #Targets
+                    WHERE sort_order >= @cur_sort;
+                END
+
                 BREAK;
             END
 
@@ -1635,7 +1666,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             );
         END
 
-        SELECT * FROM @ExecLog ORDER BY target_id;
+        SELECT * FROM @ExecLog ORDER BY start_time, target_id;
     END
 END
 GO

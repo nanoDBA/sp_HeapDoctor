@@ -9,6 +9,12 @@ Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 03_test_execute.sql
   (add -E for Windows auth, -U/-P for SQL auth, or -G for Azure AD)
 
 WARNING: This script modifies tables. It re-creates forwarded records between tests.
+
+NOTE: INSERT...EXEC nesting limitation
+  Tests that capture sp_HeapDoctor output via INSERT...EXEC cannot use
+  @CpuSource = 'QUICKIESTORE', because sp_HeapDoctor internally uses
+  INSERT...EXEC for the QuickieStore path, and SQL Server does not allow
+  nested INSERT...EXEC.  See 02_test_planonly.sql header for details.
 */
 
 SET NOCOUNT ON;
