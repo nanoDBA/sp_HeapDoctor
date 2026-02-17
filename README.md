@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server**
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0217e
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -9,6 +9,16 @@ Your heaps have forwarded records.  You know they do.  You've been meaning to de
 When a variable-length row on a heap grows beyond its original page, SQL Server doesn't move it cleanly.  It leaves a forwarding pointer on the old page and puts the row on a new page.  Every single read that follows that pointer does **double the I/O**.  At scale, forwarded records silently degrade scan and seek performance on heaps, and "silently" is the operative word because nothing in your monitoring is going to flag this until you go looking.
 
 Most DBAs fix this manually: run `dm_db_index_physical_stats`, squint at the results, decide which tables matter, write ALTER TABLE REBUILD, hope they picked the right ones.  sp_HeapDoctor does all of that, except it uses Query Store CPU data instead of squinting.
+
+## Philosophy
+
+sp_HeapDoctor is built around three ideas:
+
+1. **Rank by impact, not by size.**  A 10 GB heap with zero Query Store activity is less important than a 500 MB heap driving 200K CPU ms of table scans.  The proc uses Query Store showplan XML to attribute CPU to heap objects via `Table Scan` operators, then supplements with `forwarded_fetch_count` (runtime pointer traversals) and structural severity (`forwarded_pct * page_count`).  All three signals feed a mixed ranking formula so that heaps are rebuilt in order of actual pain.
+
+2. **Measure before you fix.**  Every rebuild captures a before-snapshot of Query Store runtime stats (logical reads, physical reads, duration, executions) and a list of `query_hash` values per heap.  These are persisted in CommandLog `ExtendedInfo` XML.  Because `query_hash` is stable across plan recompilation and CI_SWAP DDL changes, you can query current QS data by the same hashes to measure whether the rebuild actually helped.
+
+3. **Safe defaults, escape hatches.**  Plan-only mode is the default.  Lock timeouts, time limits, online preference, and CI swap are all opt-in.  The proc warns about write-heavy heaps (forwarded records will recur), pre-flight lock contention, and online-to-offline fallback rather than making silent decisions.
 
 ## Key Features
 
@@ -132,6 +142,87 @@ EXEC dbo.sp_HeapDoctor
 | `@Debug` | `0` | Extra diagnostic output (database list, target details, environment info) |
 | `@Help` | `0` | Print parameter documentation and return |
 
+## Result Set Columns
+
+The target list result set (returned in both plan-only and execute modes) contains the following columns:
+
+### Identity and Location
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `version` | nvarchar | Procedure version string |
+| `target_id` | int | Row identity (stable within a run) |
+| `sort_order` | int | Execution priority (1 = first to rebuild) |
+| `database_name` | sysname | Target database |
+| `schema_name` | sysname | Schema |
+| `table_name` | sysname | Table name |
+
+### Physical Stats (from dm_db_index_physical_stats, SAMPLED mode)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `page_count` | bigint | Total pages in the heap |
+| `record_count` | bigint | Row count estimate |
+| `forwarded_record_count` | bigint | Forwarded records found (SAMPLED estimate) |
+| `forwarded_pct` | decimal(6,2) | `forwarded_record_count / record_count * 100` |
+| `avg_page_space_pct` | decimal(5,2) | Average page space used (%). Low values suggest compaction opportunity |
+| `avg_frag_pct` | decimal(5,2) | Logical fragmentation %. Less meaningful for heaps than B-trees |
+| `ghost_record_count` | bigint | Ghost records awaiting cleanup. Rebuild reclaims these |
+
+### Operational Stats (from dm_db_index_operational_stats)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `forwarded_fetch_count` | bigint | Cumulative count of forwarded pointer traversals since server restart. The runtime impact metric: how often forwarded records are actually being followed |
+
+### CPU and Ranking
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `total_cpu_ms` | bigint | Query Store CPU attributed to this heap (Table Scan operators only). NULL when `@CpuSource = 'NONE'` |
+| `ranking_basis` | varchar(20) | How this target was ranked: `QS_CPU` (Query Store data available), `QS_NO_DATA` (QS active but no matching plans), `FWD_PCT` (CPU source is NONE) |
+
+### CI Swap Info
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `nci_count` | int | Nonclustered index count. Each NCI is rebuilt twice during CI swap |
+| `key_source_index` | sysname | NC index used as CI swap key source. NULL if no safe key or CI swap disabled |
+
+### Action and Commands
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `action_chosen` | varchar(32) | `HEAP_REBUILD_ONLINE`, `HEAP_REBUILD_OFFLINE`, or `CI_SWAP_ONLINE` |
+| `command_text` | nvarchar(max) | The rebuild command (3-part name) |
+| `ci_drop_command` | nvarchar(max) | DROP INDEX command for CI swap cleanup. NULL for heap rebuilds |
+
+### Estimation (when @EstimateTime = 1)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `est_pages_per_sec` | float | Throughput rate from CommandLog history (pages/sec by action type) |
+| `est_seconds` | int | Estimated rebuild time in seconds |
+| `est_duration` | nvarchar(20) | Human-readable estimate (`HH:MM:SS` format) |
+
+### Query Store Snapshot (when @CpuSource is QUERY_STORE or QUICKIESTORE)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `qs_snapshot_time_utc` | datetime2(3) | UTC timestamp when QS data was captured |
+| `qs_total_logical_reads` | bigint | Total logical reads across all plans referencing this heap |
+| `qs_total_physical_reads` | bigint | Total physical reads |
+| `qs_total_duration_ms` | bigint | Total duration in ms |
+| `qs_total_executions` | bigint | Total execution count |
+| `qs_plan_count` | int | Distinct plan_ids referencing this heap |
+| `qs_query_count` | int | Distinct query_ids (a query can have multiple plans) |
+
+### Usage Analysis
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `usage_hint` | varchar(30) | `WRITE_ONLY` (zero reads), `WRITE_HEAVY` (more updates than reads), or NULL (normal read pattern). Forwarded records recur on write-heavy heaps |
+
 ## How It Works
 
 1. **Database selection** - parses `@Databases` using the Ola Hallengren pattern (wildcards, exclusions, AG awareness).  AG secondaries are automatically skipped because you can't rebuild on a read-only replica, no matter how badly you want to.
@@ -157,6 +248,26 @@ This eliminates forwarded records by physically reordering the data.  The temp C
 - Not on Enterprise/Developer edition
 
 **Trade-off:** Every nonclustered index on the table gets rebuilt when the clustered index is created, *and again* when it's dropped.  Check the `nci_count` column in the output before committing to this.  A table with 2 NCIs?  Sure.  A table with 15 NCIs?  Maybe just do the heap rebuild.
+
+## Remediation Time Estimation
+
+When `@EstimateTime = 1`, each target gets a predicted rebuild time based on two data sources:
+
+1. **CommandLog history** (plan-only and execute modes) - queries previous `HEAP_REBUILD_*` / `CI_SWAP_*` entries from the last `@EstimateLookbackDays` days (default 90).  Computes median pages/sec by action type (online, offline, CI swap separately, because they have very different throughput).  If no history exists, estimates are NULL.
+
+2. **Live calibration** (execute mode only) - after each rebuild completes, the proc measures actual pages/sec and blends it with the historical rate.  Remaining targets get updated estimates based on observed throughput.  This handles hardware differences between servers that share the same CommandLog.
+
+The `est_duration` column shows the estimate in `HH:MM:SS` format.  A banner line shows the total estimated remediation time across all targets.
+
+```sql
+-- Plan-only with time estimates
+EXEC dbo.sp_HeapDoctor
+    @Databases     = 'USER_DATABASES',
+    @EstimateTime  = 1,
+    @PlanOnly      = 1;
+```
+
+**First run:** No history means no estimates.  Run a small batch with `@TopN = 3` first to seed CommandLog, then subsequent runs will have throughput data.
 
 ## CommandLog Integration
 
@@ -197,6 +308,60 @@ SELECT * FROM dbo.CommandLog
 WHERE CommandType LIKE 'HEAP_REBUILD%'
 ORDER BY StartTime DESC;
 ```
+
+### Before/After Comparison
+
+After a rebuild, you can compare current Query Store performance against the before-snapshot stored in CommandLog.  The `QsQueryHashes` element provides stable query identifiers that survive plan recompilation:
+
+```sql
+-- Compare before-rebuild snapshot with current QS performance for a specific table
+DECLARE @table_name sysname = N'MyTable';
+
+;WITH BeforeSnapshot AS (
+    SELECT
+        ObjectName,
+        StartTime,
+        ExtendedInfo.value('(/ExtendedInfo/QsTotalLogicalReads)[1]', 'bigint') AS before_logical_reads,
+        ExtendedInfo.value('(/ExtendedInfo/QsTotalDurationMs)[1]', 'bigint') AS before_duration_ms,
+        ExtendedInfo.value('(/ExtendedInfo/QsTotalExecutions)[1]', 'bigint') AS before_executions,
+        ExtendedInfo.value('(/ExtendedInfo/QsQueryHashes)[1]', 'nvarchar(max)') AS query_hashes
+    FROM dbo.CommandLog
+    WHERE CommandType IN ('HEAP_REBUILD_ONLINE','HEAP_REBUILD_OFFLINE','CI_SWAP_ONLINE')
+      AND ObjectName = @table_name
+      AND ErrorNumber = 0
+      AND ExtendedInfo.exist('(/ExtendedInfo/QsQueryHashes)[1]') = 1
+),
+-- Split comma-separated query_hashes and look up current QS stats
+CurrentQS AS (
+    SELECT
+        SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_logical_io_reads)) AS current_logical_reads,
+        SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_duration)) / 1000 AS current_duration_ms,
+        SUM(CONVERT(bigint, rs.count_executions)) AS current_executions
+    FROM sys.query_store_runtime_stats rs
+    JOIN sys.query_store_plan p ON rs.plan_id = p.plan_id
+    JOIN sys.query_store_query q ON p.query_id = q.query_id
+    WHERE CONVERT(varchar(18), q.query_hash, 1) IN (
+        SELECT TRIM(value)
+        FROM BeforeSnapshot
+        CROSS APPLY STRING_SPLIT(query_hashes, ',')
+    )
+)
+SELECT
+    b.ObjectName,
+    b.StartTime AS rebuild_time,
+    b.before_logical_reads,
+    c.current_logical_reads,
+    CASE WHEN b.before_logical_reads > 0
+         THEN CAST(100.0 * (b.before_logical_reads - c.current_logical_reads)
+              / b.before_logical_reads AS decimal(5,1))
+         END AS pct_reduction,
+    b.before_duration_ms,
+    c.current_duration_ms
+FROM BeforeSnapshot b
+CROSS JOIN CurrentQS c;
+```
+
+This query joins the before-snapshot `query_hash` values against current Query Store data.  A positive `pct_reduction` means the rebuild improved logical read performance for those queries.
 
 ## Known Limitations and Notes
 
