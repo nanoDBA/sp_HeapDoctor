@@ -412,6 +412,12 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
         RETURN;
     END
 
+    IF @EstimateLookbackDays IS NOT NULL AND @EstimateLookbackDays <= 0
+    BEGIN
+        RAISERROR(N'@EstimateLookbackDays must be a positive integer.', 16, 1);
+        RETURN;
+    END
+
     ----------------------------------------------------------------------------
     -- Environment / capability gating
     ----------------------------------------------------------------------------

@@ -275,5 +275,35 @@ END CATCH
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4R: Negative @EstimateLookbackDays', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @EstimateLookbackDays = -1, @PlanOnly = 1;
+    RAISERROR(N'*** FAIL: Should have raised error for negative EstimateLookbackDays ***', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4R nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4R, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4S: Zero @EstimateLookbackDays', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @EstimateLookbackDays = 0, @PlanOnly = 1;
+    RAISERROR(N'*** FAIL: Should have raised error for zero EstimateLookbackDays ***', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4S nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4S, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'Negative tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
 GO
