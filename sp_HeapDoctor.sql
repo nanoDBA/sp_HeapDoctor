@@ -50,9 +50,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.1.2026.0216
+Version:    1.2.2026.0216
 
-History:    1.1.2026.0216 - Pre-release hardening
+History:    1.2.2026.0216 - Test-driven bug fixes
+                          - @Debug parameter now functional (database list, target details)
+                          - @OnlinePreference='ON' warns when edition forces offline fallback
+                          - SizeMB in CommandLog ExtendedInfo uses decimal instead of integer division
+                          - QUICKIESTORE path re-ranks targets after CPU update
+            1.1.2026.0216 - Pre-release hardening
                           - Azure SQL DB / Managed Instance edition detection via EngineEdition
                           - XPath filter: Table Scan RelOps only (no false CPU from index seeks)
                           - QS XML pre-filter: LIKE on plan text before TRY_CONVERT(xml)
@@ -288,7 +293,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.1.2026.0216';
+    DECLARE @Version nvarchar(20) = N'1.2.2026.0216';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -394,6 +399,11 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
             WHEN @OnlinePreference = 'OFF' THEN 0
             ELSE IIF(@CanOnline = 1, 1, 0)  -- AUTO
         END;
+
+    IF @OnlinePreference = 'ON' AND @CanOnline = 0
+    BEGIN
+        RAISERROR(N'WARNING: @OnlinePreference = ON but this edition does not support online index operations. Falling back to offline rebuilds.', 10, 1) WITH NOWAIT;
+    END
 
     DECLARE @start_time datetime2(3) = SYSDATETIME();
 
@@ -634,6 +644,28 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
 
     SET @Msg = N'Databases:   ' + CAST(@DatabaseCount AS nvarchar(10)) + N' selected';
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+    IF @Debug = 1
+    BEGIN
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'[DEBUG] EngineEdition = %d, CanOnline = %d, Online = %d', 10, 1, @EngineEdition, @CanOnline, @Online) WITH NOWAIT;
+        RAISERROR(N'[DEBUG] Selected databases:', 10, 1) WITH NOWAIT;
+
+        DECLARE @dbg_cursor sysname;
+        DECLARE dbg_db CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DatabaseName FROM @tmpDatabases WHERE Selected = 1 ORDER BY ID;
+        OPEN dbg_db;
+        FETCH NEXT FROM dbg_db INTO @dbg_cursor;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @Msg = N'[DEBUG]   ' + @dbg_cursor;
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            FETCH NEXT FROM dbg_db INTO @dbg_cursor;
+        END
+        CLOSE dbg_db;
+        DEALLOCATE dbg_db;
+    END
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     ----------------------------------------------------------------------------
@@ -660,7 +692,8 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
         has_lob_columns          bit            NOT NULL DEFAULT 0,
         action_chosen            varchar(32)    NOT NULL,
         command_text             nvarchar(max)  NOT NULL,
-        ci_drop_command          nvarchar(max)  NULL
+        ci_drop_command          nvarchar(max)  NULL,
+        sort_order               int            NOT NULL DEFAULT 0
     );
 
     DECLARE @ExecLog TABLE
@@ -1006,6 +1039,9 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         END CATCH;
 
+        -- Set sort_order = target_id for newly inserted rows
+        UPDATE #Targets SET sort_order = target_id WHERE sort_order = 0;
+
         -- Mark database as completed
         UPDATE @tmpDatabases SET Completed = 1 WHERE ID = @CurrentDatabaseID;
     END
@@ -1138,6 +1174,22 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         END
 
         DROP TABLE #CpuByPlan;
+
+        /*
+        Re-rank targets after QUICKIESTORE CPU update. The execution loop iterates
+        by sort_order, so we reassign sort_order to reflect the updated ranking.
+        */
+        ;WITH Reranked AS
+        (
+            SELECT
+                target_id,
+                sort_order,
+                ROW_NUMBER() OVER (
+                    ORDER BY COALESCE(total_cpu_ms, 0) + CAST(forwarded_pct * page_count AS bigint) DESC
+                ) AS new_rank
+            FROM #Targets
+        )
+        UPDATE Reranked SET sort_order = new_rank;
     END
 
     ----------------------------------------------------------------------------
@@ -1164,12 +1216,42 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RETURN;
     END
 
+    IF @Debug = 1
+    BEGIN
+        RAISERROR(N'[DEBUG] Target details:', 10, 1) WITH NOWAIT;
+        DECLARE @dbg_tid int, @dbg_db sysname, @dbg_tbl sysname, @dbg_action varchar(32),
+                @dbg_pages bigint, @dbg_fwd decimal(6,2), @dbg_cpu bigint, @dbg_basis varchar(20);
+        DECLARE dbg_tgt CURSOR LOCAL FAST_FORWARD FOR
+            SELECT target_id, database_name, table_name, action_chosen,
+                   page_count, forwarded_pct, total_cpu_ms, ranking_basis
+            FROM #Targets ORDER BY sort_order;
+        OPEN dbg_tgt;
+        FETCH NEXT FROM dbg_tgt INTO @dbg_tid, @dbg_db, @dbg_tbl, @dbg_action,
+                                     @dbg_pages, @dbg_fwd, @dbg_cpu, @dbg_basis;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @Msg = N'[DEBUG]   #' + CAST(@dbg_tid AS nvarchar(10))
+                     + N' ' + @dbg_db + N'.' + @dbg_tbl
+                     + N' | ' + @dbg_action
+                     + N' | pages=' + CAST(@dbg_pages AS nvarchar(20))
+                     + N' fwd=' + CAST(@dbg_fwd AS nvarchar(10)) + N'%'
+                     + N' cpu=' + ISNULL(CAST(@dbg_cpu AS nvarchar(20)), N'NULL')
+                     + N' basis=' + @dbg_basis;
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            FETCH NEXT FROM dbg_tgt INTO @dbg_tid, @dbg_db, @dbg_tbl, @dbg_action,
+                                         @dbg_pages, @dbg_fwd, @dbg_cpu, @dbg_basis;
+        END
+        CLOSE dbg_tgt;
+        DEALLOCATE dbg_tgt;
+    END
+
     ----------------------------------------------------------------------------
     -- Output: target list (always shown)
     ----------------------------------------------------------------------------
     SELECT
         @Version AS version,
         target_id,
+        sort_order,
         database_name,
         schema_name,
         table_name,
@@ -1183,19 +1265,20 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         key_source_index,
         action_chosen
     FROM #Targets
-    ORDER BY database_name, target_id;
+    ORDER BY sort_order;
 
     ----------------------------------------------------------------------------
     -- Output: commands (always shown)
     ----------------------------------------------------------------------------
     SELECT
         target_id,
+        sort_order,
         database_name,
         action_chosen,
         command_text,
         ci_drop_command
     FROM #Targets
-    ORDER BY database_name, target_id;
+    ORDER BY sort_order;
 
     ----------------------------------------------------------------------------
     -- Execute if requested
@@ -1209,6 +1292,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
         DECLARE
             @i              int = 0,
+            @cur_sort       int,
             @tid            int,
             @db             sysname,
             @schema         sysname,
@@ -1283,13 +1367,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         END
 
         /*
-        WHILE loop - iterate by target_id order.
+        WHILE loop - iterate by sort_order.
         Commands already use 3-part names (db.schema.table) so no USE statement needed.
         */
         WHILE 1 = 1
         BEGIN
             -- Get next target
             SELECT TOP (1)
+                @cur_sort       = sort_order,
                 @tid            = target_id,
                 @db             = database_name,
                 @schema         = schema_name,
@@ -1303,12 +1388,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @cur_fwd_pct    = forwarded_pct,
                 @cur_cpu_ms     = total_cpu_ms
             FROM #Targets
-            WHERE target_id > @i
-            ORDER BY target_id;
+            WHERE sort_order > @i
+            ORDER BY sort_order;
 
             IF @@ROWCOUNT = 0 BREAK;
 
-            SET @i = @tid;
+            SET @i = @cur_sort;
 
             /*
             Time limit check
@@ -1332,9 +1417,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     NULL,
                     N'SKIPPED: @MaxRunSeconds reached.'
                 FROM #Targets
-                WHERE target_id >= @tid;
+                WHERE sort_order >= @cur_sort;
 
-                SET @skipped_cnt += (SELECT COUNT(*) FROM #Targets WHERE target_id >= @tid);
+                SET @skipped_cnt += (SELECT COUNT(*) FROM #Targets WHERE sort_order >= @cur_sort);
                 BREAK;
             END
 
@@ -1434,7 +1519,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     SET @extended_info = (
                         SELECT
                             @cur_page_count AS PageCount,
-                            @cur_page_count / 128 AS SizeMB,
+                            CAST(@cur_page_count AS decimal(18,2)) / 128.0 AS SizeMB,
                             @cur_fwd_count AS ForwardedRecords,
                             @cur_fwd_pct AS ForwardedPct,
                             @cur_cpu_ms AS TotalCpuMs,
@@ -1479,7 +1564,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     SET @extended_info = (
                         SELECT
                             @cur_page_count AS PageCount,
-                            @cur_page_count / 128 AS SizeMB,
+                            CAST(@cur_page_count AS decimal(18,2)) / 128.0 AS SizeMB,
                             @cur_fwd_count AS ForwardedRecords,
                             @cur_fwd_pct AS ForwardedPct,
                             @cur_cpu_ms AS TotalCpuMs

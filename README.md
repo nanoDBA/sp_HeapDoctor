@@ -109,7 +109,7 @@ EXEC dbo.sp_HeapDoctor
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | `Y` = log to `dbo.CommandLog`, `N` = no logging |
-| `@Debug` | `0` | Extra diagnostic output |
+| `@Debug` | `0` | Extra diagnostic output (database list, target details, environment info) |
 | `@Help` | `0` | Print parameter documentation and return |
 
 ## How It Works
@@ -150,7 +150,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 ```xml
 <ExtendedInfo>
   <PageCount>12345</PageCount>
-  <SizeMB>96</SizeMB>
+  <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
   <ForwardedPct>3.50</ForwardedPct>
   <TotalCpuMs>150000</TotalCpuMs>

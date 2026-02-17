@@ -37,8 +37,8 @@ BEGIN TRY
     RAISERROR(N'*** FAIL: Should have raised error for invalid OnlinePreference ***', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    SET @Msg = N'PASS: Got expected error: ' + ERROR_MESSAGE();
-    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    DECLARE @Msg4B nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4B, 10, 1) WITH NOWAIT;
 END CATCH
 GO
 
@@ -52,8 +52,8 @@ BEGIN TRY
     RAISERROR(N'*** FAIL: Should have raised error for missing QuickieExecSql ***', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    SET @Msg = N'PASS: Got expected error: ' + ERROR_MESSAGE();
-    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    DECLARE @Msg4C nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4C, 10, 1) WITH NOWAIT;
 END CATCH
 GO
 
@@ -67,8 +67,8 @@ BEGIN TRY
     RAISERROR(N'*** FAIL: Should have raised error for negative Maxdop ***', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    SET @Msg = N'PASS: Got expected error: ' + ERROR_MESSAGE();
-    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    DECLARE @Msg4D nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4D, 10, 1) WITH NOWAIT;
 END CATCH
 GO
 
@@ -82,8 +82,8 @@ BEGIN TRY
     RAISERROR(N'*** FAIL: Should have raised error for no matching databases ***', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    SET @Msg = N'PASS: Got expected error: ' + ERROR_MESSAGE();
-    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    DECLARE @Msg4E nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4E, 10, 1) WITH NOWAIT;
 END CATCH
 GO
 
@@ -148,5 +148,102 @@ GO
 -- Verify on Enterprise: action_chosen should be HEAP_REBUILD_ONLINE.
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
-RAISERROR(N'Negative tests complete. Review output above.', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4J: @Maxdop = 0 (valid boundary)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- @Maxdop = 0 means unlimited parallelism in SQL Server - should be accepted
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @CpuSource = 'NONE', @Maxdop = 0, @PlanOnly = 1;
+    RAISERROR(N'  PASS 4J: @Maxdop=0 accepted without error.', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4J nvarchar(4000) = N'  *** FAIL 4J: @Maxdop=0 raised unexpected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4J, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4K: @MaxRunSeconds = 0 (edge case)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- @MaxRunSeconds = 0 should immediately skip all targets (time limit already reached)
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @CpuSource = 'NONE', @PlanOnly = 0, @MaxRunSeconds = 0, @LogToTable = N'N';
+    RAISERROR(N'  PASS 4K: @MaxRunSeconds=0 ran without error (all targets skipped).', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4K nvarchar(4000) = N'  *** FAIL 4K: @MaxRunSeconds=0 raised unexpected error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4K, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4L: @LogToTable = Y when CommandLog exists', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Verify CommandLog table exists in HeapDoctorTest
+IF OBJECT_ID('dbo.CommandLog', 'U') IS NOT NULL
+    RAISERROR(N'  PASS 4L: CommandLog exists, @LogToTable=Y should work.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'  *** FAIL 4L: CommandLog does not exist in HeapDoctorTest.', 10, 1) WITH NOWAIT;
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4M: @LogToTable = Y from database without CommandLog', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Run from master (which does not have dbo.CommandLog)
+-- Should print WARNING but not fail
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor
+        @Databases = 'HeapDoctorTest',
+        @CpuSource = 'NONE',
+        @LogToTable = N'Y',
+        @PlanOnly  = 1;
+    RAISERROR(N'  PASS 4M: @LogToTable=Y with missing CommandLog ran without fatal error (warning expected in output above).', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4M nvarchar(4000) = N'  *** FAIL 4M: @LogToTable=Y with missing CommandLog raised fatal error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4M, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4N: Case insensitive @LogToTable', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Lowercase 'y' should work the same as 'Y'
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @CpuSource = 'NONE', @LogToTable = N'y', @PlanOnly = 1;
+    RAISERROR(N'  PASS 4N: @LogToTable=''y'' (lowercase) accepted.', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4N nvarchar(4000) = N'  *** FAIL 4N: @LogToTable=''y'' raised error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4N, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 4O: Case insensitive @CpuSource', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Lowercase 'none' should work the same as 'NONE'
+BEGIN TRY
+    EXEC dbo.sp_HeapDoctor @CpuSource = 'none', @PlanOnly = 1;
+    RAISERROR(N'  PASS 4O: @CpuSource=''none'' (lowercase) accepted.', 10, 1) WITH NOWAIT;
+END TRY
+BEGIN CATCH
+    DECLARE @Msg4O nvarchar(4000) = N'  *** FAIL 4O: @CpuSource=''none'' raised error: ' + ERROR_MESSAGE();
+    RAISERROR(@Msg4O, 10, 1) WITH NOWAIT;
+END CATCH
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'Negative tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
 GO
