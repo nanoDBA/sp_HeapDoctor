@@ -801,7 +801,7 @@ BEGIN
         ;WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan''),
         HeapPlans AS
         (
-            -- Pre-filter: only parse plans whose text contains a heap table name (Pedro Lopes)
+            -- Pre-filter: only parse plans whose text contains a heap table name
             SELECT p.plan_id, TRY_CONVERT(xml, p.query_plan) AS plan_xml
             FROM sys.query_store_plan p
             JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
@@ -809,8 +809,8 @@ BEGIN
         ),
         PlanObj AS
         (
-            -- Filter to Table Scan RelOps only — those are the operations that traverse
-            -- forwarded record pointers. Index Seeks/Scans on NCIs don''t hit them. (Grant Fritchey)
+            -- Filter to Table Scan RelOps only. These are the operations that traverse
+            -- forwarded record pointers. Index Seeks/Scans on NCIs don''t hit them.
             SELECT DISTINCT
                 hp.plan_id,
                 REPLACE(REPLACE(obj.value(''@Schema'',''sysname''), N''['', N''''), N'']'', N'''') AS schema_name,
@@ -909,7 +909,7 @@ Ranked AS
         CASE WHEN lt.object_id IS NOT NULL THEN 1 ELSE 0 END AS has_lob_columns,
         ROW_NUMBER() OVER (ORDER BY
             -- Mixed ranking: use CPU when available, fall back to forwarded_pct.
-            -- NULL CPU no longer penalized vs low CPU (Jeff Moden).
+            -- NULL CPU no longer penalized vs low CPU.
             COALESCE(cbo.total_cpu_ms, 0) + CAST(h.forwarded_pct * h.page_count AS bigint) DESC
         ) AS target_rank
     FROM #Heaps h
@@ -1398,8 +1398,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 SET @succeeded_cnt += 1;
 
                 /*
-                Post-rebuild verification: confirm forwarded records are gone (Jeff Moden).
-                Uses SAMPLED mode for speed — this is a spot-check, not a guarantee.
+                Post-rebuild verification: confirm forwarded records are gone.
+                Uses SAMPLED mode for speed. This is a spot-check, not a guarantee.
                 */
                 SET @post_fwd_count = NULL;
                 BEGIN TRY

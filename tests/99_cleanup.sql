@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness — Cleanup
+sp_HeapDoctor Test Harness - Cleanup
 
 Drops the test database.
 

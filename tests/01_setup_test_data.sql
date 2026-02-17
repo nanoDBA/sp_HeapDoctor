@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness — Step 1: Setup Test Data
+sp_HeapDoctor Test Harness - Step 1: Setup Test Data
 
 Creates a test database with:
   - Heap tables with forwarded records

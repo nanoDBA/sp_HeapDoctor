@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness — Step 2: Plan-Only Tests
+sp_HeapDoctor Test Harness - Step 2: Plan-Only Tests
 
 Tests @PlanOnly = 1 across all CPU source modes and action preferences.
 Validates that targets are found, commands are generated, nothing is executed.

@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness — Step 4: Negative / Edge Case Tests
+sp_HeapDoctor Test Harness - Step 4: Negative / Edge Case Tests
 
 Tests error handling, lock timeouts, invalid inputs, permission edge cases.
 

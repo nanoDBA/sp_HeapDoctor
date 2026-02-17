@@ -1,7 +1,7 @@
 /*
-sp_HeapDoctor Test Harness — Step 3: Execution Tests
+sp_HeapDoctor Test Harness - Step 3: Execution Tests
 
-Tests @PlanOnly = 0 — actually executes rebuilds.
+Tests @PlanOnly = 0 - actually executes rebuilds.
 Verifies forwarded records are eliminated, CommandLog is populated, time limits work.
 
 Prerequisites: Run 01_setup_test_data.sql first (this script re-creates forwarded records as needed).
@@ -211,7 +211,7 @@ GO
 
 -- Verify: ExecLog should show some targets as SKIPPED.
 -- Verify: Summary should show Skipped > 0 (unless all rebuilds completed in < 1 second).
--- Note: On fast hardware, all 3 rebuilds may complete in < 1 second. That's OK —
+-- Note: On fast hardware, all 3 rebuilds may complete in < 1 second. That's OK -
 -- the test validates the code path runs without error.
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
