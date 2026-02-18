@@ -122,7 +122,7 @@ EXEC dbo.sp_HeapDoctor
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@PlanOnly` | `1` | `1` = print commands only, `0` = execute |
-| `@Execute` | `NULL` | Ola Hallengren convention: `Y` = execute (`@PlanOnly=0`), `N` = plan only (`@PlanOnly=1`). Overrides `@PlanOnly` when set |
+| `@Execute` | `NULL` | Ola Hallengren convention: `Y` = execute (`@PlanOnly=0`), `N` = plan only (`@PlanOnly=1`).  Overrides `@PlanOnly` when set |
 | `@Maxdop` | `NULL` | MAXDOP on index operations (`NULL` = omit) |
 | `@LockTimeoutMs` | `NULL` | Per-rebuild lock timeout in ms |
 | `@MaxRunSeconds` | `NULL` | Stop after N seconds (`NULL` = no limit) |
@@ -165,29 +165,29 @@ The target list result set (returned in both plan-only and execute modes) contai
 | `record_count` | bigint | Row count estimate |
 | `forwarded_record_count` | bigint | Forwarded records found (SAMPLED estimate) |
 | `forwarded_pct` | decimal(6,2) | `forwarded_record_count / record_count * 100` |
-| `avg_page_space_pct` | decimal(5,2) | Average page space used (%). Low values suggest compaction opportunity |
-| `avg_frag_pct` | decimal(5,2) | Logical fragmentation %. Less meaningful for heaps than B-trees |
-| `ghost_record_count` | bigint | Ghost records awaiting cleanup. Rebuild reclaims these |
+| `avg_page_space_pct` | decimal(5,2) | Average page space used (%).  Low values suggest compaction opportunity |
+| `avg_frag_pct` | decimal(5,2) | Logical fragmentation %.  Less meaningful for heaps than B-trees |
+| `ghost_record_count` | bigint | Ghost records awaiting cleanup.  Rebuild reclaims these |
 
 ### Operational Stats (from dm_db_index_operational_stats)
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `forwarded_fetch_count` | bigint | Cumulative count of forwarded pointer traversals since server restart. The runtime impact metric: how often forwarded records are actually being followed |
+| `forwarded_fetch_count` | bigint | Cumulative count of forwarded pointer traversals since server restart.  The runtime impact metric: how often forwarded records are actually being followed |
 
 ### CPU and Ranking
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `total_cpu_ms` | bigint | Query Store CPU attributed to this heap (Table Scan operators only). NULL when `@CpuSource = 'NONE'` |
+| `total_cpu_ms` | bigint | Query Store CPU attributed to this heap (Table Scan operators only).  NULL when `@CpuSource = 'NONE'` |
 | `ranking_basis` | varchar(20) | How this target was ranked: `QS_CPU` (Query Store data available), `QS_NO_DATA` (QS active but no matching plans), `FWD_PCT` (CPU source is NONE) |
 
 ### CI Swap Info
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `nci_count` | int | Nonclustered index count. Each NCI is rebuilt twice during CI swap |
-| `key_source_index` | sysname | NC index used as CI swap key source. NULL if no safe key or CI swap disabled |
+| `nci_count` | int | Nonclustered index count.  Each NCI is rebuilt twice during CI swap |
+| `key_source_index` | sysname | NC index used as CI swap key source.  NULL if no safe key or CI swap disabled |
 
 ### Action and Commands
 
@@ -195,7 +195,7 @@ The target list result set (returned in both plan-only and execute modes) contai
 |--------|------|-------------|
 | `action_chosen` | varchar(32) | `HEAP_REBUILD_ONLINE`, `HEAP_REBUILD_OFFLINE`, or `CI_SWAP_ONLINE` |
 | `command_text` | nvarchar(max) | The rebuild command (3-part name) |
-| `ci_drop_command` | nvarchar(max) | DROP INDEX command for CI swap cleanup. NULL for heap rebuilds |
+| `ci_drop_command` | nvarchar(max) | DROP INDEX command for CI swap cleanup.  NULL for heap rebuilds |
 
 ### Estimation (when @EstimateTime = 1)
 
@@ -221,8 +221,8 @@ The target list result set (returned in both plan-only and execute modes) contai
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `usage_hint` | varchar(30) | `WRITE_ONLY` (zero reads), `WRITE_HEAVY` (more updates than reads), or NULL (normal read pattern). Forwarded records recur on write-heavy heaps |
-| `ranking_score` | decimal(8,4) | LOG10-normalized composite score. Higher = more impactful. Formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`, penalized for write-heavy patterns |
+| `usage_hint` | varchar(30) | `WRITE_ONLY` (zero reads), `WRITE_HEAVY` (more updates than reads), or NULL (normal read pattern).  Forwarded records recur on write-heavy heaps |
+| `ranking_score` | decimal(8,4) | LOG10-normalized composite score.  Higher = more impactful.  Formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`, penalized for write-heavy patterns |
 
 ## How It Works
 
