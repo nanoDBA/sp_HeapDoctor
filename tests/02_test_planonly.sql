@@ -61,6 +61,7 @@ CREATE TABLE #Results
     qs_plan_count          int           NULL,
     qs_query_count         int           NULL,
     usage_hint             varchar(30)   NULL,
+    ranking_score          decimal(8,4)  NULL,
     command_text           nvarchar(max) NULL,
     ci_drop_command        nvarchar(max) NULL
 );
@@ -565,6 +566,71 @@ ELSE
 BEGIN
     DECLARE @2m_msg1 nvarchar(200) = N'  INFO 2M-1: usage_hint populated for ' + CAST(@2m_hinted AS nvarchar(10)) + N' target(s). Expected NULL for read-heavy test heaps.';
     RAISERROR(@2m_msg1, 10, 1) WITH NOWAIT;
+END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 2N: ranking_score (LOG10-normalized)', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Re-use existing #Results from 2K (CpuSource=NONE, all heaps present)
+
+-- 2N-1: ranking_score should be populated (NOT NULL) for all targets
+DECLARE @2n_score_count int = (SELECT COUNT(*) FROM #Results WHERE ranking_score IS NOT NULL);
+DECLARE @2n_total_count int = (SELECT COUNT(*) FROM #Results);
+IF @2n_score_count = @2n_total_count AND @2n_total_count > 0
+    RAISERROR(N'  PASS 2N-1: ranking_score populated for all targets.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2n_msg1 nvarchar(200) = N'  *** FAIL 2N-1: ranking_score populated for ' + CAST(@2n_score_count AS nvarchar(10)) + N'/' + CAST(@2n_total_count AS nvarchar(10)) + N' targets.';
+    RAISERROR(@2n_msg1, 10, 1) WITH NOWAIT;
+END
+
+-- 2N-2: ranking_score should be > 0 (forwarded_pct > 0 guarantees a positive score)
+DECLARE @2n_positive int = (SELECT COUNT(*) FROM #Results WHERE ranking_score > 0);
+IF @2n_positive = @2n_total_count AND @2n_total_count > 0
+    RAISERROR(N'  PASS 2N-2: ranking_score > 0 for all targets.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2n_msg2 nvarchar(200) = N'  *** FAIL 2N-2: Expected all ranking_score > 0, got ' + CAST(@2n_positive AS nvarchar(10)) + N'/' + CAST(@2n_total_count AS nvarchar(10));
+    RAISERROR(@2n_msg2, 10, 1) WITH NOWAIT;
+END
+
+-- 2N-3: sort_order should match ranking_score descending (highest score = sort_order 1)
+DECLARE @2n_order_bad int = (
+    SELECT COUNT(*)
+    FROM #Results r1
+    INNER JOIN #Results r2
+        ON r1.sort_order < r2.sort_order
+       AND r1.ranking_score < r2.ranking_score
+);
+IF @2n_order_bad = 0
+    RAISERROR(N'  PASS 2N-3: sort_order matches ranking_score descending order.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2n_msg3 nvarchar(200) = N'  *** FAIL 2N-3: ' + CAST(@2n_order_bad AS nvarchar(10)) + N' sort_order violations vs ranking_score.';
+    RAISERROR(@2n_msg3, 10, 1) WITH NOWAIT;
+END
+
+-- 2N-4: With QS CPU data, ranking_score should be higher for targets with CPU
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @CpuSource = 'QUERY_STORE',
+    @PlanOnly  = 1;
+
+DECLARE @2n_with_cpu decimal(8,4) = (SELECT MAX(ranking_score) FROM #Results WHERE total_cpu_ms IS NOT NULL AND total_cpu_ms > 0);
+DECLARE @2n_no_cpu decimal(8,4) = (SELECT MAX(ranking_score) FROM #Results WHERE total_cpu_ms IS NULL OR total_cpu_ms = 0);
+IF @2n_with_cpu IS NOT NULL AND @2n_no_cpu IS NOT NULL AND @2n_with_cpu > @2n_no_cpu
+    RAISERROR(N'  PASS 2N-4: Targets with CPU data have higher ranking_score than those without.', 10, 1) WITH NOWAIT;
+ELSE IF @2n_with_cpu IS NULL OR @2n_no_cpu IS NULL
+    RAISERROR(N'  SKIP 2N-4: Cannot compare (all targets have CPU data or none do).', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @2n_msg4 nvarchar(200) = N'  *** FAIL 2N-4: Max CPU score (' + CAST(@2n_with_cpu AS nvarchar(20)) + N') not > max no-CPU score (' + CAST(@2n_no_cpu AS nvarchar(20)) + N').';
+    RAISERROR(@2n_msg4, 10, 1) WITH NOWAIT;
 END
 GO
 

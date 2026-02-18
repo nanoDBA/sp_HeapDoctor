@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0217e
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0218
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -222,12 +222,13 @@ The target list result set (returned in both plan-only and execute modes) contai
 | Column | Type | Description |
 |--------|------|-------------|
 | `usage_hint` | varchar(30) | `WRITE_ONLY` (zero reads), `WRITE_HEAVY` (more updates than reads), or NULL (normal read pattern). Forwarded records recur on write-heavy heaps |
+| `ranking_score` | decimal(8,4) | LOG10-normalized composite score. Higher = more impactful. Formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`, penalized for write-heavy patterns |
 
 ## How It Works
 
 1. **Database selection** - parses `@Databases` using the Ola Hallengren pattern (wildcards, exclusions, AG awareness).  AG secondaries are automatically skipped because you can't rebuild on a read-only replica, no matter how badly you want to.
 2. **Heap discovery** - heap `object_id`s are materialized first from `sys.indexes WHERE type = 0`, then each heap is scanned individually via `dm_db_index_physical_stats` with `SAMPLED` mode.  This skips all non-heap objects.  Memory-optimized tables and tables with columnstore indexes are excluded.  Runtime `forwarded_fetch_count` from `dm_db_index_operational_stats` is captured alongside the physical stats.
-3. **CPU ranking** - Query Store runtime stats are mapped to heap objects via showplan XML, but only for `Table Scan` operators.  A query that does an index seek on your heap's NCI doesn't touch forwarded records, so it doesn't count.  The `ranking_basis` column tells you whether each target was ranked by QS CPU (`QS_CPU`), had no QS data (`QS_NO_DATA`), or you skipped CPU entirely (`FWD_PCT`).
+3. **Ranking** - targets are scored using a LOG10-normalized weighted formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`.  LOG10 compresses wildly different scales (fetch counts in millions, CPU in thousands, percentages in single digits) into a comparable 0-10 range.  Query Store CPU is mapped to heap objects via showplan XML, but only for `Table Scan` operators.  Write-heavy heaps (more updates than reads) are penalized because forwarded records recur quickly after rebuild.  The `ranking_score` column shows the computed score, and `ranking_basis` tells you the CPU source (`QS_CPU`, `QS_NO_DATA`, or `FWD_PCT`).
 4. **Key detection** - for CI swap, finds the smallest safe unique non-nullable NC index with no LOB key columns and total key size <= 900 bytes.  The `nci_count` column shows how many NCIs will get rebuilt twice if you go the CI swap route.
 5. **LOB guard** - CI swap is skipped if the table has `text`, `ntext`, `image`, `xml`, or `MAX`-length columns (`DROP INDEX ONLINE` doesn't support LOB).
 6. **Command generation** - builds 3-part-name commands (`[DB].[Schema].[Table]`) so execution is context-agnostic.  Run it from master, run it from the target database, doesn't matter.

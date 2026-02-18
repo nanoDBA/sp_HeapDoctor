@@ -648,6 +648,7 @@ CREATE TABLE #Est
     qs_plan_count          int           NULL,
     qs_query_count         int           NULL,
     usage_hint             varchar(30)   NULL,
+    ranking_score          decimal(8,4)  NULL,
     command_text           nvarchar(max) NULL,
     ci_drop_command        nvarchar(max) NULL
 );
@@ -815,6 +816,58 @@ SELECT ID, CommandType, ObjectName,
 FROM dbo.CommandLog
 WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
 ORDER BY ID;
+GO
+
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 3G: RankingScore in ExtendedInfo', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Uses CommandLog from test 3F (CpuSource=QUERY_STORE execution)
+
+-- 3G-1: RankingScore element should be present in ExtendedInfo for per-rebuild entries
+DECLARE @3g_score_count int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+      AND ExtendedInfo.exist('(/ExtendedInfo/RankingScore)[1]') = 1
+);
+DECLARE @3g_rebuild_count int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+);
+
+IF @3g_rebuild_count > 0 AND @3g_score_count = @3g_rebuild_count
+    RAISERROR(N'  PASS 3G-1: RankingScore present in ExtendedInfo for all successful rebuilds.', 10, 1) WITH NOWAIT;
+ELSE IF @3g_rebuild_count = 0
+    RAISERROR(N'  SKIP 3G-1: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3g_msg1 nvarchar(200) = N'  *** FAIL 3G-1: RankingScore present in '
+        + CAST(@3g_score_count AS nvarchar(10)) + N'/' + CAST(@3g_rebuild_count AS nvarchar(10)) + N' entries.';
+    RAISERROR(@3g_msg1, 10, 1) WITH NOWAIT;
+END
+
+-- 3G-2: RankingScore value should be > 0
+DECLARE @3g_positive int = (
+    SELECT COUNT(*)
+    FROM dbo.CommandLog
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+      AND ISNULL(ErrorNumber, 0) = 0
+      AND ExtendedInfo.value('(/ExtendedInfo/RankingScore)[1]', 'decimal(8,4)') > 0
+);
+IF @3g_rebuild_count > 0 AND @3g_positive = @3g_rebuild_count
+    RAISERROR(N'  PASS 3G-2: RankingScore > 0 for all successful rebuilds.', 10, 1) WITH NOWAIT;
+ELSE IF @3g_rebuild_count = 0
+    RAISERROR(N'  SKIP 3G-2: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @3g_msg2 nvarchar(200) = N'  *** FAIL 3G-2: Only ' + CAST(@3g_positive AS nvarchar(10)) + N'/' + CAST(@3g_rebuild_count AS nvarchar(10)) + N' entries have RankingScore > 0.';
+    RAISERROR(@3g_msg2, 10, 1) WITH NOWAIT;
+END
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;

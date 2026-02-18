@@ -50,9 +50,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0217e
+Version:    1.0.2026.0218
 
-History:    1.0.2026.0217e - forwarded_fetch_count in ranking, XE observability
+History:    1.0.2026.0218 - LOG10-normalized weighted ranking algorithm
+                          - Replaces raw-sum formula with LOG10-normalized scoring:
+                            0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)
+                          - Fetch rate normalization via sqlserver_start_time uptime hours
+                          - Write-heavy penalty: score * 0.5 for WRITE_HEAVY, * 0.25 for WRITE_ONLY
+                          - Structural severity uses fwd_pct alone (not fwd_pct*page_count) to avoid size bias
+                          - ranking_score column exposed in result set and ExtendedInfo XML
+            1.0.2026.0217e - forwarded_fetch_count in ranking, XE observability
                           - Ranking formula now incorporates forwarded_fetch_count as
                             runtime impact signal alongside CPU and structural severity.
                             Formula: COALESCE(cpu,0) + ISNULL(fwd_fetch,0)/1000 + fwd_pct*pages
@@ -331,7 +338,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0217e';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0218';
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -788,6 +795,7 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
         qs_query_count           int            NULL,
         qs_query_hashes          nvarchar(max)  NULL,
         usage_hint               varchar(30)    NULL,
+        ranking_score            decimal(8,4)   NULL,
         sort_order               int            NOT NULL DEFAULT 0
     );
 
@@ -812,6 +820,14 @@ COMMANDLOG:   Expects dbo.CommandLog in the current database (Ola Hallengren pat
         @CurrentDatabaseID   int,
         @discovery_sql       nvarchar(max),
         @discovery_errors    int = 0;
+
+    -- Uptime hours for fetch-rate normalization (converts cumulative dm_db_index_operational_stats
+    -- counters to per-hour rates, making them comparable across servers with different uptimes).
+    DECLARE @UptimeHours float;
+    SELECT @UptimeHours = DATEDIFF(SECOND, sqlserver_start_time, GETDATE()) / 3600.0
+    FROM sys.dm_os_sys_info;
+    -- Guard: minimum 1 hour to avoid division-by-near-zero on fresh restarts
+    SET @UptimeHours = CASE WHEN @UptimeHours < 1.0 THEN 1.0 ELSE @UptimeHours END;
 
     WHILE EXISTS (SELECT 1 FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
     BEGIN
@@ -1193,14 +1209,36 @@ Ranked AS
                 THEN ''WRITE_HEAVY''
             ELSE NULL
         END AS usage_hint,
+        -- LOG10-normalized ranking score: compresses all signals to comparable ~0-10 range.
+        -- Weights: 0.4 fetch_rate + 0.4 CPU + 0.2 structural severity.
+        -- Write-heavy penalty: 0.5 for WRITE_HEAVY, 0.25 for WRITE_ONLY (rebuild ROI is poor).
+        CAST(
+            (0.4 * LOG10(ISNULL(h.forwarded_fetch_count, 0) / @UptimeHours_param + 1)
+           + 0.4 * LOG10(COALESCE(cbo.total_cpu_ms, 0) + 1)
+           + 0.2 * LOG10(h.forwarded_pct + 1))
+          * CASE
+                WHEN ISNULL(h.user_updates, 0) > 0
+                     AND (ISNULL(h.user_scans, 0) + ISNULL(h.user_seeks, 0) + ISNULL(h.user_lookups, 0)) = 0
+                    THEN 0.25
+                WHEN ISNULL(h.user_updates, 0) > (ISNULL(h.user_scans, 0) + ISNULL(h.user_seeks, 0) + ISNULL(h.user_lookups, 0))
+                    THEN 0.5
+                ELSE 1.0
+            END
+        AS decimal(8,4)) AS ranking_score,
         ROW_NUMBER() OVER (ORDER BY
-            -- Mixed ranking: CPU + runtime fetch impact + structural severity.
-            -- forwarded_fetch_count/1000 normalizes cumulative counters to a similar
-            -- scale as CPU ms and fwd_pct*page_count. All three signals contribute.
-            COALESCE(cbo.total_cpu_ms, 0)
-            + ISNULL(h.forwarded_fetch_count, 0) / 1000
-            + CAST(h.forwarded_pct * h.page_count AS bigint) DESC
-        ) AS target_rank
+            -- LOG10-normalized weighted score (higher = more impactful)
+            (0.4 * LOG10(ISNULL(h.forwarded_fetch_count, 0) / @UptimeHours_param + 1)
+           + 0.4 * LOG10(COALESCE(cbo.total_cpu_ms, 0) + 1)
+           + 0.2 * LOG10(h.forwarded_pct + 1))
+          * CASE
+                WHEN ISNULL(h.user_updates, 0) > 0
+                     AND (ISNULL(h.user_scans, 0) + ISNULL(h.user_seeks, 0) + ISNULL(h.user_lookups, 0)) = 0
+                    THEN 0.25
+                WHEN ISNULL(h.user_updates, 0) > (ISNULL(h.user_scans, 0) + ISNULL(h.user_seeks, 0) + ISNULL(h.user_lookups, 0))
+                    THEN 0.5
+                ELSE 1.0
+            END
+        DESC) AS target_rank
     FROM #Heaps h
     LEFT JOIN #CpuByObject cbo ON h.object_id = cbo.object_id
     LEFT JOIN BestKey bk ON h.object_id = bk.object_id AND bk.rn = 1
@@ -1217,7 +1255,7 @@ INSERT #Targets
     action_chosen, command_text, ci_drop_command,
     qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
     qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count, qs_query_hashes,
-    usage_hint
+    usage_hint, ranking_score
 )
 SELECT TOP (@TopN_param)
     DB_NAME(),
@@ -1276,7 +1314,8 @@ SELECT TOP (@TopN_param)
     r.qs_plan_count,
     r.qs_query_count,
     r.qs_query_hashes,
-    r.usage_hint
+    r.usage_hint,
+    r.ranking_score
 FROM Ranked r
 ORDER BY r.target_rank;
 
@@ -1294,7 +1333,7 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
                 N'@MinPages_param bigint, @MaxPages_param bigint, @MinForwardedPct_param decimal(6,2),
                   @LookbackDays_param int, @TopN_param int,
                   @AllowCiSwap_param bit, @PreferCiSwap_param bit, @Online_param bit,
-                  @Maxdop_param int, @CpuSource_param varchar(20)',
+                  @Maxdop_param int, @CpuSource_param varchar(20), @UptimeHours_param float',
                 @MinPages_param = @MinPages,
                 @MaxPages_param = @MaxPages,
                 @MinForwardedPct_param = @MinForwardedPct,
@@ -1304,7 +1343,8 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
                 @PreferCiSwap_param = @PreferCiSwap,
                 @Online_param = @Online,
                 @Maxdop_param = @Maxdop,
-                @CpuSource_param = @CpuSourceUpper;
+                @CpuSource_param = @CpuSourceUpper,
+                @UptimeHours_param = @UptimeHours;
         END TRY
         BEGIN CATCH
             SET @discovery_errors += 1;
@@ -1524,13 +1564,26 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         Re-rank targets after QUICKIESTORE CPU update. The execution loop iterates
         by sort_order, so we reassign sort_order to reflect the updated ranking.
         */
+        -- Recalculate ranking_score with updated CPU from QUICKIESTORE
+        UPDATE #Targets
+        SET ranking_score = CAST(
+            (0.4 * LOG10(ISNULL(forwarded_fetch_count, 0) / @UptimeHours + 1)
+           + 0.4 * LOG10(COALESCE(total_cpu_ms, 0) + 1)
+           + 0.2 * LOG10(forwarded_pct + 1))
+          * CASE usage_hint
+                WHEN 'WRITE_ONLY' THEN 0.25
+                WHEN 'WRITE_HEAVY' THEN 0.5
+                ELSE 1.0
+            END
+        AS decimal(8,4));
+
         ;WITH Reranked AS
         (
             SELECT
                 target_id,
                 sort_order,
                 ROW_NUMBER() OVER (
-                    ORDER BY COALESCE(total_cpu_ms, 0) + ISNULL(forwarded_fetch_count, 0) / 1000 + CAST(forwarded_pct * page_count AS bigint) DESC
+                    ORDER BY ranking_score DESC
                 ) AS new_rank
             FROM #Targets
         )
@@ -1565,14 +1618,15 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     BEGIN
         RAISERROR(N'[DEBUG] Target details:', 10, 1) WITH NOWAIT;
         DECLARE @dbg_tid int, @dbg_db sysname, @dbg_tbl sysname, @dbg_action varchar(32),
-                @dbg_pages bigint, @dbg_fwd decimal(6,2), @dbg_cpu bigint, @dbg_basis varchar(20);
+                @dbg_pages bigint, @dbg_fwd decimal(6,2), @dbg_cpu bigint, @dbg_basis varchar(20),
+                @dbg_score decimal(8,4);
         DECLARE dbg_tgt CURSOR LOCAL FAST_FORWARD FOR
             SELECT target_id, database_name, table_name, action_chosen,
-                   page_count, forwarded_pct, total_cpu_ms, ranking_basis
+                   page_count, forwarded_pct, total_cpu_ms, ranking_basis, ranking_score
             FROM #Targets ORDER BY sort_order;
         OPEN dbg_tgt;
         FETCH NEXT FROM dbg_tgt INTO @dbg_tid, @dbg_db, @dbg_tbl, @dbg_action,
-                                     @dbg_pages, @dbg_fwd, @dbg_cpu, @dbg_basis;
+                                     @dbg_pages, @dbg_fwd, @dbg_cpu, @dbg_basis, @dbg_score;
         WHILE @@FETCH_STATUS = 0
         BEGIN
             SET @Msg = N'[DEBUG]   #' + CAST(@dbg_tid AS nvarchar(10))
@@ -1581,10 +1635,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                      + N' | pages=' + CAST(@dbg_pages AS nvarchar(20))
                      + N' fwd=' + CAST(@dbg_fwd AS nvarchar(10)) + N'%%'
                      + N' cpu=' + ISNULL(CAST(@dbg_cpu AS nvarchar(20)), N'NULL')
-                     + N' basis=' + @dbg_basis;
+                     + N' basis=' + @dbg_basis
+                     + N' score=' + ISNULL(CAST(@dbg_score AS nvarchar(20)), N'NULL');
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             FETCH NEXT FROM dbg_tgt INTO @dbg_tid, @dbg_db, @dbg_tbl, @dbg_action,
-                                         @dbg_pages, @dbg_fwd, @dbg_cpu, @dbg_basis;
+                                         @dbg_pages, @dbg_fwd, @dbg_cpu, @dbg_basis, @dbg_score;
         END
         CLOSE dbg_tgt;
         DEALLOCATE dbg_tgt;
@@ -1731,6 +1786,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         qs_plan_count,
         qs_query_count,
         usage_hint,
+        ranking_score,
         command_text,
         ci_drop_command
     FROM #Targets
@@ -1790,6 +1846,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_qs_query_count     int,
             @cur_qs_query_hashes    nvarchar(max),
             @cur_usage_hint         varchar(30),
+            @cur_ranking_score      decimal(8,4),
             @preflight_sessions     int,
             @trace_msg              nvarchar(128),
             -- Live calibration for throughput estimation
@@ -1888,7 +1945,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @cur_qs_plan_count     = qs_plan_count,
                 @cur_qs_query_count    = qs_query_count,
                 @cur_qs_query_hashes   = qs_query_hashes,
-                @cur_usage_hint        = usage_hint
+                @cur_usage_hint        = usage_hint,
+                @cur_ranking_score     = ranking_score
             FROM #Targets
             WHERE sort_order > @i
             ORDER BY sort_order;
@@ -1966,7 +2024,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                 qs_plan_count AS QsPlanCount,
                                 qs_query_count AS QsQueryCount,
                                 qs_query_hashes AS QsQueryHashes,
-                                usage_hint AS UsageHint
+                                usage_hint AS UsageHint,
+                                ranking_score AS RankingScore
                             FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                         )
                     FROM #Targets
@@ -2226,7 +2285,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             @cur_qs_plan_count AS QsPlanCount,
                             @cur_qs_query_count AS QsQueryCount,
                             @cur_qs_query_hashes AS QsQueryHashes,
-                            @cur_usage_hint AS UsageHint
+                            @cur_usage_hint AS UsageHint,
+                            @cur_ranking_score AS RankingScore
                         FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                     );
 
@@ -2296,7 +2356,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             @cur_qs_plan_count AS QsPlanCount,
                             @cur_qs_query_count AS QsQueryCount,
                             @cur_qs_query_hashes AS QsQueryHashes,
-                            @cur_usage_hint AS UsageHint
+                            @cur_usage_hint AS UsageHint,
+                            @cur_ranking_score AS RankingScore
                         FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                     );
 
