@@ -8,3 +8,4 @@
 !sp_HeapDoctor.sql
 !tests/
 !tests/*.sql
+!tests/*.ps1

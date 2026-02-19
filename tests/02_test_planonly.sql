@@ -62,8 +62,14 @@ CREATE TABLE #Results
     qs_query_count         int           NULL,
     usage_hint             varchar(30)   NULL,
     ranking_score          decimal(8,4)  NULL,
+    heap_compression       varchar(4)    NULL,
+    replication_hint       varchar(20)   NULL,
+    lock_escalation        varchar(10)   NULL,
     command_text           nvarchar(max) NULL,
-    ci_drop_command        nvarchar(max) NULL
+    ci_drop_command        nvarchar(max) NULL,
+    verify_command         nvarchar(max) NULL,
+    prev_forwarded_pct     decimal(6,2)  NULL,
+    rebuilds_in_90d        int           NULL
 );
 GO
 

@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0218
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0220
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -38,6 +38,7 @@ sp_HeapDoctor is built around three ideas:
 - **Write-heavy heap detection** - `usage_hint` column flags heaps with more writes than reads via `dm_db_index_usage_stats`.  `WRITE_ONLY` means zero reads (staging table), `WRITE_HEAVY` means more updates than scans+seeks.  Forwarded records will come right back on these tables; consider adding a clustered index instead of rebuilding.
 - **Scan phase time limit** - when `@MaxRunSeconds` is set, the discovery loop checks elapsed time between databases.  If time is exhausted during scanning, remaining databases are skipped so the execution phase can still process whatever targets were found.
 - **Pre-flight lock check** - before each rebuild, checks `dm_tran_locks` for other sessions holding locks on the target table.  If found, emits a warning that Sch-M acquisition may block or be blocked.  Does not prevent the rebuild.
+- **Obfuscation for external sharing** - `@ObfuscateKey` replaces database/schema/table names with deterministic hex pseudonyms in result sets and CommandLog.  `@RevealKey` decrypts the mapping from a previous run.  `@ObfuscateSeed` enables consistent pseudonyms across environments for side-by-side comparison.
 
 ## Requirements
 
@@ -84,6 +85,17 @@ EXEC dbo.sp_HeapDoctor
     @Databases     = 'USER_DATABASES',
     @EstimateTime  = 1,
     @PlanOnly      = 1;
+
+-- 6) Obfuscated output (safe to share externally)
+EXEC dbo.sp_HeapDoctor
+    @Databases    = 'USER_DATABASES',
+    @ObfuscateKey = 'my secret passphrase',
+    @PlanOnly     = 1;
+
+-- 7) Reveal real names from an obfuscated run
+EXEC dbo.sp_HeapDoctor
+    @RevealKey   = 'my secret passphrase',
+    @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
 ```
 
 ## Parameters
@@ -126,6 +138,7 @@ EXEC dbo.sp_HeapDoctor
 | `@Maxdop` | `NULL` | MAXDOP on index operations (`NULL` = omit) |
 | `@LockTimeoutMs` | `NULL` | Per-rebuild lock timeout in ms |
 | `@MaxRunSeconds` | `NULL` | Stop after N seconds (`NULL` = no limit) |
+| `@ScanThrottleMs` | `NULL` | Milliseconds to pause between database scans (0-60000).  Reduces latch contention on busy servers |
 
 ### Estimation
 
@@ -140,7 +153,43 @@ EXEC dbo.sp_HeapDoctor
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | `Y` = log to `dbo.CommandLog`, `N` = no logging |
 | `@Debug` | `0` | Extra diagnostic output (database list, target details, environment info) |
-| `@Help` | `0` | Print parameter documentation and return |
+| `@Help` | `0` | Print parameter documentation and return.  `1` = common parameters, `2` = advanced + environmental details |
+
+### Obfuscation
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@ObfuscateKey` | `NULL` | Passphrase for pseudonymizing database/schema/table names in output.  When set, all object names in result sets, CommandLog entries, and execution logs are replaced with deterministic hex pseudonyms |
+| `@ObfuscateSeed` | `NULL` | Optional seed for cross-environment consistency.  Same key + same seed on different servers produces identical pseudonyms.  When NULL, auto-seeded with RunID (unique per run) |
+| `@RevealKey` | `NULL` | Passphrase to decrypt a previous obfuscated run.  Must match the `@ObfuscateKey` used in the original run.  Requires `@RevealRunID` |
+| `@RevealRunID` | `NULL` | RunID (uniqueidentifier) of the obfuscated run to decrypt.  The RunID is displayed in the RAISERROR output when obfuscation is applied |
+
+### Output Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `@TargetsFound` | int OUTPUT | Number of targets discovered.  Populated in both plan-only and execute modes |
+| `@Succeeded` | int OUTPUT | Rebuilds completed successfully.  NULL in plan-only mode |
+| `@Failed` | int OUTPUT | Rebuilds that errored.  NULL in plan-only mode |
+| `@Skipped` | int OUTPUT | Targets skipped (time limit, TOCTOU, etc.).  NULL in plan-only mode |
+
+Useful for SQL Agent integration:
+
+```sql
+DECLARE @found int, @succeeded int, @failed int, @skipped int;
+
+EXEC dbo.sp_HeapDoctor
+    @Databases     = 'USER_DATABASES',
+    @PlanOnly      = 0,
+    @MaxRunSeconds = 3600,
+    @TargetsFound  = @found OUTPUT,
+    @Succeeded     = @succeeded OUTPUT,
+    @Failed        = @failed OUTPUT,
+    @Skipped       = @skipped OUTPUT;
+
+IF @failed > 0
+    RAISERROR(N'sp_HeapDoctor: %d rebuild(s) failed.', 16, 1, @failed);
+```
 
 ## Result Set Columns
 
@@ -196,6 +245,7 @@ The target list result set (returned in both plan-only and execute modes) contai
 | `action_chosen` | varchar(32) | `HEAP_REBUILD_ONLINE`, `HEAP_REBUILD_OFFLINE`, or `CI_SWAP_ONLINE` |
 | `command_text` | nvarchar(max) | The rebuild command (3-part name) |
 | `ci_drop_command` | nvarchar(max) | DROP INDEX command for CI swap cleanup.  NULL for heap rebuilds |
+| `verify_command` | nvarchar(max) | Paste-ready `dm_db_index_physical_stats` query to verify forwarded records after rebuild |
 
 ### Estimation (when @EstimateTime = 1)
 
@@ -223,16 +273,56 @@ The target list result set (returned in both plan-only and execute modes) contai
 |--------|------|-------------|
 | `usage_hint` | varchar(30) | `WRITE_ONLY` (zero reads), `WRITE_HEAVY` (more updates than reads), or NULL (normal read pattern).  Forwarded records recur on write-heavy heaps |
 | `ranking_score` | decimal(8,4) | LOG10-normalized composite score.  Higher = more impactful.  Formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`, penalized for write-heavy patterns |
+| `heap_compression` | varchar(4) | Data compression on the heap: `NONE`, `ROW`, or `PAGE`.  Preserved during rebuild |
+| `replication_hint` | varchar(20) | Replication status: `PUBLISHED`, `MERGE_PUBLISHED`, `CDC`, combinations, or NULL.  CDC + CI swap warns about capture instance |
+| `lock_escalation` | varchar(10) | Lock escalation setting: `TABLE`, `AUTO`, or `DISABLE`.  `TABLE` warns for online rebuilds |
+
+### Trending (from CommandLog history)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `prev_forwarded_pct` | decimal(6,2) | Forwarded record % at the last rebuild of this table (from CommandLog).  NULL if never rebuilt |
+| `rebuilds_in_90d` | int | Number of times this table was rebuilt in the last 90 days.  High values suggest a clustered index may be more appropriate than repeated rebuilds |
 
 ## How It Works
 
 1. **Database selection** - parses `@Databases` using the Ola Hallengren pattern (wildcards, exclusions, AG awareness).  AG secondaries are automatically skipped because you can't rebuild on a read-only replica, no matter how badly you want to.
 2. **Heap discovery** - heap `object_id`s are materialized first from `sys.indexes WHERE type = 0`, then each heap is scanned individually via `dm_db_index_physical_stats` with `SAMPLED` mode.  This skips all non-heap objects.  Memory-optimized tables and tables with columnstore indexes are excluded.  Runtime `forwarded_fetch_count` from `dm_db_index_operational_stats` is captured alongside the physical stats.
 3. **Ranking** - targets are scored using a LOG10-normalized weighted formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`.  LOG10 compresses wildly different scales (fetch counts in millions, CPU in thousands, percentages in single digits) into a comparable 0-10 range.  Query Store CPU is mapped to heap objects via showplan XML, but only for `Table Scan` operators.  Write-heavy heaps (more updates than reads) are penalized because forwarded records recur quickly after rebuild.  The `ranking_score` column shows the computed score, and `ranking_basis` tells you the CPU source (`QS_CPU`, `QS_NO_DATA`, or `FWD_PCT`).
-4. **Key detection** - for CI swap, finds the smallest safe unique non-nullable NC index with no LOB key columns and total key size <= 900 bytes.  The `nci_count` column shows how many NCIs will get rebuilt twice if you go the CI swap route.
+4. **Key detection** - for CI swap, finds the smallest safe unique non-nullable NC index with no LOB key columns and total key size <= 1700 bytes.  The `nci_count` column shows how many NCIs will get rebuilt twice if you go the CI swap route.
 5. **LOB guard** - CI swap is skipped if the table has `text`, `ntext`, `image`, `xml`, or `MAX`-length columns (`DROP INDEX ONLINE` doesn't support LOB).
 6. **Command generation** - builds 3-part-name commands (`[DB].[Schema].[Table]`) so execution is context-agnostic.  Run it from master, run it from the target database, doesn't matter.
 7. **Execution** - iterates targets with lock timeout prefix/suffix, time limit checks, per-rebuild CommandLog entries, and post-rebuild verification that the forwarded records are actually gone.
+
+## What's Automatically Excluded
+
+The discovery phase silently skips objects that would fail or cause problems during rebuild:
+
+- **Memory-optimized tables** - in-memory OLTP tables don't have forwarded records
+- **Tables with columnstore indexes** - incompatible with heap rebuild
+- **System-versioned temporal tables** - both the temporal table and its history table are excluded (`sys.tables.temporal_type`)
+- **Graph tables** - node and edge tables are excluded (`is_node`, `is_edge`)
+- **Ledger tables** (SQL Server 2022+) - append-only tables are excluded (`sys.tables.ledger_type`).  Safe no-op on older versions
+- **Always Encrypted columns** - excluded from CI swap key selection only (the heap itself is still rebuilt, but the proc won't pick an AE column as a clustered index key)
+
+## Compression Preservation
+
+Heaps with ROW or PAGE compression are rebuilt with the same compression level.  The `heap_compression` column in the result set shows the current setting.  Both `ALTER TABLE ... REBUILD` and CI swap commands include the `DATA_COMPRESSION` clause when the heap is compressed.  If a previous CI swap run was interrupted (leaving a temp clustered index behind), the proc detects the leftover `CX__Temp__` index and prepends a DROP before the new CREATE.
+
+## Environmental Warnings
+
+During execution, the proc checks for conditions that may affect rebuild performance or safety and emits RAISERROR warnings (severity 10, non-fatal):
+
+- **TDE-encrypted databases** - warns about 30-50% throughput reduction from encryption overhead
+- **AG synchronous replicas** - warns when large rebuilds (> 100K pages) will generate log traffic to sync-commit secondaries
+- **RCSI version store pressure** - warns when large online rebuilds may generate significant version store activity
+- **FULL recovery model** - warns when estimated log generation exceeds 1 GB (rebuilds generate full logging)
+- **Active backups** - warns when a BACKUP is running on the target database (concurrent Sch-M may conflict)
+- **Replication/CDC** - warns about log reader traffic for published tables and capture instance issues for CDC + CI swap
+- **Lock escalation = TABLE** - warns that online rebuilds may escalate to a full table lock
+- **Write-heavy heaps** - warns that forwarded records will recur quickly after rebuild
+- **Statistics invalidation** - notes that auto-update statistics will fire on next query after rebuild
+- **Re-entrancy guard** - if another sp_HeapDoctor session is already running, the proc exits immediately with a warning rather than running concurrently.  Uses `sp_getapplock` with session scope
 
 ## CI Swap Technique
 
@@ -363,6 +453,158 @@ CROSS JOIN CurrentQS c;
 ```
 
 This query joins the before-snapshot `query_hash` values against current Query Store data.  A positive `pct_reduction` means the rebuild improved logical read performance for those queries.
+
+## Obfuscation for External Sharing
+
+When sharing diagnostic reports with consultants, forums, or audit teams, real database and table names can expose sensitive information about your environment.  The obfuscation feature replaces all object names with deterministic hex pseudonyms (e.g., `DB_AA92F53B`, `S_9F96C397`, `T_43306ED0`) in result sets, CommandLog entries, and execution logs.  RAISERROR progress messages in the session continue to show real names.
+
+### Basic usage
+
+```sql
+-- Plan-only with obfuscated names (safe to share)
+EXEC dbo.sp_HeapDoctor
+    @Databases    = 'USER_DATABASES',
+    @ObfuscateKey = 'my secret passphrase',
+    @PlanOnly     = 1;
+```
+
+Output columns `database_name`, `schema_name`, `table_name`, `key_source_index`, `command_text`, `ci_drop_command`, and `verify_command` all show pseudonyms instead of real names.  The pseudonym format is `PREFIX_` + 8 hex characters (SHA2_256 derived), where prefixes are `DB_` (database), `S_` (schema), `T_` (table), and `I_` (index).
+
+### Execute with obfuscation
+
+```sql
+-- Execute rebuilds; CommandLog entries use pseudonyms
+EXEC dbo.sp_HeapDoctor
+    @Databases    = 'USER_DATABASES',
+    @ObfuscateKey = 'my secret passphrase',
+    @PlanOnly     = 0;
+
+-- Output includes:
+-- "Obfuscation applied to 5 targets.
+--  RunID=153ACF40-D520-4472-ABE1-8A9BC99203A7
+--  (provide with @RevealKey to decrypt)."
+```
+
+Save the RunID.  You'll need it to reveal the mapping later.
+
+### Revealing the real names
+
+```sql
+-- Decrypt the mapping from a previous obfuscated run
+EXEC dbo.sp_HeapDoctor
+    @RevealKey   = 'my secret passphrase',
+    @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
+```
+
+Returns a result set mapping each pseudonym back to the real object name:
+
+| object_type | pseudonym | real_name |
+|-------------|-----------|-----------|
+| DB | DB_AA92F53B | ProductionDB |
+| S | S_9F96C397 | dbo |
+| T | T_43306ED0 | Orders |
+| T | T_8B2F1A77 | Customers |
+
+### Cross-environment comparison
+
+When comparing obfuscated reports from multiple servers (dev, staging, prod), use `@ObfuscateSeed` to ensure the same tables get the same pseudonyms:
+
+```sql
+-- Same key + seed = same pseudonyms across environments
+-- Run on Server A:
+EXEC dbo.sp_HeapDoctor
+    @ObfuscateKey  = 'shared passphrase',
+    @ObfuscateSeed = 'Q1-2026-audit',
+    @PlanOnly      = 1;
+
+-- Run on Server B with same key and seed:
+EXEC dbo.sp_HeapDoctor
+    @ObfuscateKey  = 'shared passphrase',
+    @ObfuscateSeed = 'Q1-2026-audit',
+    @PlanOnly      = 1;
+```
+
+Tables with the same name on both servers will have identical pseudonyms, enabling side-by-side comparison without exposing real names.  Without `@ObfuscateSeed`, each run auto-seeds with its unique RunID, producing different pseudonyms even with the same key.
+
+### Finding available RunIDs
+
+If you lost the RunID from the session output, query CommandLog to find obfuscated runs:
+
+```sql
+-- List all obfuscated sp_HeapDoctor runs with their RunIDs
+SELECT
+    ID,
+    StartTime,
+    ExtendedInfo.value('(/ExtendedInfo/RunID)[1]', 'uniqueidentifier') AS RunID,
+    ExtendedInfo.value('(/ExtendedInfo/ObfuscateSeed)[1]', 'nvarchar(128)') AS Seed,
+    Command AS DatabasesScanned
+FROM dbo.CommandLog
+WHERE CommandType = 'HEAP_REBUILD_START'
+  AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%ObfuscatedMappingHex%'
+ORDER BY StartTime DESC;
+```
+
+### Joining reveal mapping to CommandLog history
+
+After reveal, you can decode your full rebuild history by joining the mapping back to CommandLog:
+
+```sql
+-- Step 1: Reveal the mapping into a temp table
+IF OBJECT_ID('tempdb..#Mapping') IS NOT NULL DROP TABLE #Mapping;
+CREATE TABLE #Mapping (object_type varchar(5), pseudonym sysname, real_name sysname);
+
+INSERT #Mapping
+EXEC dbo.sp_HeapDoctor
+    @RevealKey   = 'my secret passphrase',
+    @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
+
+-- Step 2: Join to CommandLog to see real names alongside rebuild results
+SELECT
+    c.StartTime,
+    c.EndTime,
+    DATEDIFF(SECOND, c.StartTime, c.EndTime) AS duration_sec,
+    c.CommandType,
+    ISNULL(m.real_name, c.DatabaseName) AS real_database,
+    ISNULL(t.real_name, c.ObjectName) AS real_table,
+    c.ErrorNumber,
+    c.ErrorMessage
+FROM dbo.CommandLog c
+LEFT JOIN #Mapping m ON m.pseudonym = c.DatabaseName AND m.object_type = 'DB'
+LEFT JOIN #Mapping t ON t.pseudonym = c.ObjectName  AND t.object_type = 'T'
+WHERE c.CommandType IN ('HEAP_REBUILD_ONLINE','HEAP_REBUILD_OFFLINE','CI_SWAP_ONLINE')
+  AND CAST(c.ExtendedInfo AS nvarchar(max)) LIKE '%<RunID>153ACF40-D520-4472-ABE1-8A9BC99203A7</RunID>%'
+ORDER BY c.StartTime;
+```
+
+### End-to-end workflow: sharing a report with a consultant
+
+```sql
+-- 1. Generate obfuscated report (run on your server)
+EXEC dbo.sp_HeapDoctor
+    @Databases    = 'USER_DATABASES',
+    @ObfuscateKey = 'acme-2026-audit',
+    @PlanOnly     = 0;
+-- Note the RunID from the output (e.g., 153ACF40-...)
+
+-- 2. Export the obfuscated result set and/or CommandLog
+--    (copy-paste from SSMS, or bcp out - all names are pseudonymized)
+
+-- 3. Send to consultant.  They see DB_AA92F53B, T_43306ED0, etc.
+--    All metrics (page counts, CPU, forwarded %) are real; only names are hidden.
+
+-- 4. When consultant asks "what is T_43306ED0?", reveal on your server:
+EXEC dbo.sp_HeapDoctor
+    @RevealKey   = 'acme-2026-audit',
+    @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
+-- Returns: T_43306ED0 = Orders
+```
+
+### Important notes
+
+- **Plan-only limitation**: The encrypted mapping is stored in CommandLog during execution.  Plan-only runs (`@PlanOnly = 1`) don't write CommandLog, so `@RevealKey` only works for runs that were actually executed.  A warning is emitted when obfuscating in plan-only mode.
+- **Wrong key**: If you provide the wrong `@RevealKey`, the decryption fails with an error rather than returning wrong data.
+- **RAISERROR messages**: Progress messages in the session always show real names (they are ephemeral and not captured in result sets or logs).  This is by design; you need to see real names to monitor the session.
+- **Existing columns**: Physical stats, CPU metrics, ranking scores, and all numeric columns remain unobfuscated.  Only object name columns and generated command strings are pseudonymized.
 
 ## Known Limitations and Notes
 

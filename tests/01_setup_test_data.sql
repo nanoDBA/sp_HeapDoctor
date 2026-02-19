@@ -183,7 +183,67 @@ FROM sys.all_objects;
 GO
 
 ------------------------------------------------------------------------
--- 5) Generate Query Store CPU data by running queries
+-- 5) Batch 6: Create additional test objects
+------------------------------------------------------------------------
+
+-- HeapE: heap with PAGE compression (CI swap should preserve compression)
+RAISERROR(N'Creating dbo.HeapE (PAGE compressed heap for CI swap test)...', 10, 1) WITH NOWAIT;
+CREATE TABLE dbo.HeapE
+(
+    ID       int           NOT NULL,
+    Code     varchar(50)   NOT NULL,
+    Padding  varchar(4000) NOT NULL,
+    MoreData varchar(4000) NULL
+) WITH (DATA_COMPRESSION = PAGE);
+CREATE UNIQUE NONCLUSTERED INDEX UX_HeapE_ID ON dbo.HeapE(ID);
+
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapE (ID, Code, Padding, MoreData)
+SELECT TOP (20000) n, 'CODE-' + CAST(n AS varchar(10)), REPLICATE('E', 10), NULL FROM N;
+
+UPDATE dbo.HeapE
+SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000)
+WHERE ID <= 15000;
+
+-- HeapF: heap with ROW compression (ALTER TABLE REBUILD should preserve compression)
+RAISERROR(N'Creating dbo.HeapF (ROW compressed heap for rebuild test)...', 10, 1) WITH NOWAIT;
+CREATE TABLE dbo.HeapF
+(
+    ID       int           NOT NULL,
+    Padding  varchar(4000) NOT NULL,
+    MoreData varchar(4000) NULL
+) WITH (DATA_COMPRESSION = ROW);
+
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapF (ID, Padding, MoreData)
+SELECT TOP (20000) n, REPLICATE('F', 10), NULL FROM N;
+
+UPDATE dbo.HeapF
+SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000)
+WHERE ID <= 15000;
+
+-- HeapTemporal: system-versioned temporal heap (should be EXCLUDED from discovery)
+RAISERROR(N'Creating dbo.HeapTemporal (temporal table, should be excluded)...', 10, 1) WITH NOWAIT;
+CREATE TABLE dbo.HeapTemporal
+(
+    ID        int           NOT NULL PRIMARY KEY NONCLUSTERED,
+    Padding   varchar(4000) NOT NULL,
+    SysStart  datetime2     GENERATED ALWAYS AS ROW START NOT NULL,
+    SysEnd    datetime2     GENERATED ALWAYS AS ROW END   NOT NULL,
+    PERIOD FOR SYSTEM_TIME (SysStart, SysEnd)
+) WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.HeapTemporalHistory));
+
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapTemporal (ID, Padding)
+SELECT TOP (20000) n, REPLICATE('T', 10) FROM N;
+
+UPDATE dbo.HeapTemporal
+SET Padding = REPLICATE('X', 3000)
+WHERE ID <= 15000;
+GO
+
+------------------------------------------------------------------------
+-- 6) Generate Query Store CPU data by running queries
 ------------------------------------------------------------------------
 RAISERROR(N'Running queries to populate Query Store CPU data...', 10, 1) WITH NOWAIT;
 
@@ -195,6 +255,8 @@ BEGIN
     SELECT @sink = COUNT(*) FROM dbo.HeapA WHERE Padding LIKE '%X%';
     SELECT @sink = COUNT(*) FROM dbo.HeapB WHERE Padding LIKE '%X%';
     SELECT @sink = COUNT(*) FROM dbo.HeapC WHERE Padding LIKE '%X%';
+    SELECT @sink = COUNT(*) FROM dbo.HeapE WHERE Padding LIKE '%X%';
+    SELECT @sink = COUNT(*) FROM dbo.HeapF WHERE Padding LIKE '%X%';
     SET @iter += 1;
 END
 
