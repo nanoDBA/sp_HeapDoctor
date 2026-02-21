@@ -13,6 +13,9 @@ Tests Batch 10 additions:
   10I - Reveal mode returns correct mapping
   10J - Reveal with wrong key (decryption failure)
   10K - Reveal with nonexistent RunID (error)
+  10L - Plan-only obfuscation stores mapping in HEAP_SCAN_SUMMARY
+  10M - Reveal from plan-only HEAP_SCAN_SUMMARY
+  10N - Plan-only with @LogToTable='N' does not store mapping
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 10_test_batch10.sql
@@ -520,6 +523,159 @@ END
 ELSE
 BEGIN
     RAISERROR(N'  FAIL: 10K - Reveal with nonexistent RunID did not raise error.', 10, 1) WITH NOWAIT;
+    UPDATE #TestCounts SET FailCount += 1;
+END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 10L: Plan-only obfuscation stores mapping in HEAP_SCAN_SUMMARY', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+------------------------------------------------------------------------
+/*
+Run plan-only with @ObfuscateKey and @LogToTable='Y'.
+Verify HEAP_SCAN_SUMMARY ExtendedInfo contains ObfuscatedMappingHex.
+*/
+DECLARE @max_cmd_10L int;
+SELECT @max_cmd_10L = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
+
+EXEC dbo.sp_HeapDoctor
+    @Databases = 'HeapDoctorTest',
+    @CpuSource = 'NONE',
+    @ObfuscateKey = N'TestKey10L',
+    @ObfuscateSeed = N'PlanOnlySeed',
+    @PlanOnly = 1,
+    @LogToTable = 'Y';
+
+-- Check HEAP_SCAN_SUMMARY has ObfuscatedMappingHex
+IF EXISTS (
+    SELECT 1 FROM dbo.CommandLog
+    WHERE ID > @max_cmd_10L
+      AND CommandType = N'HEAP_SCAN_SUMMARY'
+      AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%ObfuscatedMappingHex%'
+)
+BEGIN
+    RAISERROR(N'  PASS: 10L - HEAP_SCAN_SUMMARY contains ObfuscatedMappingHex.', 10, 1) WITH NOWAIT;
+    UPDATE #TestCounts SET PassCount += 1;
+END
+ELSE
+BEGIN
+    RAISERROR(N'  FAIL: 10L - HEAP_SCAN_SUMMARY missing ObfuscatedMappingHex.', 10, 1) WITH NOWAIT;
+    UPDATE #TestCounts SET FailCount += 1;
+END
+
+-- Also check ObfuscateSeed is present
+IF EXISTS (
+    SELECT 1 FROM dbo.CommandLog
+    WHERE ID > @max_cmd_10L
+      AND CommandType = N'HEAP_SCAN_SUMMARY'
+      AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%<ObfuscateSeed>PlanOnlySeed</ObfuscateSeed>%'
+)
+BEGIN
+    RAISERROR(N'  PASS: 10L2 - HEAP_SCAN_SUMMARY contains ObfuscateSeed.', 10, 1) WITH NOWAIT;
+    UPDATE #TestCounts SET PassCount += 1;
+END
+ELSE
+BEGIN
+    RAISERROR(N'  FAIL: 10L2 - HEAP_SCAN_SUMMARY missing ObfuscateSeed.', 10, 1) WITH NOWAIT;
+    UPDATE #TestCounts SET FailCount += 1;
+END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 10M: Reveal from plan-only HEAP_SCAN_SUMMARY', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+------------------------------------------------------------------------
+/*
+Extract RunID from the HEAP_SCAN_SUMMARY created by 10L, then reveal using it.
+Verify the reveal result set contains correct real names.
+*/
+DECLARE @scan_xml_10M xml;
+SELECT TOP (1) @scan_xml_10M = ExtendedInfo
+FROM dbo.CommandLog
+WHERE CommandType = N'HEAP_SCAN_SUMMARY'
+  AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%ObfuscatedMappingHex%'
+ORDER BY ID DESC;
+
+IF @scan_xml_10M IS NOT NULL
+BEGIN
+    DECLARE @runid_10M uniqueidentifier;
+    SET @runid_10M = @scan_xml_10M.value(N'(/ScanSummary/RunID)[1]', N'uniqueidentifier');
+
+    IF @runid_10M IS NOT NULL
+    BEGIN
+        -- Capture reveal output
+        IF OBJECT_ID('tempdb..#Reveal10M') IS NOT NULL DROP TABLE #Reveal10M;
+        CREATE TABLE #Reveal10M (pseudonym nvarchar(20), object_type varchar(10), real_name sysname);
+
+        INSERT #Reveal10M
+        EXEC dbo.sp_HeapDoctor @RevealKey = N'TestKey10L', @RevealRunID = @runid_10M;
+
+        -- Verify HeapDoctorTest appears as a DB mapping
+        IF EXISTS (SELECT 1 FROM #Reveal10M WHERE object_type = 'DB' AND real_name = N'HeapDoctorTest')
+        BEGIN
+            RAISERROR(N'  PASS: 10M - Reveal from HEAP_SCAN_SUMMARY returned correct DB mapping.', 10, 1) WITH NOWAIT;
+            UPDATE #TestCounts SET PassCount += 1;
+        END
+        ELSE
+        BEGIN
+            RAISERROR(N'  FAIL: 10M - Reveal from HEAP_SCAN_SUMMARY did not return HeapDoctorTest mapping.', 10, 1) WITH NOWAIT;
+            UPDATE #TestCounts SET FailCount += 1;
+        END
+
+        -- Verify at least one table mapping exists
+        IF EXISTS (SELECT 1 FROM #Reveal10M WHERE object_type = 'Table')
+        BEGIN
+            RAISERROR(N'  PASS: 10M2 - Reveal contains Table mappings.', 10, 1) WITH NOWAIT;
+            UPDATE #TestCounts SET PassCount += 1;
+        END
+        ELSE
+        BEGIN
+            RAISERROR(N'  FAIL: 10M2 - Reveal missing Table mappings.', 10, 1) WITH NOWAIT;
+            UPDATE #TestCounts SET FailCount += 1;
+        END
+
+        DROP TABLE #Reveal10M;
+    END
+    ELSE
+    BEGIN
+        RAISERROR(N'  SKIP: 10M - Could not extract RunID from HEAP_SCAN_SUMMARY.', 10, 1) WITH NOWAIT;
+    END
+END
+ELSE
+BEGIN
+    RAISERROR(N'  SKIP: 10M - No HEAP_SCAN_SUMMARY with mapping found (10L may have failed).', 10, 1) WITH NOWAIT;
+END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 10N: Plan-only with @LogToTable=N does not store mapping', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+------------------------------------------------------------------------
+DECLARE @max_cmd_10N int;
+SELECT @max_cmd_10N = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
+
+EXEC dbo.sp_HeapDoctor
+    @Databases = 'HeapDoctorTest',
+    @CpuSource = 'NONE',
+    @ObfuscateKey = N'TestKey10N',
+    @PlanOnly = 1,
+    @LogToTable = 'N';
+
+-- No new CommandLog entries should exist
+IF NOT EXISTS (SELECT 1 FROM dbo.CommandLog WHERE ID > @max_cmd_10N)
+BEGIN
+    RAISERROR(N'  PASS: 10N - No CommandLog entries when @LogToTable=N.', 10, 1) WITH NOWAIT;
+    UPDATE #TestCounts SET PassCount += 1;
+END
+ELSE
+BEGIN
+    RAISERROR(N'  FAIL: 10N - Unexpected CommandLog entries with @LogToTable=N.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO

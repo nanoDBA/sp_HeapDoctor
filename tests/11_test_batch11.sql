@@ -4,7 +4,7 @@ sp_HeapDoctor Test Harness - Batch 11: Enhanced Logging & Impact Projections
 Tests Batch 11 additions:
   -- Smoke Tests --
   11A - size_mb column populated and correct (page_count / 128)
-  11B - Version is 1.0.2026.0221
+  11B - Version is 1.0.2026.0222
 
   -- Unit Tests (deterministic) --
   11C - size_mb = page_count / 128.0 for all targets (arithmetic check)
@@ -155,20 +155,20 @@ END
 GO
 
 ------------------------------------------------------------------------
--- 11B: Smoke test - Version is 1.0.2026.0221
+-- 11B: Smoke test - Version is 1.0.2026.0222
 ------------------------------------------------------------------------
 RAISERROR(N'--- 11B: Version check ---', 10, 1) WITH NOWAIT;
 
-IF EXISTS (SELECT 1 FROM #Results WHERE version = N'1.0.2026.0221')
+IF EXISTS (SELECT 1 FROM #Results WHERE version = N'1.0.2026.0222')
 BEGIN
-    RAISERROR(N'  PASS 11B: Version is 1.0.2026.0221.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 11B: Version is 1.0.2026.0222.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @actual_ver nvarchar(20);
     SELECT TOP 1 @actual_ver = version FROM #Results;
-    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version 1.0.2026.0221, got ' + ISNULL(@actual_ver, N'NULL');
+    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version 1.0.2026.0222, got ' + ISNULL(@actual_ver, N'NULL');
     RAISERROR(@ver_msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
@@ -552,7 +552,7 @@ RAISERROR(N'--- 11P: Obfuscated HEAP_SCAN_SUMMARY ---', 10, 1) WITH NOWAIT;
 DELETE FROM dbo.CommandLog WHERE CommandType = 'HEAP_SCAN_SUMMARY';
 
 -- Run with obfuscation + logging
--- Note: plan-only + obfuscation warning is expected (mapping not persisted without execution)
+-- Note: plan-only + obfuscation mapping is now persisted in HEAP_SCAN_SUMMARY when @LogToTable='Y'
 TRUNCATE TABLE #Results;
 INSERT #Results
 EXEC dbo.sp_HeapDoctor
@@ -674,7 +674,7 @@ DECLARE @summary nvarchar(200) = N'  PASSED: ' + CAST(@p AS nvarchar(10)) + N'  
 RAISERROR(@summary, 10, 1) WITH NOWAIT;
 
 IF @f > 0
-    RAISERROR(N'  *** FAILURES DETECTED - Review output above ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'THERE WERE FAILURES. Review output above.', 16, 1);
 ELSE
     RAISERROR(N'  All Batch 11 tests passed.', 10, 1) WITH NOWAIT;
 

@@ -50,9 +50,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0221
+Version:    1.0.2026.0222
 
-History:    1.0.2026.0221 - Batch 11: Enhanced logging and impact projections
+History:    1.0.2026.0222 - Cross-environment obfuscation workflow
+                          - Plan-only runs now store encrypted mapping in HEAP_SCAN_SUMMARY
+                            (enables reveal for plan-only analysis without executing rebuilds)
+                          - Reveal mode checks both HEAP_REBUILD_START and HEAP_SCAN_SUMMARY
+                          - Enhanced @Help with cross-environment workflow guidance
+            1.0.2026.0221 - Batch 11: Enhanced logging and impact projections
                           - Suppress ANSI_WARNINGS noise from DMV aggregation in discovery scan
                           - New columns: size_mb, est_space_savings_mb, est_ci_swap_overhead_mb,
                             est_log_mb, days_since_last_rebuild
@@ -66,7 +71,7 @@ History:    1.0.2026.0221 - Batch 11: Enhanced logging and impact projections
                           - @ObfuscateSeed: optional seed for deterministic pseudonyms across
                             environments (same key+seed = same pseudonyms on any server)
                           - @RevealKey + @RevealRunID: decrypt a prior run's mapping from CommandLog
-                          - Encrypted mapping stored in HEAP_REBUILD_START ExtendedInfo XML
+                          - Encrypted mapping stored in HEAP_REBUILD_START or HEAP_SCAN_SUMMARY ExtendedInfo XML
                           - RAISERROR messages show real names (session-local, ephemeral)
                           - Uses HASHBYTES('SHA2_256') for pseudonyms, ENCRYPTBYPASSPHRASE for mapping
             1.0.2026.0219d - Batch 9: Polish and documentation
@@ -396,7 +401,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0221';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0222';
     DECLARE @RunID uniqueidentifier = NEWID();
 
     -- Obfuscation state
@@ -452,14 +457,23 @@ QUICKIESTORE PARAMETERS:
 OBFUSCATION PARAMETERS:
   @ObfuscateKey      nvarchar(128) = NULL   Replace real names with 8-char hex pseudonyms.
   @ObfuscateSeed     nvarchar(128) = NULL   Optional seed for cross-environment consistency.
-  @RevealKey         nvarchar(128) = NULL   Decrypt a prior obfuscated run''s mapping.
+                                            Same key+seed on different servers = same pseudonyms.
+  @RevealKey         nvarchar(128) = NULL   Decrypt a prior run''s mapping from CommandLog.
   @RevealRunID       uniqueidentifier = NULL  Required with @RevealKey.
+
+  Cross-environment workflow:
+    1. Run with @ObfuscateKey (+ @ObfuscateSeed for multi-server). Note the RunID.
+    2. Copy obfuscated result set to analysis machine. All metrics are real; names are pseudonyms.
+    3. To decode: EXEC sp_HeapDoctor @RevealKey=N''<key>'', @RevealRunID=N''<RunID>'';
+  Plan-only runs store mapping in HEAP_SCAN_SUMMARY when @LogToTable=''Y'' (default).
 
 EXAMPLES:
   EXEC sp_HeapDoctor;
   EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @PlanOnly = 0;
   EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @Execute = N''Y'';
   EXEC sp_HeapDoctor @ObfuscateKey = N''MySecretKey'';
+  EXEC sp_HeapDoctor @ObfuscateKey = N''MyKey'', @ObfuscateSeed = N''prod-q1'';
+  EXEC sp_HeapDoctor @RevealKey = N''MyKey'', @RevealRunID = N''<RunID-from-output>'';
 
 REQUIREMENTS: SQL Server 2017+ (STRING_AGG). Enterprise/Developer for ONLINE.
 COMMANDLOG:   dbo.CommandLog (Ola Hallengren). https://ola.hallengren.com/scripts/CommandLog.sql
@@ -503,13 +517,26 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             RETURN;
         END
 
-        -- Retrieve the START entry's ExtendedInfo for this RunID
+        -- Retrieve the encrypted mapping - check HEAP_REBUILD_START first (exec), then HEAP_SCAN_SUMMARY (plan-only)
         DECLARE @reveal_xml xml;
-        SELECT TOP (1) @reveal_xml = ExtendedInfo
+        DECLARE @reveal_source nvarchar(30);
+
+        -- 1. Try HEAP_REBUILD_START (execution-mode runs)
+        SELECT TOP (1) @reveal_xml = ExtendedInfo, @reveal_source = N'HEAP_REBUILD_START'
         FROM dbo.CommandLog
         WHERE CommandType = N'HEAP_REBUILD_START'
           AND ExtendedInfo.exist(N'/Parameters/RunID[text()=sql:variable("@RevealRunID")]') = 1
         ORDER BY ID DESC;
+
+        -- 2. Fall back to HEAP_SCAN_SUMMARY (plan-only runs)
+        IF @reveal_xml IS NULL
+        BEGIN
+            SELECT TOP (1) @reveal_xml = ExtendedInfo, @reveal_source = N'HEAP_SCAN_SUMMARY'
+            FROM dbo.CommandLog
+            WHERE CommandType = N'HEAP_SCAN_SUMMARY'
+              AND ExtendedInfo.exist(N'/ScanSummary/RunID[text()=sql:variable("@RevealRunID")]') = 1
+            ORDER BY ID DESC;
+        END
 
         IF @reveal_xml IS NULL
         BEGIN
@@ -519,19 +546,26 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             RETURN;
         END
 
-        -- Read the hex-encoded encrypted mapping
+        -- Read the hex-encoded encrypted mapping (XPath depends on source)
         DECLARE @hex_mapping nvarchar(max);
-        SET @hex_mapping = @reveal_xml.value(N'(/Parameters/ObfuscatedMappingHex)[1]', N'nvarchar(max)');
+        DECLARE @stored_seed nvarchar(128);
+
+        IF @reveal_source = N'HEAP_REBUILD_START'
+        BEGIN
+            SET @hex_mapping = @reveal_xml.value(N'(/Parameters/ObfuscatedMappingHex)[1]', N'nvarchar(max)');
+            SET @stored_seed = @reveal_xml.value(N'(/Parameters/ObfuscateSeed)[1]', N'nvarchar(128)');
+        END
+        ELSE
+        BEGIN
+            SET @hex_mapping = @reveal_xml.value(N'(/ScanSummary/ObfuscatedMappingHex)[1]', N'nvarchar(max)');
+            SET @stored_seed = @reveal_xml.value(N'(/ScanSummary/ObfuscateSeed)[1]', N'nvarchar(128)');
+        END
 
         IF @hex_mapping IS NULL
         BEGIN
-            RAISERROR(N'RunID found but no encrypted mapping stored. The run may not have used @ObfuscateKey, or was @PlanOnly=1.', 16, 1);
+            RAISERROR(N'RunID found but no encrypted mapping stored. The run may not have used @ObfuscateKey, or @LogToTable was N.', 16, 1);
             RETURN;
         END
-
-        -- Reconstruct the passphrase: key + effective_seed
-        DECLARE @stored_seed nvarchar(128);
-        SET @stored_seed = @reveal_xml.value(N'(/Parameters/ObfuscateSeed)[1]', N'nvarchar(128)');
 
         -- If no stored seed, the original run used @RunID as seed
         DECLARE @reveal_passphrase nvarchar(max) = @RevealKey + ISNULL(@stored_seed, CAST(@RevealRunID AS nvarchar(36)));
@@ -2360,8 +2394,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
     IF @obfuscate = 1
     BEGIN
-        -- 8a: Build encrypted mapping (only when it can be stored: execute mode + CommandLog)
-        IF @commandlog_exists = 1 AND @PlanOnly = 0
+        -- 8a: Build encrypted mapping (stored in HEAP_REBUILD_START or HEAP_SCAN_SUMMARY)
+        IF @commandlog_exists = 1
         BEGIN
             DECLARE @obfu_mapping_xml nvarchar(max);
             SET @obfu_mapping_xml = CAST((
@@ -2475,10 +2509,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                  + N' (provide with @RevealKey to decrypt).';
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
-        IF @PlanOnly = 1
-            RAISERROR(N'NOTE: @PlanOnly=1 - encrypted mapping not stored (no CommandLog write in plan-only mode).', 10, 1) WITH NOWAIT;
+        IF ISNULL(@LogToTable, N'N') <> N'Y'
+            RAISERROR(N'NOTE: @ObfuscateKey used with @LogToTable<>Y - encrypted mapping not stored. Set @LogToTable=Y to enable reveal.', 10, 1) WITH NOWAIT;
         ELSE IF @commandlog_exists = 0
-            RAISERROR(N'WARNING: @ObfuscateKey used but CommandLog missing. Encrypted mapping will not be stored; reveal mode unavailable for this run.', 10, 1) WITH NOWAIT;
+            RAISERROR(N'WARNING: @ObfuscateKey used but dbo.CommandLog table not found. Encrypted mapping will not be stored; reveal mode unavailable for this run.', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END
@@ -2548,7 +2582,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             N'dbo',
             N'sp_HeapDoctor',
             N'P',
-            N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N''' @PlanOnly = 1...',
+            N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N''', @PlanOnly = 1...',
             N'HEAP_SCAN_SUMMARY',
             @start_time,
             SYSDATETIME(),
@@ -2564,6 +2598,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     CAST((SELECT SUM(page_count) FROM #Targets) AS decimal(18,2)) / 128.0 AS TotalSizeMB,
                     @CpuSourceUpper AS CpuSource,
                     DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS ElapsedSeconds,
+                    CASE WHEN @obfuscate = 1 THEN @effective_seed ELSE NULL END AS ObfuscateSeed,
+                    CASE WHEN @obfuscate = 1 THEN CONVERT(nvarchar(max), @obfu_mapping_encrypted, 2) ELSE NULL END AS ObfuscatedMappingHex,
                     (
                         SELECT
                             CASE WHEN @obfuscate = 1 THEN pseudo_database_name ELSE database_name END AS DatabaseName,

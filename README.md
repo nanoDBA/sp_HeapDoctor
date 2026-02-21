@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0220
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0222
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -498,12 +498,12 @@ EXEC dbo.sp_HeapDoctor
 
 Returns a result set mapping each pseudonym back to the real object name:
 
-| object_type | pseudonym | real_name |
-|-------------|-----------|-----------|
-| DB | DB_AA92F53B | ProductionDB |
-| S | S_9F96C397 | dbo |
-| T | T_43306ED0 | Orders |
-| T | T_8B2F1A77 | Customers |
+| pseudonym | object_type | real_name |
+|-----------|-------------|-----------|
+| DB_AA92F53B | DB | ProductionDB |
+| S_9F96C397 | Schema | dbo |
+| T_43306ED0 | Table | Orders |
+| T_8B2F1A77 | Table | Customers |
 
 ### Cross-environment comparison
 
@@ -532,14 +532,22 @@ If you lost the RunID from the session output, query CommandLog to find obfuscat
 
 ```sql
 -- List all obfuscated sp_HeapDoctor runs with their RunIDs
+-- (checks both execution runs and plan-only scan summaries)
 SELECT
     ID,
     StartTime,
-    ExtendedInfo.value('(/ExtendedInfo/RunID)[1]', 'uniqueidentifier') AS RunID,
-    ExtendedInfo.value('(/ExtendedInfo/ObfuscateSeed)[1]', 'nvarchar(128)') AS Seed,
+    CommandType,
+    COALESCE(
+        ExtendedInfo.value('(/Parameters/RunID)[1]', 'uniqueidentifier'),
+        ExtendedInfo.value('(/ScanSummary/RunID)[1]', 'uniqueidentifier')
+    ) AS RunID,
+    COALESCE(
+        ExtendedInfo.value('(/Parameters/ObfuscateSeed)[1]', 'nvarchar(128)'),
+        ExtendedInfo.value('(/ScanSummary/ObfuscateSeed)[1]', 'nvarchar(128)')
+    ) AS Seed,
     Command AS DatabasesScanned
 FROM dbo.CommandLog
-WHERE CommandType = 'HEAP_REBUILD_START'
+WHERE CommandType IN ('HEAP_REBUILD_START', 'HEAP_SCAN_SUMMARY')
   AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%ObfuscatedMappingHex%'
 ORDER BY StartTime DESC;
 ```
@@ -551,7 +559,7 @@ After reveal, you can decode your full rebuild history by joining the mapping ba
 ```sql
 -- Step 1: Reveal the mapping into a temp table
 IF OBJECT_ID('tempdb..#Mapping') IS NOT NULL DROP TABLE #Mapping;
-CREATE TABLE #Mapping (object_type varchar(5), pseudonym sysname, real_name sysname);
+CREATE TABLE #Mapping (pseudonym nvarchar(20), object_type varchar(10), real_name sysname);
 
 INSERT #Mapping
 EXEC dbo.sp_HeapDoctor
@@ -570,38 +578,73 @@ SELECT
     c.ErrorMessage
 FROM dbo.CommandLog c
 LEFT JOIN #Mapping m ON m.pseudonym = c.DatabaseName AND m.object_type = 'DB'
-LEFT JOIN #Mapping t ON t.pseudonym = c.ObjectName  AND t.object_type = 'T'
+LEFT JOIN #Mapping t ON t.pseudonym = c.ObjectName  AND t.object_type = 'Table'
 WHERE c.CommandType IN ('HEAP_REBUILD_ONLINE','HEAP_REBUILD_OFFLINE','CI_SWAP_ONLINE')
   AND CAST(c.ExtendedInfo AS nvarchar(max)) LIKE '%<RunID>153ACF40-D520-4472-ABE1-8A9BC99203A7</RunID>%'
 ORDER BY c.StartTime;
 ```
 
-### End-to-end workflow: sharing a report with a consultant
+### End-to-end workflow: cross-environment analysis
+
+This workflow lets you analyze heap performance on a company server and safely bring the results to a non-company machine for analysis, then map findings back to real objects.
 
 ```sql
--- 1. Generate obfuscated report (run on your server)
+-- STEP 1: On your company server, generate an obfuscated plan-only report.
+--         Use @ObfuscateSeed for consistent pseudonyms across servers.
 EXEC dbo.sp_HeapDoctor
-    @Databases    = 'USER_DATABASES',
-    @ObfuscateKey = 'acme-2026-audit',
-    @PlanOnly     = 0;
--- Note the RunID from the output (e.g., 153ACF40-...)
+    @Databases     = 'USER_DATABASES',
+    @ObfuscateKey  = 'acme-2026-audit',
+    @ObfuscateSeed = 'prod-q1',
+    @PlanOnly      = 1;
+-- Output includes:
+-- "Obfuscation applied to 5 targets.
+--  RunID=153ACF40-D520-4472-ABE1-8A9BC99203A7"
+-- Save this RunID! You'll need it to reveal later.
 
--- 2. Export the obfuscated result set and/or CommandLog
---    (copy-paste from SSMS, or bcp out - all names are pseudonymized)
+-- STEP 2: Copy the obfuscated result set to your analysis machine.
+--         Use SSMS "Copy with Headers" or bcp. All object names are pseudonyms
+--         (DB_AA92F53B, T_43306ED0, etc.) but metrics are real:
+--         page_count, forwarded_pct, ranking_score, size_mb, total_cpu_ms, etc.
 
--- 3. Send to consultant.  They see DB_AA92F53B, T_43306ED0, etc.
---    All metrics (page counts, CPU, forwarded %) are real; only names are hidden.
+-- STEP 3: Analyze on your non-company machine.
+--         Identify highest-impact heaps by ranking_score, size_mb, forwarded_pct.
+--         Write notes like: "T_43306ED0 (rank 7.45, 1.2 GB, 48% forwarded) - rebuild first"
+--         "T_8B2F1A77 (rank 3.12, 200 MB) - low priority, write-heavy"
 
--- 4. When consultant asks "what is T_43306ED0?", reveal on your server:
+-- STEP 4: Back on company server, reveal the mapping.
 EXEC dbo.sp_HeapDoctor
     @RevealKey   = 'acme-2026-audit',
     @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
--- Returns: T_43306ED0 = Orders
+-- Returns: T_43306ED0 = Orders, T_8B2F1A77 = AuditLog, etc.
+-- Now apply your recommendations using real names.
 ```
+
+**Multi-server comparison with consistent pseudonyms:**
+
+```sql
+-- Run on Server A (dev):
+EXEC dbo.sp_HeapDoctor
+    @ObfuscateKey = 'compare-key', @ObfuscateSeed = 'env-compare', @PlanOnly = 1;
+
+-- Run on Server B (prod):
+EXEC dbo.sp_HeapDoctor
+    @ObfuscateKey = 'compare-key', @ObfuscateSeed = 'env-compare', @PlanOnly = 1;
+
+-- Tables with the same name produce identical pseudonyms on both servers.
+-- Compare forwarded_pct, ranking_score, size_mb side by side in a spreadsheet.
+```
+
+**Tips for the cross-environment workflow:**
+
+- Always use `@ObfuscateSeed` when comparing multiple servers (without it, each run uses a unique seed)
+- `@LogToTable = 'Y'` (default) is required for plan-only reveal to work
+- The RunID appears in session output and is also queryable from CommandLog (see "Finding available RunIDs" above)
+- Numeric columns (page_count, forwarded_pct, total_cpu_ms, size_mb, est_log_mb, ranking_score) are never obfuscated
+- To track trends over time, run periodic plan-only scans; each creates a HEAP_SCAN_SUMMARY entry in CommandLog
 
 ### Important notes
 
-- **Plan-only limitation**: The encrypted mapping is stored in CommandLog during execution.  Plan-only runs (`@PlanOnly = 1`) don't write CommandLog, so `@RevealKey` only works for runs that were actually executed.  A warning is emitted when obfuscating in plan-only mode.
+- **Plan-only support**: Plan-only runs store the encrypted mapping in the HEAP_SCAN_SUMMARY CommandLog entry when `@LogToTable = 'Y'` (default). Reveal mode checks both HEAP_REBUILD_START (execution runs) and HEAP_SCAN_SUMMARY (plan-only runs). If `@LogToTable = 'N'`, no mapping is stored and a warning is emitted.
 - **Wrong key**: If you provide the wrong `@RevealKey`, the decryption fails with an error rather than returning wrong data.
 - **RAISERROR messages**: Progress messages in the session always show real names (they are ephemeral and not captured in result sets or logs).  This is by design; you need to see real names to monitor the session.
 - **Existing columns**: Physical stats, CPU metrics, ranking scores, and all numeric columns remain unobfuscated.  Only object name columns and generated command strings are pseudonymized.
