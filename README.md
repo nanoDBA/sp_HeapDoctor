@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0222
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0223
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -344,9 +344,9 @@ This eliminates forwarded records by physically reordering the data.  The temp C
 
 When `@EstimateTime = 1`, each target gets a predicted rebuild time based on two data sources:
 
-1. **CommandLog history** (plan-only and execute modes) - queries previous `HEAP_REBUILD_*` / `CI_SWAP_*` entries from the last `@EstimateLookbackDays` days (default 90).  Computes median pages/sec by action type (online, offline, CI swap separately, because they have very different throughput).  If no history exists, estimates are NULL.
+1. **CommandLog history** (plan-only and execute modes) - queries previous `HEAP_REBUILD_*` / `CI_SWAP_*` entries from the last `@EstimateLookbackDays` days (default 90).  Computes average pages/sec by action type (online, offline, CI swap separately, because they have very different throughput).  Shows sample count for confidence assessment.  If no history exists, estimates are NULL.
 
-2. **Live calibration** (execute mode only) - after each rebuild completes, the proc measures actual pages/sec and blends it with the historical rate.  Remaining targets get updated estimates based on observed throughput.  This handles hardware differences between servers that share the same CommandLog.
+2. **Live calibration** (execute mode only) - after each rebuild completes, the proc measures actual pages/sec per action type and updates remaining targets with matching rates.  This handles hardware differences between servers and avoids mixing ONLINE and CI_SWAP rates (CI swap is typically slower due to NCI rebuild overhead).
 
 The `est_duration` column shows the estimate in `HH:MM:SS` format.  A banner line shows the total estimated remediation time across all targets.
 
@@ -360,6 +360,28 @@ EXEC dbo.sp_HeapDoctor
 
 **First run:** No history means no estimates.  Run a small batch with `@TopN = 3` first to seed CommandLog, then subsequent runs will have throughput data.
 
+### Measuring Rebuild Throughput
+
+Every successful rebuild stores `DurationMs` and `ActualPagesPerSec` in its CommandLog `ExtendedInfo` XML.  Use this to measure and trend throughput across servers, action types, and time:
+
+```sql
+-- Throughput by action type (last 90 days)
+SELECT
+    CommandType,
+    COUNT(*) AS rebuilds,
+    AVG(ExtendedInfo.value('(/ExtendedInfo/ActualPagesPerSec)[1]', 'int')) AS avg_pps,
+    MIN(ExtendedInfo.value('(/ExtendedInfo/ActualPagesPerSec)[1]', 'int')) AS min_pps,
+    MAX(ExtendedInfo.value('(/ExtendedInfo/ActualPagesPerSec)[1]', 'int')) AS max_pps,
+    AVG(ExtendedInfo.value('(/ExtendedInfo/DurationMs)[1]', 'int')) AS avg_duration_ms
+FROM dbo.CommandLog
+WHERE CommandType IN ('HEAP_REBUILD_ONLINE', 'HEAP_REBUILD_OFFLINE', 'CI_SWAP_ONLINE')
+  AND ISNULL(ErrorNumber, 0) = 0
+  AND DATEDIFF(DAY, StartTime, SYSDATETIME()) <= 90
+GROUP BY CommandType;
+```
+
+The summary `HEAP_REBUILD_END` entry also includes `TotalPagesRebuilt` and `AvgPagesPerSec` for the entire run (not gated on `@EstimateTime`; `AvgPagesPerSec` is populated when at least one rebuild exceeds 100ms).  CI_SWAP `DurationMs` reflects only the CREATE CI step, not the subsequent DROP.
+
 ## CommandLog Integration
 
 When `@LogToTable = 'Y'` and `dbo.CommandLog` exists:
@@ -370,30 +392,30 @@ When `@LogToTable = 'Y'` and `dbo.CommandLog` exists:
 - **`HEAP_REBUILD_END`** - logged at run end with summary XML (succeeded/failed/skipped counts)
 
 Each per-rebuild entry includes `ExtendedInfo` XML:
+
 ```xml
 <ExtendedInfo>
+  <Version>1.0.2026.0223</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
   <ForwardedPct>3.50</ForwardedPct>
-  <TotalCpuMs>150000</TotalCpuMs>
   <ForwardedFetchCount>85000</ForwardedFetchCount>
+  <TotalCpuMs>150000</TotalCpuMs>
   <PostRebuildForwardedRecords>0</PostRebuildForwardedRecords>
+  <DurationMs>3456</DurationMs>
+  <ActualPagesPerSec>3572</ActualPagesPerSec>
+  <!-- Qs* elements populated when @CpuSource is QUERY_STORE or QUICKIESTORE -->
   <QsSnapshotTimeUtc>2026-02-17T04:30:00.123</QsSnapshotTimeUtc>
   <QsTotalLogicalReads>2500000</QsTotalLogicalReads>
-  <QsTotalPhysicalReads>1200</QsTotalPhysicalReads>
-  <QsTotalDurationMs>85000</QsTotalDurationMs>
-  <QsTotalExecutions>4500</QsTotalExecutions>
-  <QsPlanCount>3</QsPlanCount>
-  <QsQueryCount>2</QsQueryCount>
-  <QsQueryHashes>0xABC123,0xDEF456</QsQueryHashes>
-  <UsageHint>WRITE_HEAVY</UsageHint>
+  <!-- ... additional elements: RankingScore, RecordCount, NciCount, RunID, etc. -->
 </ExtendedInfo>
 ```
 
 The `Qs*` elements are populated when `@CpuSource` is `QUERY_STORE` or `QUICKIESTORE` and the heap has Query Store data.  They are omitted when `@CpuSource = 'NONE'`.  The `QsQueryHashes` list contains distinct `query_hash` values (hex format) for queries whose plans reference the heap via Table Scan operators.  These hashes are stable across plan recompilation and CI_SWAP DDL changes, making them suitable for before/after comparison in Query Store.
 
 Query rebuild history:
+
 ```sql
 SELECT * FROM dbo.CommandLog
 WHERE CommandType LIKE 'HEAP_REBUILD%'

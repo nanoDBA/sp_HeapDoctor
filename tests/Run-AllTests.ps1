@@ -105,6 +105,7 @@ $AllTests = [ordered]@{
     "09" = "09_test_batch9.sql"
     "10" = "10_test_batch10.sql"
     "11" = "11_test_batch11.sql"
+    "12" = "12_test_batch12.sql"
 }
 
 if (-not $Tests -or $Tests.Count -eq 0) {

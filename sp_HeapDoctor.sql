@@ -50,9 +50,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0222
+Version:    1.0.2026.0223
 
-History:    1.0.2026.0222 - Cross-environment obfuscation workflow
+History:    1.0.2026.0223 - Throughput/ETA improvements
+                          - Per-rebuild ExtendedInfo now includes DurationMs and ActualPagesPerSec
+                            (enables post-hoc throughput trending from CommandLog)
+                          - Live throughput tracking is now unconditional (not gated on @EstimateTime)
+                          - Summary always reports TotalPagesRebuilt and AvgPagesPerSec
+                          - Live calibration uses per-action-type rates (ONLINE/OFFLINE/CI_SWAP)
+                          - Historical estimation shows sample count for confidence assessment
+            1.0.2026.0222 - Cross-environment obfuscation workflow
                           - Plan-only runs now store encrypted mapping in HEAP_SCAN_SUMMARY
                             (enables reveal for plan-only analysis without executing rebuilds)
                           - Reveal mode checks both HEAP_REBUILD_START and HEAP_SCAN_SUMMARY
@@ -401,7 +408,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0222';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0223';
     DECLARE @RunID uniqueidentifier = NEWID();
 
     -- Obfuscation state
@@ -2218,6 +2225,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     DECLARE @hist_ciswap_pps    float = NULL;
     DECLARE @hist_any_pps       float = NULL;
     DECLARE @hist_source        varchar(20) = 'NONE';
+    DECLARE @hist_sample_count  int = 0;
 
     IF @EstimateTime = 1 AND @commandlog_exists = 1
     BEGIN
@@ -2234,15 +2242,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             WHERE CommandType IN ('HEAP_REBUILD_ONLINE', 'HEAP_REBUILD_OFFLINE', 'CI_SWAP_ONLINE')
               AND ISNULL(ErrorNumber, 0) = 0
               AND EndTime IS NOT NULL
-              AND DATEDIFF(MILLISECOND, StartTime, EndTime) > 500
+              AND DATEDIFF(MILLISECOND, StartTime, EndTime) > 100
               AND DATEDIFF(DAY, StartTime, SYSDATETIME()) <= @EstimateLookbackDays
+              AND ExtendedInfo.value('(/ExtendedInfo/PageCount)[1]', 'bigint') IS NOT NULL
             GROUP BY CommandType
         )
         SELECT
             @hist_online_pps  = MAX(CASE WHEN CommandType = 'HEAP_REBUILD_ONLINE'  THEN avg_pps END),
             @hist_offline_pps = MAX(CASE WHEN CommandType = 'HEAP_REBUILD_OFFLINE' THEN avg_pps END),
             @hist_ciswap_pps  = MAX(CASE WHEN CommandType = 'CI_SWAP_ONLINE'       THEN avg_pps END),
-            @hist_any_pps     = AVG(avg_pps)
+            @hist_any_pps     = SUM(avg_pps * sample_count) / NULLIF(SUM(sample_count), 0),
+            @hist_sample_count = SUM(sample_count)
         FROM HistRates;
 
         IF @hist_any_pps IS NOT NULL
@@ -2260,8 +2270,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             SET @Msg = N'EstimateTime: Historical throughput (pages/sec):'
                      + CASE WHEN @hist_online_pps  IS NOT NULL THEN N'  ONLINE='  + CAST(CAST(@hist_online_pps  AS int) AS nvarchar(20)) ELSE N'' END
                      + CASE WHEN @hist_offline_pps IS NOT NULL THEN N'  OFFLINE=' + CAST(CAST(@hist_offline_pps AS int) AS nvarchar(20)) ELSE N'' END
-                     + CASE WHEN @hist_ciswap_pps  IS NOT NULL THEN N'  CI_SWAP=' + CAST(CAST(@hist_ciswap_pps  AS int) AS nvarchar(20)) ELSE N'' END;
+                     + CASE WHEN @hist_ciswap_pps  IS NOT NULL THEN N'  CI_SWAP=' + CAST(CAST(@hist_ciswap_pps  AS int) AS nvarchar(20)) ELSE N'' END
+                     + N'  (' + CAST(@hist_sample_count AS nvarchar(10)) + N' sample' + CASE WHEN @hist_sample_count <> 1 THEN N's' ELSE N'' END + N')';
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+            IF @hist_sample_count < 3
+            BEGIN
+                RAISERROR(N'EstimateTime: WARNING - estimate based on fewer than 3 samples. Run a few more rebuilds to improve accuracy.', 10, 1) WITH NOWAIT;
+            END
 
             -- Populate estimate columns on #Targets
             UPDATE #Targets
@@ -2695,10 +2711,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @preflight_sessions     int,
             @preflight_bu_sessions  int,
             @trace_msg              nvarchar(128),
-            -- Live calibration for throughput estimation
+            -- Live calibration for throughput (always tracked; used for estimates when @EstimateTime=1)
             @live_pages_rebuilt   bigint = 0,
             @live_elapsed_ms     bigint = 0,
             @live_pps            float  = NULL,
+            -- Per-action-type live calibration
+            @live_online_pages   bigint = 0,
+            @live_online_ms      bigint = 0,
+            @live_offline_pages  bigint = 0,
+            @live_offline_ms     bigint = 0,
+            @live_ciswap_pages   bigint = 0,
+            @live_ciswap_ms      bigint = 0,
             @remaining_pages     bigint,
             @remaining_est_sec   int,
             @rebuild_elapsed_ms  bigint,
@@ -3176,23 +3199,69 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 /*
                 Live calibration: accumulate throughput data from this rebuild.
-                Only counts rebuilds that took > 500ms (sub-500ms are too fast for meaningful rate).
+                Always tracked (not gated on @EstimateTime) so Summary always has throughput.
+                Only counts rebuilds that took > 100ms for rate calc (sub-100ms too noisy).
                 */
-                IF @EstimateTime = 1
+                SET @rebuild_elapsed_ms = @elapsed_ms; -- reuse from line above (same @start/@end)
+
+                -- Always count pages rebuilt (not gated on timing threshold)
+                SET @live_pages_rebuilt += @cur_page_count;
+
+                IF @rebuild_elapsed_ms > 100
                 BEGIN
-                    SET @rebuild_elapsed_ms = DATEDIFF(MILLISECOND, @start, @end);
+                    -- Accumulate timing for rate calculation (sub-100ms too noisy for meaningful rate)
+                    SET @live_elapsed_ms   += @rebuild_elapsed_ms;
 
-                    IF @rebuild_elapsed_ms > 500
+                    -- Per-action-type rates for more accurate estimates
+                    IF @action = N'HEAP_REBUILD_ONLINE'
                     BEGIN
-                        SET @live_pages_rebuilt += @cur_page_count;
-                        SET @live_elapsed_ms   += @rebuild_elapsed_ms;
-                        SET @live_pps = CAST(@live_pages_rebuilt AS float)
-                                      / NULLIF(@live_elapsed_ms / 1000.0, 0);
+                        SET @live_online_pages += @cur_page_count;
+                        SET @live_online_ms    += @rebuild_elapsed_ms;
+                    END
+                    ELSE IF @action = N'HEAP_REBUILD_OFFLINE'
+                    BEGIN
+                        SET @live_offline_pages += @cur_page_count;
+                        SET @live_offline_ms    += @rebuild_elapsed_ms;
+                    END
+                    ELSE IF @action = N'CI_SWAP_ONLINE'
+                    BEGIN
+                        SET @live_ciswap_pages += @cur_page_count;
+                        SET @live_ciswap_ms    += @rebuild_elapsed_ms;
+                    END
 
-                        -- Update remaining targets with live rate
+                    -- Combined rate uses only timed pages (not @live_pages_rebuilt which includes sub-500ms)
+                    SET @live_pps = CAST((@live_online_pages + @live_offline_pages + @live_ciswap_pages) AS float)
+                                  / NULLIF(@live_elapsed_ms / 1000.0, 0);
+
+                    -- Update remaining target estimates with per-action-type live rates
+                    IF @EstimateTime = 1
+                    BEGIN
                         UPDATE #Targets
-                        SET est_pages_per_sec = @live_pps,
-                            est_seconds       = CEILING(page_count / NULLIF(@live_pps, 0))
+                        SET est_pages_per_sec = CASE action_chosen
+                                WHEN N'HEAP_REBUILD_ONLINE'  THEN COALESCE(
+                                    CASE WHEN @live_online_ms > 0 THEN CAST(@live_online_pages AS float) / (@live_online_ms / 1000.0) END,
+                                    @live_pps)
+                                WHEN N'HEAP_REBUILD_OFFLINE' THEN COALESCE(
+                                    CASE WHEN @live_offline_ms > 0 THEN CAST(@live_offline_pages AS float) / (@live_offline_ms / 1000.0) END,
+                                    @live_pps)
+                                WHEN N'CI_SWAP_ONLINE'       THEN COALESCE(
+                                    CASE WHEN @live_ciswap_ms > 0 THEN CAST(@live_ciswap_pages AS float) / (@live_ciswap_ms / 1000.0) END,
+                                    @live_pps)
+                                ELSE @live_pps
+                            END,
+                            est_seconds = CEILING(page_count / NULLIF(
+                                CASE action_chosen
+                                    WHEN N'HEAP_REBUILD_ONLINE'  THEN COALESCE(
+                                        CASE WHEN @live_online_ms > 0 THEN CAST(@live_online_pages AS float) / (@live_online_ms / 1000.0) END,
+                                        @live_pps)
+                                    WHEN N'HEAP_REBUILD_OFFLINE' THEN COALESCE(
+                                        CASE WHEN @live_offline_ms > 0 THEN CAST(@live_offline_pages AS float) / (@live_offline_ms / 1000.0) END,
+                                        @live_pps)
+                                    WHEN N'CI_SWAP_ONLINE'       THEN COALESCE(
+                                        CASE WHEN @live_ciswap_ms > 0 THEN CAST(@live_ciswap_pages AS float) / (@live_ciswap_ms / 1000.0) END,
+                                        @live_pps)
+                                    ELSE @live_pps
+                                END, 0))
                         WHERE sort_order > @i;
 
                         UPDATE #Targets
@@ -3204,12 +3273,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                          + RIGHT('00' + CAST(est_seconds % 60 AS varchar(2)), 2)
                         WHERE sort_order > @i AND est_seconds IS NOT NULL;
 
-                        -- Compute and display remaining time estimate
-                        SELECT @remaining_pages = SUM(page_count) FROM #Targets WHERE sort_order > @i;
+                        -- Compute and display remaining time estimate using per-target estimates
+                        SELECT @remaining_est_sec = SUM(est_seconds) FROM #Targets WHERE sort_order > @i AND est_seconds IS NOT NULL;
 
-                        IF @remaining_pages IS NOT NULL AND @remaining_pages > 0
+                        IF @remaining_est_sec IS NOT NULL AND @remaining_est_sec > 0
                         BEGIN
-                            SET @remaining_est_sec = CEILING(@remaining_pages / NULLIF(@live_pps, 0));
 
                             SET @Msg = N'  Live rate: ' + CAST(CAST(@live_pps AS int) AS nvarchar(20)) + N' pages/sec'
                                      + N'  |  Remaining: ~'
@@ -3242,6 +3310,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             @cur_ghost_count AS GhostRecordCount,
                             @cur_cpu_ms AS TotalCpuMs,
                             @post_fwd_count AS PostRebuildForwardedRecords,
+                            @elapsed_ms AS DurationMs,
+                            CASE WHEN @elapsed_ms > 100
+                                 THEN CAST(CAST(@cur_page_count AS float) / (@elapsed_ms / 1000.0) AS int)
+                            END AS ActualPagesPerSec,
                             @cur_qs_snapshot_utc AS QsSnapshotTimeUtc,
                             @cur_qs_logical_reads AS QsTotalLogicalReads,
                             @cur_qs_physical_reads AS QsTotalPhysicalReads,
@@ -3330,6 +3402,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             @cur_frag_pct AS AvgFragPct,
                             @cur_ghost_count AS GhostRecordCount,
                             @cur_cpu_ms AS TotalCpuMs,
+                            @elapsed_ms AS DurationMs,
                             @cur_qs_snapshot_utc AS QsSnapshotTimeUtc,
                             @cur_qs_logical_reads AS QsTotalLogicalReads,
                             @cur_qs_physical_reads AS QsTotalPhysicalReads,
@@ -3379,7 +3452,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         THEN N'  ScanErrors: ' + CAST(@discovery_errors AS nvarchar(10))
                         ELSE N'' END
                  + N'  Elapsed: ' + CAST(DATEDIFF(SECOND, @RunStart, SYSDATETIME()) AS nvarchar(10)) + N's'
-                 + CASE WHEN @EstimateTime = 1 AND @live_pps IS NOT NULL
+                 + CASE WHEN @live_pps IS NOT NULL
                         THEN N'  AvgRate: ' + CAST(CAST(@live_pps AS int) AS nvarchar(20)) + N' pages/sec'
                         ELSE N'' END;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -3430,8 +3503,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             WHEN @skipped_cnt > 0 THEN N'COMPLETED_WITH_SKIPS'
                             ELSE N'SUCCESS'
                         END AS StopReason,
-                        CASE WHEN @EstimateTime = 1 THEN @live_pages_rebuilt END AS TotalPagesRebuilt,
-                        CASE WHEN @EstimateTime = 1 THEN CAST(@live_pps AS int) END AS AvgPagesPerSec,
+                        @live_pages_rebuilt AS TotalPagesRebuilt,
+                        CAST(@live_pps AS int) AS AvgPagesPerSec,
                         @RunID AS RunID
                     FOR XML RAW(N'Summary'), ELEMENTS
                 )
