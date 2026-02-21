@@ -50,9 +50,17 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0220
+Version:    1.0.2026.0221
 
-History:    1.0.2026.0220 - Batch 10: Obfuscation/Reveal
+History:    1.0.2026.0221 - Batch 11: Enhanced logging and impact projections
+                          - Suppress ANSI_WARNINGS noise from DMV aggregation in discovery scan
+                          - New columns: size_mb, est_space_savings_mb, est_ci_swap_overhead_mb,
+                            est_log_mb, days_since_last_rebuild
+                          - Plan-only scan logging: HEAP_SCAN_SUMMARY entry in CommandLog when
+                            @LogToTable='Y' enables trending without executing rebuilds
+                          - Enhanced per-rebuild ExtendedInfo: RecordCount, NciCount, EstSeconds,
+                            DaysSinceLastRebuild
+            1.0.2026.0220 - Batch 10: Obfuscation/Reveal
                           - @ObfuscateKey: replace real names with 8-char hex pseudonyms in
                             result sets and CommandLog (database, schema, table, index, commands)
                           - @ObfuscateSeed: optional seed for deterministic pseudonyms across
@@ -388,7 +396,7 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0220';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0221';
     DECLARE @RunID uniqueidentifier = NEWID();
 
     -- Obfuscation state
@@ -1006,6 +1014,11 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         verify_command           nvarchar(max)  NULL,
         prev_forwarded_pct       decimal(6,2)   NULL,
         rebuilds_in_90d          int            NULL,
+        size_mb                  decimal(18,2)  NULL,
+        est_space_savings_mb     decimal(18,2)  NULL,
+        est_ci_swap_overhead_mb  decimal(18,2)  NULL,
+        est_log_mb               decimal(18,2)  NULL,
+        days_since_last_rebuild  int            NULL,
         sort_order               int            NOT NULL DEFAULT 0,
         -- Obfuscation: pseudo_ columns hold pseudonyms when @ObfuscateKey is provided.
         -- Real columns remain untouched for TOCTOU checks, execution, and RAISERROR.
@@ -1155,6 +1168,8 @@ DECLARE @HeapTableCount int = (SELECT COUNT(*) FROM #HeapObjects);
 SET @Msg_inner = N''  '' + CAST(@HeapTableCount AS nvarchar(10)) + N'' heap table(s) to scan (non-heap objects skipped).'';
 RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
+SET ANSI_WARNINGS OFF;  -- suppress "Null value is eliminated by an aggregate" from DMV aggregation
+
 INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation)
 SELECT
     ho.object_id,
@@ -1222,6 +1237,8 @@ WHERE ips.forwarded_record_count > 0
   AND ips.page_count >= @MinPages_param
   AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param)
   AND (100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0)) >= @MinForwardedPct_param;
+
+SET ANSI_WARNINGS ON;
 
 DROP TABLE #HeapObjects;
 
@@ -2279,14 +2296,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         UPDATE t
         SET
             t.prev_forwarded_pct = hist.prev_fwd_pct,
-            t.rebuilds_in_90d = hist.rebuild_count
+            t.rebuilds_in_90d = hist.rebuild_count,
+            t.days_since_last_rebuild = hist.days_since
         FROM #Targets t
         OUTER APPLY (
             SELECT TOP 1
                 CASE WHEN cl.ExtendedInfo IS NOT NULL
                      THEN cl.ExtendedInfo.value('(/ExtendedInfo/ForwardedPct)[1]', 'decimal(6,2)')
                      ELSE NULL END AS prev_fwd_pct,
-                NULL AS rebuild_count  -- placeholder, computed separately
+                NULL AS rebuild_count,  -- placeholder, computed separately
+                DATEDIFF(DAY, cl.EndTime, SYSDATETIME()) AS days_since
             FROM dbo.CommandLog cl
             WHERE cl.DatabaseName = t.database_name
               AND cl.ObjectName = t.table_name
@@ -2310,6 +2329,28 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
               AND cl.EndTime >= DATEADD(DAY, -90, SYSDATETIME())
         ) cnt;
     END
+
+    ----------------------------------------------------------------------------
+    -- Size and impact projections
+    ----------------------------------------------------------------------------
+    UPDATE #Targets
+    SET
+        size_mb = CAST(page_count AS decimal(18,2)) / 128.0,
+        est_ci_swap_overhead_mb = CASE
+            WHEN action_chosen = 'CI_SWAP_ONLINE'
+            THEN CAST(page_count AS decimal(18,2)) / 128.0
+            ELSE NULL END,
+        est_space_savings_mb = CASE
+            WHEN avg_page_space_pct IS NOT NULL AND avg_page_space_pct < 75.0
+            THEN CAST(page_count AS decimal(18,2)) * (1.0 - avg_page_space_pct / 100.0) / 128.0
+            ELSE NULL END;
+
+    -- est_log_mb: per-target log estimate for FULL recovery databases
+    UPDATE t
+    SET t.est_log_mb = CAST(t.page_count AS decimal(18,2)) * 8192.0 / 1048576.0
+    FROM #Targets t
+    JOIN sys.databases d ON d.name = t.database_name COLLATE DATABASE_DEFAULT
+    WHERE d.recovery_model_desc = N'FULL';
 
     ----------------------------------------------------------------------------
     -- Obfuscation: build encrypted mapping, then populate pseudo_ columns.
@@ -2484,9 +2525,74 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         CASE WHEN @obfuscate = 1 THEN pseudo_ci_drop        ELSE ci_drop_command END AS ci_drop_command,
         CASE WHEN @obfuscate = 1 THEN pseudo_verify_cmd     ELSE verify_command  END AS verify_command,
         prev_forwarded_pct,
-        rebuilds_in_90d
+        rebuilds_in_90d,
+        size_mb,
+        est_space_savings_mb,
+        est_ci_swap_overhead_mb,
+        est_log_mb,
+        days_since_last_rebuild
     FROM #Targets
     ORDER BY sort_order;
+
+    ----------------------------------------------------------------------------
+    -- Plan-only scan logging: persist discovery results to CommandLog
+    ----------------------------------------------------------------------------
+    IF @PlanOnly = 1 AND @LogToTable = 'Y' AND @commandlog_exists = 1
+    BEGIN
+        INSERT INTO dbo.CommandLog
+            (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
+             StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+        VALUES
+        (
+            ISNULL(@Databases, DB_NAME()),
+            N'dbo',
+            N'sp_HeapDoctor',
+            N'P',
+            N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N''' @PlanOnly = 1...',
+            N'HEAP_SCAN_SUMMARY',
+            @start_time,
+            SYSDATETIME(),
+            0,
+            NULL,
+            (
+                SELECT
+                    @Version AS Version,
+                    @RunID AS RunID,
+                    @TargetCount AS TargetCount,
+                    @DatabaseCount AS DatabasesScanned,
+                    (SELECT SUM(page_count) FROM #Targets) AS TotalPageCount,
+                    CAST((SELECT SUM(page_count) FROM #Targets) AS decimal(18,2)) / 128.0 AS TotalSizeMB,
+                    @CpuSourceUpper AS CpuSource,
+                    DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS ElapsedSeconds,
+                    (
+                        SELECT
+                            CASE WHEN @obfuscate = 1 THEN pseudo_database_name ELSE database_name END AS DatabaseName,
+                            CASE WHEN @obfuscate = 1 THEN pseudo_schema_name   ELSE schema_name   END AS SchemaName,
+                            CASE WHEN @obfuscate = 1 THEN pseudo_table_name    ELSE table_name    END AS TableName,
+                            page_count AS PageCount,
+                            size_mb AS SizeMB,
+                            record_count AS RecordCount,
+                            forwarded_pct AS ForwardedPct,
+                            forwarded_fetch_count AS ForwardedFetchCount,
+                            total_cpu_ms AS TotalCpuMs,
+                            ranking_score AS RankingScore,
+                            action_chosen AS ActionChosen,
+                            usage_hint AS UsageHint,
+                            nci_count AS NciCount,
+                            est_seconds AS EstSeconds,
+                            est_log_mb AS EstLogMB,
+                            est_space_savings_mb AS EstSpaceSavingsMB,
+                            days_since_last_rebuild AS DaysSinceLastRebuild,
+                            prev_forwarded_pct AS PrevForwardedPct,
+                            rebuilds_in_90d AS RebuildsIn90d
+                        FROM #Targets
+                        ORDER BY sort_order
+                        FOR XML RAW(N'Target'), TYPE
+                    ) AS Targets
+                FOR XML RAW(N'ScanSummary'), ELEMENTS, TYPE
+            )
+        );
+    END
 
     ----------------------------------------------------------------------------
     -- Execute if requested
@@ -2546,6 +2652,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_ranking_score      decimal(8,4),
             @cur_replication_hint   varchar(20),
             @cur_lock_escalation    tinyint,
+            @cur_record_count       bigint,
+            @cur_nci_count          int,
+            @cur_est_seconds        int,
+            @cur_days_since_rebuild int,
             @preflight_sessions     int,
             @preflight_bu_sessions  int,
             @trace_msg              nvarchar(128),
@@ -2659,6 +2769,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @cur_ranking_score     = ranking_score,
                 @cur_replication_hint  = replication_hint,
                 @cur_lock_escalation   = lock_escalation,
+                @cur_record_count      = record_count,
+                @cur_nci_count         = nci_count,
+                @cur_est_seconds       = est_seconds,
+                @cur_days_since_rebuild = days_since_last_rebuild,
                 -- Obfuscation: pseudo values (NULL when not obfuscating)
                 @pseudo_db             = pseudo_database_name,
                 @pseudo_schema         = pseudo_schema_name,
@@ -2773,6 +2887,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                 ranking_score AS RankingScore,
                                 replication_hint AS ReplicationHint,
                                 lock_escalation AS LockEscalation,
+                                record_count AS RecordCount,
+                                nci_count AS NciCount,
+                                est_seconds AS EstSeconds,
+                                days_since_last_rebuild AS DaysSinceLastRebuild,
                                 @RunID AS RunID
                             FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                         )
@@ -3100,6 +3218,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             @cur_ranking_score AS RankingScore,
                             @cur_replication_hint AS ReplicationHint,
                             @cur_lock_escalation AS LockEscalation,
+                            @cur_record_count AS RecordCount,
+                            @cur_nci_count AS NciCount,
+                            @cur_est_seconds AS EstSeconds,
+                            @cur_days_since_rebuild AS DaysSinceLastRebuild,
                             @RunID AS RunID
                         FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                     );
@@ -3184,6 +3306,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             @cur_ranking_score AS RankingScore,
                             @cur_replication_hint AS ReplicationHint,
                             @cur_lock_escalation AS LockEscalation,
+                            @cur_record_count AS RecordCount,
+                            @cur_nci_count AS NciCount,
+                            @cur_est_seconds AS EstSeconds,
+                            @cur_days_since_rebuild AS DaysSinceLastRebuild,
                             @RunID AS RunID
                         FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                     );

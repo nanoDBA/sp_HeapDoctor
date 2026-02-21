@@ -69,7 +69,12 @@ CREATE TABLE #Results
     ci_drop_command        nvarchar(max) NULL,
     verify_command         nvarchar(max) NULL,
     prev_forwarded_pct     decimal(6,2)  NULL,
-    rebuilds_in_90d        int           NULL
+    rebuilds_in_90d        int           NULL,
+    size_mb                decimal(18,2) NULL,
+    est_space_savings_mb   decimal(18,2) NULL,
+    est_ci_swap_overhead_mb decimal(18,2) NULL,
+    est_log_mb             decimal(18,2) NULL,
+    days_since_last_rebuild int           NULL
 );
 GO
 
