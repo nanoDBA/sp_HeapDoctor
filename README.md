@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0223
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0224
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -28,6 +28,8 @@ sp_HeapDoctor is built around three ideas:
 - **CI swap technique** - creates a temp clustered index using a safe unique NC key, then drops it.  Auto-detects keys, guards against LOB columns, and shows the NCI rebuild cost before you commit to it.
 - **Online rebuild support** - auto-detects Enterprise/Developer/Azure SQL DB.  Falls back to offline on Standard, because Microsoft would like you to upgrade.
 - **Multi-database targeting** - Ola Hallengren `@Databases` parameter (`USER_DATABASES`, wildcards, exclusions, comma-separated).  If you already know how Ola's tools work, you already know how this works.
+- **Table-level filtering** - `@Tables` parameter narrows discovery to specific tables: `@Tables = 'dbo.Orders, -dbo.Staging%'`.  Same syntax as `@Databases` (wildcards, exclusions, comma-separated).  Schema is optional: `'Orders'` matches any schema.
+- **Plan-then-execute workflow** - `@ResumeRunID` skips the expensive discovery and Query Store analysis by loading targets from a previous plan-only scan.  Run `@PlanOnly=1` to review, note the RunID, then `@ResumeRunID=<guid>, @PlanOnly=0` to execute the same targets without re-scanning.
 - **CommandLog logging** - `HEAP_REBUILD_START`/`END` bracketing with per-rebuild `ExtendedInfo` XML.  Post-rebuild verification confirms the forwarded records are actually gone, because trust but verify.
 - **Per-rebuild lock timeout** - `SET LOCK_TIMEOUT` prefix/suffix with session restore.  Your blocking chain will thank you.
 - **Time limit** - `@MaxRunSeconds` with graceful stop (remaining targets logged as `SKIPPED`).  Maintenance windows end whether you're done or not.
@@ -86,13 +88,26 @@ EXEC dbo.sp_HeapDoctor
     @EstimateTime  = 1,
     @PlanOnly      = 1;
 
--- 6) Obfuscated output (safe to share externally)
+-- 6) Target specific tables (wildcards + exclusions)
+EXEC dbo.sp_HeapDoctor
+    @Databases = 'USER_DATABASES',
+    @Tables    = 'dbo.Orders%, -dbo.Orders_Archive',
+    @PlanOnly  = 1;
+
+-- 7) Plan-then-execute: review first, execute same targets without re-scanning
+EXEC dbo.sp_HeapDoctor @PlanOnly = 1;
+-- Note the RunID from output, then:
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = '<RunID-from-plan-only>',
+    @PlanOnly    = 0;
+
+-- 8) Obfuscated output (safe to share externally)
 EXEC dbo.sp_HeapDoctor
     @Databases    = 'USER_DATABASES',
     @ObfuscateKey = 'my secret passphrase',
     @PlanOnly     = 1;
 
--- 7) Reveal real names from an obfuscated run
+-- 9) Reveal real names from an obfuscated run
 EXEC dbo.sp_HeapDoctor
     @RevealKey   = 'my secret passphrase',
     @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
@@ -105,6 +120,7 @@ EXEC dbo.sp_HeapDoctor
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@Databases` | `NULL` | `NULL` = current DB.  Supports `USER_DATABASES`, `ALL_DATABASES`, `SYSTEM_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%`), exclusions (`-`), comma-separated |
+| `@Tables` | `NULL` | `NULL` = all tables.  Filter by table name: `'dbo.Orders'`, `'Orders'` (any schema), `'dbo.%'` (wildcard), `'-dbo.Staging%'` (exclude).  Same syntax as `@Databases` |
 | `@LookbackDays` | `7` | Query Store lookback window in days |
 | `@TopN` | `25` | Max targets per database |
 | `@MinPages` | `1000` | Skip heaps smaller than this (page count) |
@@ -139,6 +155,7 @@ EXEC dbo.sp_HeapDoctor
 | `@LockTimeoutMs` | `NULL` | Per-rebuild lock timeout in ms |
 | `@MaxRunSeconds` | `NULL` | Stop after N seconds (`NULL` = no limit) |
 | `@ScanThrottleMs` | `NULL` | Milliseconds to pause between database scans (0-60000).  Reduces latch contention on busy servers |
+| `@ResumeRunID` | `NULL` | Load targets from a prior `@PlanOnly=1` HEAP_SCAN_SUMMARY.  Skips discovery and QS analysis.  Requires `@LogToTable='Y'` on the original run |
 
 ### Estimation
 
@@ -395,7 +412,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>1.0.2026.0223</Version>
+  <Version>1.0.2026.0224</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -670,6 +687,48 @@ EXEC dbo.sp_HeapDoctor
 - **Wrong key**: If you provide the wrong `@RevealKey`, the decryption fails with an error rather than returning wrong data.
 - **RAISERROR messages**: Progress messages in the session always show real names (they are ephemeral and not captured in result sets or logs).  This is by design; you need to see real names to monitor the session.
 - **Existing columns**: Physical stats, CPU metrics, ranking scores, and all numeric columns remain unobfuscated.  Only object name columns and generated command strings are pseudonymized.
+
+## Plan-Then-Execute Workflow
+
+Running `@PlanOnly=1` generates a target list and stores it as a `HEAP_SCAN_SUMMARY` entry in CommandLog (when `@LogToTable='Y'`, which is the default).  This means you can review the targets, step away, come back the next day, and execute exactly those targets without waiting for another full discovery pass:
+
+```sql
+-- Step 1: Review targets (stores HEAP_SCAN_SUMMARY in CommandLog)
+EXEC dbo.sp_HeapDoctor
+    @Databases = 'USER_DATABASES',
+    @PlanOnly  = 1;
+-- Output shows:  RunID=26D0C3AC-4B04-4E1F-98B9-43E5B87EE06D
+
+-- Step 2: Execute from the plan (skips discovery entirely)
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = '26D0C3AC-4B04-4E1F-98B9-43E5B87EE06D',
+    @PlanOnly    = 0;
+```
+
+The resume path loads every column from the stored XML: page counts, ranking scores, commands, QS snapshots, the works.  Discovery, Query Store analysis, trending columns, and impact projections are all skipped.  The only thing that still runs is the TOCTOU check (verifying each table still exists before rebuilding).
+
+**What `@ResumeRunID` validates:**
+
+- The RunID must reference a `HEAP_SCAN_SUMMARY` entry (not a `HEAP_REBUILD_START` from an execution run)
+- The stored procedure version must match the current version (catches "upgraded proc between plan and execute")
+- Obfuscated summaries are rejected (you cannot resume from a plan-only run that used `@ObfuscateKey`; run without obfuscation first)
+- `@Databases` and `@Tables` are ignored in resume mode (a warning is printed if you pass them)
+
+**Finding the RunID:**
+
+The RunID appears in the RAISERROR output during the plan-only run, and is also queryable from CommandLog:
+
+```sql
+SELECT TOP 5
+    ID,
+    StartTime,
+    ExtendedInfo.value('(/ScanSummary/RunID)[1]', 'uniqueidentifier') AS RunID,
+    ExtendedInfo.value('(/ScanSummary/TargetCount)[1]', 'int') AS Targets,
+    ExtendedInfo.value('(/ScanSummary/TotalSizeMB)[1]', 'decimal(18,2)') AS TotalSizeMB
+FROM dbo.CommandLog
+WHERE CommandType = 'HEAP_SCAN_SUMMARY'
+ORDER BY ID DESC;
+```
 
 ## Known Limitations and Notes
 

@@ -50,9 +50,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0223
+Version:    1.0.2026.0224
 
-History:    1.0.2026.0223 - Throughput/ETA improvements
+History:    1.0.2026.0224 - @Tables parameter and @ResumeRunID (plan-then-execute workflow)
+                          - @Tables: Include/exclude specific tables: @Tables = 'dbo.Orders, -dbo.Staging%'
+                          - Schema optional: 'Orders' matches any schema, 'dbo.Orders' matches exact
+                          - Wildcards (%), exclusions (-), comma-separated (same syntax as @Databases)
+                          - Works with @Databases for cross-database table targeting
+                          - @ResumeRunID: execute targets from a prior @PlanOnly=1 scan
+                          - Skips discovery + QS analysis; uses commands stored in HEAP_SCAN_SUMMARY
+                          - HEAP_SCAN_SUMMARY XML enriched with all #Targets columns for resume
+                          - HEAP_REBUILD_START includes ResumedFromRunID for audit trail
+                          - Version match and obfuscation checks on resume
+            1.0.2026.0223 - Throughput/ETA improvements
                           - Per-rebuild ExtendedInfo now includes DurationMs and ActualPagesPerSec
                             (enables post-hoc throughput trending from CommandLog)
                           - Live throughput tracking is now unconditional (not gated on @EstimateTime)
@@ -178,7 +188,7 @@ Key Features:
     - sp_QuickieStore integration as alternative CPU source
     - CI swap technique with auto key detection + LOB awareness
     - Online rebuild support (Enterprise/Developer edition detection)
-    - Ola Hallengren @Databases parameter for multi-database targeting
+    - Ola Hallengren @Databases and @Tables parameters for targeted scanning
     - CommandLog logging with HEAP_REBUILD_START/END bracketing
     - Per-rebuild lock timeout with session restore
     - @MaxRunSeconds time limit (remaining targets logged as SKIPPED)
@@ -234,6 +244,25 @@ EXEC dbo.sp_HeapDoctor
 EXEC dbo.sp_HeapDoctor
     @Databases         = 'USER_DATABASES, -ReportingArchive',
     @MinPages          = 5000,
+    @PlanOnly          = 1;
+
+3b) Target specific tables
+
+EXEC dbo.sp_HeapDoctor
+    @Tables            = 'dbo.Orders, dbo.OrderDetails',
+    @PlanOnly          = 1;
+
+3c) Target tables by pattern, exclude staging
+
+EXEC dbo.sp_HeapDoctor
+    @Tables            = 'dbo.%, -dbo.Staging%',
+    @Databases         = 'USER_DATABASES',
+    @PlanOnly          = 1;
+
+3d) Target tables by name only (any schema)
+
+EXEC dbo.sp_HeapDoctor
+    @Tables            = 'Heap%',
     @PlanOnly          = 1;
 
 4) Execute online rebuilds with lock timeout
@@ -315,6 +344,15 @@ Notes
   Exclusions:     'USER_DATABASES, -ReportingArchive' = all user DBs except one
   Comma-separated: 'DB1, DB2, DB3'
 
+@Tables parameter (Ola Hallengren pattern):
+  NULL            = all tables (no filter)
+  schema.table    = specific table: 'dbo.Orders'
+  table only      = any schema: 'Orders' (same as '%.Orders')
+  Wildcards:      'dbo.Order%' matches dbo.Orders, dbo.OrderDetails, etc.
+  Schema wildcard: 'dbo.%' matches all tables in dbo schema
+  Exclusions:     'dbo.%, -dbo.Staging%' = all dbo tables except staging
+  Comma-separated: 'dbo.T1, dbo.T2, sales.T3'
+
 CI-swap path:
   Creates a temporary clustered index using a safe unique NC key, then drops it.
   This eliminates forwarded records by physically reordering the data. The DROP
@@ -356,6 +394,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @Databases               nvarchar(max)  = NULL,            -- NULL = current DB. Supports: USER_DATABASES, ALL_DATABASES,
                                                                 -- SYSTEM_DATABASES, AVAILABILITY_GROUP_DATABASES,
                                                                 -- wildcards (%), exclusions (-), comma-separated
+    @Tables                  nvarchar(max)  = NULL,            -- NULL = all tables. Supports: schema.table, wildcards (%),
+                                                                -- exclusions (-), comma-separated. Schema optional (defaults to %).
     @LookbackDays            int            = 7,
     @TopN                    int            = 25,               -- per database
     @MinPages                bigint         = 1000,
@@ -402,13 +442,16 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @ObfuscateKey            nvarchar(128)  = NULL,            -- when provided, replaces real names with pseudonyms in result sets and CommandLog
     @ObfuscateSeed           nvarchar(128)  = NULL,            -- optional seed for cross-environment consistency; NULL = use @RunID (unique per run)
     @RevealKey               nvarchar(128)  = NULL,            -- decrypt a prior obfuscated run's mapping from CommandLog
-    @RevealRunID             uniqueidentifier = NULL            -- required with @RevealKey; RunID from the run to decrypt
+    @RevealRunID             uniqueidentifier = NULL,           -- required with @RevealKey; RunID from the run to decrypt
+
+    -- Resume from prior plan-only scan
+    @ResumeRunID             uniqueidentifier = NULL            -- load targets from a prior @PlanOnly=1 HEAP_SCAN_SUMMARY; skips discovery
 )
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0223';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0224';
     DECLARE @RunID uniqueidentifier = NEWID();
 
     -- Obfuscation state
@@ -431,6 +474,9 @@ COMMON PARAMETERS:
   @Databases         nvarchar(max) = NULL  NULL=current DB. USER_DATABASES, ALL_DATABASES,
                                         SYSTEM_DATABASES, AVAILABILITY_GROUP_DATABASES,
                                         wildcards (%%), exclusions (-), comma-separated.
+  @Tables            nvarchar(max) = NULL  NULL=all tables. schema.table format,
+                                        wildcards (%%), exclusions (-), comma-separated.
+                                        Schema optional (omit = any schema).
   @PlanOnly          bit     = 1       1=print commands only, 0=execute.
   @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
   @TopN              int     = 25      Max targets per database.
@@ -474,13 +520,31 @@ OBFUSCATION PARAMETERS:
     3. To decode: EXEC sp_HeapDoctor @RevealKey=N''<key>'', @RevealRunID=N''<RunID>'';
   Plan-only runs store mapping in HEAP_SCAN_SUMMARY when @LogToTable=''Y'' (default).
 
+RESUME PARAMETER:
+  @ResumeRunID       uniqueidentifier = NULL  Load targets from a prior @PlanOnly=1 scan.
+                                              Skips discovery + QS analysis. Uses stored commands.
+
+  Plan-then-execute workflow:
+    1. Run with @PlanOnly=1 (default). Note the RunID from output.
+    2. Review targets. When ready, execute the same targets:
+       EXEC sp_HeapDoctor @ResumeRunID=N''<RunID>'', @PlanOnly=0;
+  Requires @LogToTable=''Y'' (default) on the plan-only run.
+  @Databases, @Tables, @CpuSource are ignored in resume mode.
+  Execution params (@MaxRunSeconds, @LockTimeoutMs) are honored.
+  Cannot resume obfuscated scans. Version must match.
+
 EXAMPLES:
   EXEC sp_HeapDoctor;
   EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @PlanOnly = 0;
   EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @Execute = N''Y'';
+  EXEC sp_HeapDoctor @Tables = N''dbo.Orders, dbo.OrderDetails'';
+  EXEC sp_HeapDoctor @Tables = N''dbo.%%, -dbo.Staging%%'';
+  EXEC sp_HeapDoctor @Tables = N''Heap%%'', @Databases = N''USER_DATABASES'';
   EXEC sp_HeapDoctor @ObfuscateKey = N''MySecretKey'';
-  EXEC sp_HeapDoctor @ObfuscateKey = N''MyKey'', @ObfuscateSeed = N''prod-q1'';
   EXEC sp_HeapDoctor @RevealKey = N''MyKey'', @RevealRunID = N''<RunID-from-output>'';
+  -- Plan-then-execute:
+  EXEC sp_HeapDoctor @Databases = N''MyDB'';  -- plan-only, note RunID
+  EXEC sp_HeapDoctor @ResumeRunID = N''<RunID>'', @PlanOnly = 0;
 
 REQUIREMENTS: SQL Server 2017+ (STRING_AGG). Enterprise/Developer for ONLINE.
 COMMANDLOG:   dbo.CommandLog (Ola Hallengren). https://ola.hallengren.com/scripts/CommandLog.sql
@@ -788,6 +852,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     RAISERROR(N'Scan mode:   SAMPLED (forwarded record counts are estimates)', 10, 1) WITH NOWAIT;
 
+    -- Resume mode flag (set to 1 when @ResumeRunID loads targets from CommandLog)
+    DECLARE @resume_loaded bit = 0;
+    DECLARE @resume_xml xml = NULL;
+
     ----------------------------------------------------------------------------
     -- Parse @Databases (Ola Hallengren pattern)
     -- Supports: USER_DATABASES, ALL_DATABASES, SYSTEM_DATABASES,
@@ -983,6 +1051,13 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     SET @Msg = N'Databases:   ' + CAST(@DatabaseCount AS nvarchar(10)) + N' selected';
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
+    IF @Tables IS NOT NULL
+    BEGIN
+        -- Escape % as %% for RAISERROR format-string safety
+        SET @Msg = N'Tables:      filtered (' + REPLACE(@Tables, N'%', N'%%') + N')';
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    END
+
     IF @Debug = 1
     BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
@@ -1006,6 +1081,116 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     END
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
+
+    ----------------------------------------------------------------------------
+    -- Parse @Tables (Ola Hallengren pattern)
+    -- Supports: schema.table, wildcards (%), exclusions (-), comma-separated.
+    -- Schema is optional; if omitted, defaults to % (any schema).
+    -- #SelectedTables is visible inside sp_executesql discovery SQL.
+    ----------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#SelectedTables') IS NOT NULL DROP TABLE #SelectedTables;
+
+    CREATE TABLE #SelectedTables
+    (
+        SchemaPattern   nvarchar(256) NOT NULL,
+        TablePattern    nvarchar(256) NOT NULL,
+        Selected        bit           NOT NULL
+    );
+
+    IF @Tables IS NOT NULL
+    BEGIN
+        SELECT @Tables = LTRIM(RTRIM(REPLACE(REPLACE(@Tables, CHAR(10), N''), CHAR(13), N'')));
+
+        ;WITH TableSplitter AS
+        (
+            SELECT
+                TableItem = LTRIM(RTRIM(
+                    CASE
+                        WHEN CHARINDEX(N',', @Tables) > 0
+                        THEN SUBSTRING(@Tables, 1, CHARINDEX(N',', @Tables) - 1)
+                        ELSE @Tables
+                    END
+                )),
+                Remainder =
+                    CASE
+                        WHEN CHARINDEX(N',', @Tables) > 0
+                        THEN SUBSTRING(@Tables, CHARINDEX(N',', @Tables) + 1, LEN(@Tables))
+                        ELSE N''
+                    END
+
+            UNION ALL
+
+            SELECT
+                TableItem = LTRIM(RTRIM(
+                    CASE
+                        WHEN CHARINDEX(N',', Remainder) > 0
+                        THEN SUBSTRING(Remainder, 1, CHARINDEX(N',', Remainder) - 1)
+                        ELSE Remainder
+                    END
+                )),
+                Remainder =
+                    CASE
+                        WHEN CHARINDEX(N',', Remainder) > 0
+                        THEN SUBSTRING(Remainder, CHARINDEX(N',', Remainder) + 1, DATALENGTH(Remainder))
+                        ELSE N''
+                    END
+            FROM TableSplitter
+            WHERE DATALENGTH(Remainder) > 0
+        ),
+        Tables2 AS
+        (
+            -- Extract exclusion prefix (-)
+            SELECT
+                TableItem =
+                    CASE
+                        WHEN TableItem LIKE N'-%'
+                        THEN LTRIM(STUFF(TableItem, 1, 1, N''))
+                        ELSE TableItem
+                    END,
+                Selected =
+                    CASE
+                        WHEN TableItem LIKE N'-%'
+                        THEN CONVERT(bit, 0)
+                        ELSE CONVERT(bit, 1)
+                    END
+            FROM TableSplitter
+            WHERE TableItem <> N''
+        ),
+        Tables3 AS
+        (
+            -- Split schema.table on dot; default schema to % if not specified
+            SELECT
+                SchemaPattern =
+                    CASE
+                        WHEN CHARINDEX(N'.', TableItem) > 0
+                        THEN LEFT(TableItem, CHARINDEX(N'.', TableItem) - 1)
+                        ELSE N'%'
+                    END,
+                TablePattern =
+                    CASE
+                        WHEN CHARINDEX(N'.', TableItem) > 0
+                        THEN SUBSTRING(TableItem, CHARINDEX(N'.', TableItem) + 1, LEN(TableItem))
+                        ELSE TableItem
+                    END,
+                Selected
+            FROM Tables2
+        )
+        INSERT INTO #SelectedTables (SchemaPattern, TablePattern, Selected)
+        SELECT SchemaPattern, TablePattern, Selected
+        FROM Tables3
+        OPTION (MAXRECURSION 0);
+
+        IF @Debug = 1
+        BEGIN
+            DECLARE @tbl_include_count int, @tbl_exclude_count int;
+            SELECT @tbl_include_count = SUM(CASE WHEN Selected = 1 THEN 1 ELSE 0 END),
+                   @tbl_exclude_count = SUM(CASE WHEN Selected = 0 THEN 1 ELSE 0 END)
+            FROM #SelectedTables;
+            SET @Msg = N'[DEBUG] @Tables: ' + CAST(@tbl_include_count AS nvarchar(10)) + N' include pattern(s), '
+                     + CAST(@tbl_exclude_count AS nvarchar(10)) + N' exclude pattern(s)';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+    END
 
     ----------------------------------------------------------------------------
     -- Temp tables (shared across database iterations)
@@ -1086,8 +1271,168 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     );
 
     ----------------------------------------------------------------------------
-    -- Per-database discovery loop
+    -- @ResumeRunID: load targets from a prior plan-only HEAP_SCAN_SUMMARY
     ----------------------------------------------------------------------------
+    IF @ResumeRunID IS NOT NULL
+    BEGIN
+        -- Mutual exclusivity
+        IF @RevealKey IS NOT NULL
+        BEGIN
+            RAISERROR(N'@ResumeRunID and @RevealKey cannot be used together.', 16, 1);
+            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            RETURN;
+        END
+
+        -- CommandLog must exist
+        IF @commandlog_exists = 0
+        BEGIN
+            RAISERROR(N'@ResumeRunID requires dbo.CommandLog (stores the plan-only scan results).', 16, 1);
+            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            RETURN;
+        END
+
+        -- Look up HEAP_SCAN_SUMMARY by RunID
+        SELECT TOP (1) @resume_xml = ExtendedInfo
+        FROM dbo.CommandLog
+        WHERE CommandType = N'HEAP_SCAN_SUMMARY'
+          AND ExtendedInfo.exist(N'/ScanSummary/RunID[text()=sql:variable("@ResumeRunID")]') = 1
+        ORDER BY ID DESC;
+
+        IF @resume_xml IS NULL
+        BEGIN
+            -- Check if it's an execution run (helpful error)
+            IF EXISTS (
+                SELECT 1 FROM dbo.CommandLog
+                WHERE CommandType = N'HEAP_REBUILD_START'
+                  AND ExtendedInfo.exist(N'/Parameters/RunID[text()=sql:variable("@ResumeRunID")]') = 1
+            )
+            BEGIN
+                SET @Msg = N'RunID ' + CAST(@ResumeRunID AS nvarchar(36))
+                         + N' is an execution run, not a plan-only scan. Use a RunID from a @PlanOnly=1 run.';
+                RAISERROR(@Msg, 16, 1);
+            END
+            ELSE
+            BEGIN
+                SET @Msg = N'No plan-only scan found for RunID ' + CAST(@ResumeRunID AS nvarchar(36))
+                         + N'. Run sp_HeapDoctor with @PlanOnly=1, @LogToTable=''Y'' first.';
+                RAISERROR(@Msg, 16, 1);
+            END
+            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            RETURN;
+        END
+
+        -- Version match check
+        DECLARE @resume_version nvarchar(20) = @resume_xml.value(N'(/ScanSummary/Version)[1]', N'nvarchar(20)');
+        IF @resume_version <> @Version
+        BEGIN
+            SET @Msg = N'Version mismatch: plan-only scan used v' + ISNULL(@resume_version, N'(unknown)')
+                     + N' but current proc is v' + @Version
+                     + N'. Re-run with @PlanOnly=1 to generate a compatible scan.';
+            RAISERROR(@Msg, 16, 1);
+            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            RETURN;
+        END
+
+        -- Block obfuscated summaries (pseudo names stored, real names needed for execution)
+        IF @resume_xml.exist(N'/ScanSummary/ObfuscatedMappingHex[text()]') = 1
+        BEGIN
+            RAISERROR(N'Cannot resume from an obfuscated plan-only scan. Run without @ObfuscateKey first.', 16, 1);
+            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            RETURN;
+        END
+
+        -- Populate #Targets from XML
+        INSERT INTO #Targets
+        (
+            database_name, object_id, schema_name, table_name,
+            page_count, record_count, forwarded_record_count, forwarded_pct,
+            forwarded_fetch_count, avg_page_space_pct, avg_frag_pct, ghost_record_count,
+            total_cpu_ms, ranking_basis, nci_count, key_source_index, has_lob_columns,
+            action_chosen, command_text, ci_drop_command, verify_command,
+            est_pages_per_sec, est_seconds, est_duration,
+            usage_hint, ranking_score,
+            heap_compression, replication_hint, lock_escalation,
+            sort_order,
+            prev_forwarded_pct, rebuilds_in_90d,
+            size_mb, est_space_savings_mb, est_ci_swap_overhead_mb, est_log_mb,
+            days_since_last_rebuild,
+            qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
+            qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count,
+            qs_query_hashes
+        )
+        SELECT
+            t.c.value(N'@DatabaseName',          N'sysname'),
+            0,  -- object_id placeholder (only used during discovery)
+            t.c.value(N'@SchemaName',            N'sysname'),
+            t.c.value(N'@TableName',             N'sysname'),
+            t.c.value(N'@PageCount',             N'bigint'),
+            t.c.value(N'@RecordCount',           N'bigint'),
+            t.c.value(N'@ForwardedRecordCount',  N'bigint'),
+            t.c.value(N'@ForwardedPct',          N'decimal(6,2)'),
+            t.c.value(N'@ForwardedFetchCount',   N'bigint'),
+            t.c.value(N'@AvgPageSpacePct',       N'decimal(5,2)'),
+            t.c.value(N'@AvgFragPct',            N'decimal(5,2)'),
+            t.c.value(N'@GhostRecordCount',      N'bigint'),
+            t.c.value(N'@TotalCpuMs',            N'bigint'),
+            t.c.value(N'@RankingBasis',          N'varchar(20)'),
+            t.c.value(N'@NciCount',              N'int'),
+            t.c.value(N'@KeySourceIndex',        N'sysname'),
+            t.c.value(N'@HasLobColumns',         N'bit'),
+            t.c.value(N'@ActionChosen',          N'varchar(32)'),
+            t.c.value(N'@CommandText',           N'nvarchar(max)'),
+            t.c.value(N'@CiDropCommand',         N'nvarchar(max)'),
+            t.c.value(N'@VerifyCommand',         N'nvarchar(max)'),
+            t.c.value(N'@EstPagesPerSec',        N'float'),
+            t.c.value(N'@EstSeconds',            N'int'),
+            t.c.value(N'@EstDuration',           N'nvarchar(20)'),
+            t.c.value(N'@UsageHint',             N'varchar(30)'),
+            t.c.value(N'@RankingScore',          N'decimal(8,4)'),
+            t.c.value(N'@HeapCompression',       N'tinyint'),
+            t.c.value(N'@ReplicationHint',       N'varchar(20)'),
+            t.c.value(N'@LockEscalation',        N'tinyint'),
+            t.c.value(N'@SortOrder',             N'int'),
+            t.c.value(N'@PrevForwardedPct',      N'decimal(6,2)'),
+            t.c.value(N'@RebuildsIn90d',         N'int'),
+            t.c.value(N'@SizeMB',               N'decimal(18,2)'),
+            t.c.value(N'@EstSpaceSavingsMB',     N'decimal(18,2)'),
+            t.c.value(N'@EstCiSwapOverheadMb',   N'decimal(18,2)'),
+            t.c.value(N'@EstLogMB',              N'decimal(18,2)'),
+            t.c.value(N'@DaysSinceLastRebuild',  N'int'),
+            TRY_CONVERT(datetime2(3), t.c.value(N'@QsSnapshotTimeUtc', N'nvarchar(30)'), 126),
+            t.c.value(N'@QsTotalLogicalReads',   N'bigint'),
+            t.c.value(N'@QsTotalPhysicalReads',  N'bigint'),
+            t.c.value(N'@QsTotalDurationMs',     N'bigint'),
+            t.c.value(N'@QsTotalExecutions',     N'bigint'),
+            t.c.value(N'@QsPlanCount',           N'int'),
+            t.c.value(N'@QsQueryCount',          N'int'),
+            t.c.value(N'@QsQueryHashes',         N'nvarchar(max)')
+        FROM @resume_xml.nodes(N'/ScanSummary/Targets/Target') AS t(c);
+
+        SET @resume_loaded = 1;
+
+        DECLARE @resume_target_count int = (SELECT COUNT(*) FROM #Targets);
+        DECLARE @resume_cpu_source nvarchar(20) = @resume_xml.value(N'(/ScanSummary/CpuSource)[1]', N'nvarchar(20)');
+        DECLARE @resume_db_count int = @resume_xml.value(N'(/ScanSummary/DatabasesScanned)[1]', N'int');
+
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        SET @Msg = N'RESUME MODE: loading ' + CAST(@resume_target_count AS nvarchar(10))
+                 + N' target(s) from plan-only RunID=' + CAST(@ResumeRunID AS nvarchar(36));
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        SET @Msg = N'  Original CPU source: ' + ISNULL(@resume_cpu_source, N'NONE')
+                 + N', databases scanned: ' + ISNULL(CAST(@resume_db_count AS nvarchar(10)), N'?');
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+        IF @Databases IS NOT NULL OR @Tables IS NOT NULL
+            RAISERROR(N'  NOTE: @Databases and @Tables are ignored in resume mode (targets loaded from prior scan).', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+    END
+
+    ----------------------------------------------------------------------------
+    -- Per-database discovery loop (skipped in resume mode)
+    ----------------------------------------------------------------------------
+    IF @resume_loaded = 0
+    BEGIN
     DECLARE
         @CurrentDatabaseName sysname,
         @CurrentDatabaseID   int,
@@ -1202,6 +1547,21 @@ WHERE o.is_memory_optimized = 0
         -- 9I: Ledger table exclusion (SQL 2022+ only; column doesn't exist on older versions)
         IF CAST(SERVERPROPERTY('ProductMajorVersion') AS int) >= 16
             SET @discovery_sql += N'  AND o.ledger_type = 0';
+
+        -- @Tables filter: #SelectedTables is populated at outer scope, visible here.
+        -- When #SelectedTables is empty (@Tables IS NULL), both conditions are no-ops.
+        SET @discovery_sql += N'
+  -- Table include filter
+  AND (NOT EXISTS (SELECT 1 FROM #SelectedTables WHERE Selected = 1)
+       OR EXISTS (SELECT 1 FROM #SelectedTables st
+                  WHERE st.Selected = 1
+                  AND s.name LIKE REPLACE(st.SchemaPattern, N''_'', N''[_]'')
+                  AND o.name LIKE REPLACE(st.TablePattern, N''_'', N''[_]'')))
+  -- Table exclude filter
+  AND NOT EXISTS (SELECT 1 FROM #SelectedTables st
+                  WHERE st.Selected = 0
+                  AND s.name LIKE REPLACE(st.SchemaPattern, N''_'', N''[_]'')
+                  AND o.name LIKE REPLACE(st.TablePattern, N''_'', N''[_]''))';
 
         SET @discovery_sql += N';
 
@@ -2025,6 +2385,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         UPDATE Reranked SET sort_order = new_rank;
     END
 
+    END -- IF @resume_loaded = 0 (skip discovery + QUICKIESTORE in resume mode)
+
     ----------------------------------------------------------------------------
     -- Final target count
     ----------------------------------------------------------------------------
@@ -2034,7 +2396,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     SET @Msg = N'Total targets across all databases: ' + CAST(@TargetCount AS nvarchar(10));
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
-    IF @discovery_errors > 0
+    IF @resume_loaded = 0 AND @discovery_errors > 0
     BEGIN
         SET @Msg = N'WARNING: ' + CAST(@discovery_errors AS nvarchar(10))
                  + N' database(s) had errors during discovery scan. Check messages above.';
@@ -2340,8 +2702,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END
 
-    -- 9L: Trending columns from CommandLog history
-    IF @commandlog_exists = 1
+    -- 9L: Trending columns from CommandLog history (skip in resume mode: already in XML)
+    IF @resume_loaded = 0 AND @commandlog_exists = 1
     BEGIN
         UPDATE t
         SET
@@ -2381,26 +2743,29 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     END
 
     ----------------------------------------------------------------------------
-    -- Size and impact projections
+    -- Size and impact projections (skip in resume mode: already in XML)
     ----------------------------------------------------------------------------
-    UPDATE #Targets
-    SET
-        size_mb = CAST(page_count AS decimal(18,2)) / 128.0,
-        est_ci_swap_overhead_mb = CASE
-            WHEN action_chosen = 'CI_SWAP_ONLINE'
-            THEN CAST(page_count AS decimal(18,2)) / 128.0
-            ELSE NULL END,
-        est_space_savings_mb = CASE
-            WHEN avg_page_space_pct IS NOT NULL AND avg_page_space_pct < 75.0
-            THEN CAST(page_count AS decimal(18,2)) * (1.0 - avg_page_space_pct / 100.0) / 128.0
-            ELSE NULL END;
+    IF @resume_loaded = 0
+    BEGIN
+        UPDATE #Targets
+        SET
+            size_mb = CAST(page_count AS decimal(18,2)) / 128.0,
+            est_ci_swap_overhead_mb = CASE
+                WHEN action_chosen = 'CI_SWAP_ONLINE'
+                THEN CAST(page_count AS decimal(18,2)) / 128.0
+                ELSE NULL END,
+            est_space_savings_mb = CASE
+                WHEN avg_page_space_pct IS NOT NULL AND avg_page_space_pct < 75.0
+                THEN CAST(page_count AS decimal(18,2)) * (1.0 - avg_page_space_pct / 100.0) / 128.0
+                ELSE NULL END;
 
-    -- est_log_mb: per-target log estimate for FULL recovery databases
-    UPDATE t
-    SET t.est_log_mb = CAST(t.page_count AS decimal(18,2)) * 8192.0 / 1048576.0
-    FROM #Targets t
-    JOIN sys.databases d ON d.name = t.database_name COLLATE DATABASE_DEFAULT
-    WHERE d.recovery_model_desc = N'FULL';
+        -- est_log_mb: per-target log estimate for FULL recovery databases
+        UPDATE t
+        SET t.est_log_mb = CAST(t.page_count AS decimal(18,2)) * 8192.0 / 1048576.0
+        FROM #Targets t
+        JOIN sys.databases d ON d.name = t.database_name COLLATE DATABASE_DEFAULT
+        WHERE d.recovery_model_desc = N'FULL';
+    END
 
     ----------------------------------------------------------------------------
     -- Obfuscation: build encrypted mapping, then populate pseudo_ columns.
@@ -2587,7 +2952,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     ----------------------------------------------------------------------------
     -- Plan-only scan logging: persist discovery results to CommandLog
     ----------------------------------------------------------------------------
-    IF @PlanOnly = 1 AND @LogToTable = 'Y' AND @commandlog_exists = 1
+    IF @PlanOnly = 1 AND @LogToTable = 'Y' AND @commandlog_exists = 1 AND @resume_loaded = 0
     BEGIN
         INSERT INTO dbo.CommandLog
             (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
@@ -2624,19 +2989,44 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             page_count AS PageCount,
                             size_mb AS SizeMB,
                             record_count AS RecordCount,
+                            forwarded_record_count AS ForwardedRecordCount,
                             forwarded_pct AS ForwardedPct,
                             forwarded_fetch_count AS ForwardedFetchCount,
+                            avg_page_space_pct AS AvgPageSpacePct,
+                            avg_frag_pct AS AvgFragPct,
+                            ghost_record_count AS GhostRecordCount,
                             total_cpu_ms AS TotalCpuMs,
                             ranking_score AS RankingScore,
+                            ranking_basis AS RankingBasis,
                             action_chosen AS ActionChosen,
+                            CASE WHEN @obfuscate = 1 THEN pseudo_command_text ELSE command_text END AS CommandText,
+                            CASE WHEN @obfuscate = 1 THEN pseudo_ci_drop      ELSE ci_drop_command END AS CiDropCommand,
+                            CASE WHEN @obfuscate = 1 THEN pseudo_verify_cmd   ELSE verify_command END AS VerifyCommand,
+                            CASE WHEN @obfuscate = 1 THEN pseudo_key_index    ELSE key_source_index END AS KeySourceIndex,
+                            CAST(has_lob_columns AS int) AS HasLobColumns,
                             usage_hint AS UsageHint,
                             nci_count AS NciCount,
+                            heap_compression AS HeapCompression,
+                            replication_hint AS ReplicationHint,
+                            lock_escalation AS LockEscalation,
+                            sort_order AS SortOrder,
+                            est_pages_per_sec AS EstPagesPerSec,
                             est_seconds AS EstSeconds,
+                            est_duration AS EstDuration,
                             est_log_mb AS EstLogMB,
                             est_space_savings_mb AS EstSpaceSavingsMB,
+                            est_ci_swap_overhead_mb AS EstCiSwapOverheadMb,
                             days_since_last_rebuild AS DaysSinceLastRebuild,
                             prev_forwarded_pct AS PrevForwardedPct,
-                            rebuilds_in_90d AS RebuildsIn90d
+                            rebuilds_in_90d AS RebuildsIn90d,
+                            CONVERT(nvarchar(30), qs_snapshot_time_utc, 126) AS QsSnapshotTimeUtc,
+                            qs_total_logical_reads AS QsTotalLogicalReads,
+                            qs_total_physical_reads AS QsTotalPhysicalReads,
+                            qs_total_duration_ms AS QsTotalDurationMs,
+                            qs_total_executions AS QsTotalExecutions,
+                            qs_plan_count AS QsPlanCount,
+                            qs_query_count AS QsQueryCount,
+                            qs_query_hashes AS QsQueryHashes
                         FROM #Targets
                         ORDER BY sort_order
                         FOR XML RAW(N'Target'), TYPE
@@ -2780,10 +3170,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         @Maxdop AS Maxdop,
                         @LockTimeoutMs AS LockTimeoutMs,
                         @MaxRunSeconds AS MaxRunSeconds,
+                        @Tables AS Tables,
                         CASE WHEN @AllowCiSwap = 1 THEN N'Y' ELSE N'N' END AS AllowCiSwap,
                         CASE WHEN @PreferCiSwap = 1 THEN N'Y' ELSE N'N' END AS PreferCiSwap,
                         CASE WHEN @EstimateTime = 1 THEN N'Y' ELSE N'N' END AS EstimateTime,
                         @RunID AS RunID,
+                        CASE WHEN @resume_loaded = 1 THEN @ResumeRunID ELSE NULL END AS ResumedFromRunID,
                         CASE WHEN @obfuscate = 1 THEN @effective_seed ELSE NULL END AS ObfuscateSeed,
                         CASE WHEN @obfuscate = 1 THEN CONVERT(nvarchar(max), @obfu_mapping_encrypted, 2) ELSE NULL END AS ObfuscatedMappingHex
                     FOR XML RAW(N'Parameters'), ELEMENTS
