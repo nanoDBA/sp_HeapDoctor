@@ -62,6 +62,7 @@ History:    1.0.2026.0224 - @Tables parameter and @ResumeRunID (plan-then-execut
                           - HEAP_SCAN_SUMMARY XML enriched with all #Targets columns for resume
                           - HEAP_REBUILD_START includes ResumedFromRunID for audit trail
                           - Version match and obfuscation checks on resume
+                          - @Tables and @TopN applied as post-load filters in resume mode
             1.0.2026.0223 - Throughput/ETA improvements
                           - Per-rebuild ExtendedInfo now includes DurationMs and ActualPagesPerSec
                             (enables post-hoc throughput trending from CommandLog)
