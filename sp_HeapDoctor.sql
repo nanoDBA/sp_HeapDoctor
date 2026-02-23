@@ -529,7 +529,8 @@ RESUME PARAMETER:
     2. Review targets. When ready, execute the same targets:
        EXEC sp_HeapDoctor @ResumeRunID=N''<RunID>'', @PlanOnly=0;
   Requires @LogToTable=''Y'' (default) on the plan-only run.
-  @Databases, @Tables, @CpuSource are ignored in resume mode.
+  @Databases and @CpuSource are ignored in resume mode.
+  @Tables and @TopN are applied as post-load filters (select a subset to execute).
   Execution params (@MaxRunSeconds, @LockTimeoutMs) are honored.
   Cannot resume obfuscated scans. Version must match.
 
@@ -545,6 +546,8 @@ EXAMPLES:
   -- Plan-then-execute:
   EXEC sp_HeapDoctor @Databases = N''MyDB'';  -- plan-only, note RunID
   EXEC sp_HeapDoctor @ResumeRunID = N''<RunID>'', @PlanOnly = 0;
+  -- Resume a subset:
+  EXEC sp_HeapDoctor @ResumeRunID = N''<RunID>'', @Tables = N''dbo.Orders'', @PlanOnly = 0;
 
 REQUIREMENTS: SQL Server 2017+ (STRING_AGG). Enterprise/Developer for ONLINE.
 COMMANDLOG:   dbo.CommandLog (Ola Hallengren). https://ola.hallengren.com/scripts/CommandLog.sql
@@ -1422,8 +1425,65 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                  + N', databases scanned: ' + ISNULL(CAST(@resume_db_count AS nvarchar(10)), N'?');
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
-        IF @Databases IS NOT NULL OR @Tables IS NOT NULL
-            RAISERROR(N'  NOTE: @Databases and @Tables are ignored in resume mode (targets loaded from prior scan).', 10, 1) WITH NOWAIT;
+        IF @Databases IS NOT NULL
+            RAISERROR(N'  NOTE: @Databases is ignored in resume mode (targets loaded from prior scan).', 10, 1) WITH NOWAIT;
+
+        -- Apply @Tables filter to resumed targets (post-load filter)
+        IF @Tables IS NOT NULL AND EXISTS (SELECT 1 FROM #SelectedTables)
+        BEGIN
+            DECLARE @pre_filter_count int = @resume_target_count;
+
+            -- Include filter: keep only targets matching inclusion patterns
+            IF EXISTS (SELECT 1 FROM #SelectedTables WHERE Selected = 1)
+            BEGIN
+                DELETE t FROM #Targets t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM #SelectedTables st
+                    WHERE st.Selected = 1
+                      AND t.schema_name LIKE REPLACE(st.SchemaPattern, N'_', N'[_]')
+                      AND t.table_name  LIKE REPLACE(st.TablePattern,  N'_', N'[_]')
+                );
+            END
+
+            -- Exclude filter: remove targets matching exclusion patterns
+            DELETE t FROM #Targets t
+            WHERE EXISTS (
+                SELECT 1 FROM #SelectedTables st
+                WHERE st.Selected = 0
+                  AND t.schema_name LIKE REPLACE(st.SchemaPattern, N'_', N'[_]')
+                  AND t.table_name  LIKE REPLACE(st.TablePattern,  N'_', N'[_]')
+            );
+
+            DECLARE @post_filter_count int = (SELECT COUNT(*) FROM #Targets);
+            IF @post_filter_count < @pre_filter_count
+            BEGIN
+                DECLARE @tables_safe nvarchar(4000) = REPLACE(@Tables, N'%', N'%%');
+                SET @Msg = N'  @Tables filter applied: ' + CAST(@pre_filter_count AS nvarchar(10))
+                         + N' -> ' + CAST(@post_filter_count AS nvarchar(10))
+                         + N' target(s) (' + @tables_safe + N')';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+        END
+
+        -- Apply @TopN limit to resumed targets (keep top N by sort_order)
+        IF @TopN IS NOT NULL
+        BEGIN
+            DECLARE @pre_topn_count int = (SELECT COUNT(*) FROM #Targets);
+            IF @pre_topn_count > @TopN
+            BEGIN
+                DELETE FROM #Targets
+                WHERE sort_order > (
+                    SELECT sort_order FROM (
+                        SELECT sort_order, ROW_NUMBER() OVER (ORDER BY sort_order) AS rn
+                        FROM #Targets
+                    ) ranked WHERE rn = @TopN
+                );
+
+                SET @Msg = N'  @TopN filter applied: ' + CAST(@pre_topn_count AS nvarchar(10))
+                         + N' -> ' + CAST(@TopN AS nvarchar(10)) + N' target(s)';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+        END
 
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END

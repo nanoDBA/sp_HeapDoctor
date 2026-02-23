@@ -707,12 +707,24 @@ EXEC dbo.sp_HeapDoctor
 
 The resume path loads every column from the stored XML: page counts, ranking scores, commands, QS snapshots, the works.  Discovery, Query Store analysis, trending columns, and impact projections are all skipped.  The only thing that still runs is the TOCTOU check (verifying each table still exists before rebuilding).
 
+You can also use `@Tables` to execute a subset of the resumed targets:
+
+```sql
+-- Execute only one table from a multi-table plan
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = '26D0C3AC-4B04-4E1F-98B9-43E5B87EE06D',
+    @Tables      = 'dbo.Orders',
+    @PlanOnly    = 0;
+```
+
 **What `@ResumeRunID` validates:**
 
 - The RunID must reference a `HEAP_SCAN_SUMMARY` entry (not a `HEAP_REBUILD_START` from an execution run)
 - The stored procedure version must match the current version (catches "upgraded proc between plan and execute")
 - Obfuscated summaries are rejected (you cannot resume from a plan-only run that used `@ObfuscateKey`; run without obfuscation first)
-- `@Databases` and `@Tables` are ignored in resume mode (a warning is printed if you pass them)
+- `@Databases` is ignored in resume mode (a warning is printed if you pass it)
+- `@Tables` is applied as a post-load filter to select a subset of resumed targets
+- `@TopN` is applied as a post-load filter to limit the number of targets executed
 
 **Finding the RunID:**
 

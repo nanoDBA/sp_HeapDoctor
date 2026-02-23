@@ -458,10 +458,10 @@ GO
 ------------------------------------------------------------------------
 RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
-RAISERROR(N' TEST 14I: @Databases ignored warning in resume mode', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 14I: @Tables filters resumed targets; @Databases ignored', 10, 1) WITH NOWAIT;
 RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
 
--- Get the plan-only RunID
+-- Get the plan-only RunID (non-obfuscated, has HeapA + HeapB)
 DECLARE @PlanRunID uniqueidentifier;
 SELECT TOP (1) @PlanRunID = ExtendedInfo.value(N'(/ScanSummary/RunID)[1]', N'uniqueidentifier')
 FROM dbo.CommandLog
@@ -469,8 +469,25 @@ WHERE CommandType = N'HEAP_SCAN_SUMMARY'
   AND ExtendedInfo.exist(N'/ScanSummary/ObfuscatedMappingHex[text()]') = 0
 ORDER BY ID DESC;
 
--- Resume with @Databases (should be ignored, not error)
-DECLARE @14i_err int = 0;
+-- 14I-1: @Tables should filter resumed targets to just HeapA
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = @PlanRunID,
+    @Tables      = N'dbo.HeapA',
+    @PlanOnly    = 1;
+
+DECLARE @14i1_count int = (SELECT COUNT(*) FROM #Results);
+IF @14i1_count = 1 AND EXISTS (SELECT 1 FROM #Results WHERE table_name = N'HeapA')
+    RAISERROR(N'  PASS 14I-1: @Tables filtered resumed targets to HeapA only (%d target).', 10, 1, @14i1_count) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @14i1_msg nvarchar(200) = N'  *** FAIL 14I-1: Expected 1 HeapA, found ' + CAST(@14i1_count AS nvarchar(10)) + N' rows.';
+    RAISERROR(@14i1_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 14I-2: @Databases with @ResumeRunID should be ignored (not error)
+DECLARE @14i2_err int = 0;
 BEGIN TRY
     TRUNCATE TABLE #Results;
     INSERT #Results
@@ -480,15 +497,102 @@ BEGIN TRY
         @PlanOnly    = 1;
 END TRY
 BEGIN CATCH
-    SET @14i_err = ERROR_NUMBER();
+    SET @14i2_err = ERROR_NUMBER();
 END CATCH
 
-IF @14i_err = 0
-    RAISERROR(N'  PASS 14I-1: @Databases with @ResumeRunID did not error (ignored gracefully).', 10, 1) WITH NOWAIT;
+IF @14i2_err = 0
+    RAISERROR(N'  PASS 14I-2: @Databases with @ResumeRunID did not error (ignored gracefully).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @14i_msg nvarchar(200) = N'  *** FAIL 14I-1: @Databases with @ResumeRunID raised error ' + CAST(@14i_err AS nvarchar(10));
-    RAISERROR(@14i_msg, 10, 1) WITH NOWAIT;
+    DECLARE @14i2_msg nvarchar(200) = N'  *** FAIL 14I-2: @Databases with @ResumeRunID raised error ' + CAST(@14i2_err AS nvarchar(10));
+    RAISERROR(@14i2_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 14I-3: @Tables exclusion should work on resumed targets
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = @PlanRunID,
+    @Tables      = N'-dbo.HeapA',
+    @PlanOnly    = 1;
+
+DECLARE @14i3_count int = (SELECT COUNT(*) FROM #Results);
+IF @14i3_count = 1 AND EXISTS (SELECT 1 FROM #Results WHERE table_name = N'HeapB')
+    RAISERROR(N'  PASS 14I-3: @Tables exclusion removed HeapA, kept HeapB.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @14i3_msg nvarchar(200) = N'  *** FAIL 14I-3: Expected 1 HeapB, found ' + CAST(@14i3_count AS nvarchar(10)) + N' rows.';
+    RAISERROR(@14i3_msg, 10, 1) WITH NOWAIT;
+END
+GO
+
+------------------------------------------------------------------------
+RAISERROR(N'', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+RAISERROR(N' TEST 14J: @TopN filters resumed targets', 10, 1) WITH NOWAIT;
+RAISERROR(N'================================================================', 10, 1) WITH NOWAIT;
+
+-- Get the plan-only RunID (non-obfuscated, has HeapA + HeapB)
+DECLARE @PlanRunID uniqueidentifier;
+SELECT TOP (1) @PlanRunID = ExtendedInfo.value(N'(/ScanSummary/RunID)[1]', N'uniqueidentifier')
+FROM dbo.CommandLog
+WHERE CommandType = N'HEAP_SCAN_SUMMARY'
+  AND ExtendedInfo.exist(N'/ScanSummary/ObfuscatedMappingHex[text()]') = 0
+ORDER BY ID DESC;
+
+-- 14J-1: @TopN=1 should return only 1 target (plan had 2: HeapA + HeapB)
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = @PlanRunID,
+    @TopN        = 1,
+    @PlanOnly    = 1;
+
+DECLARE @14j1_count int = (SELECT COUNT(*) FROM #Results);
+IF @14j1_count = 1
+    RAISERROR(N'  PASS 14J-1: @TopN=1 filtered resumed targets to 1 (from 2).', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @14j1_msg nvarchar(200) = N'  *** FAIL 14J-1: Expected 1 target, found ' + CAST(@14j1_count AS nvarchar(10));
+    RAISERROR(@14j1_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 14J-2: @TopN=1 combined with @Tables exclusion
+--   Plan has HeapA (sort_order 1) + HeapB (sort_order 2).
+--   @Tables = '-dbo.HeapA' removes HeapA first, leaving HeapB.
+--   @TopN=1 then keeps only HeapB.
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = @PlanRunID,
+    @Tables      = N'-dbo.HeapA',
+    @TopN        = 1,
+    @PlanOnly    = 1;
+
+DECLARE @14j2_count int = (SELECT COUNT(*) FROM #Results);
+IF @14j2_count = 1 AND EXISTS (SELECT 1 FROM #Results WHERE table_name = N'HeapB')
+    RAISERROR(N'  PASS 14J-2: @Tables exclusion + @TopN=1 returned HeapB only.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @14j2_msg nvarchar(200) = N'  *** FAIL 14J-2: Expected 1 HeapB, found ' + CAST(@14j2_count AS nvarchar(10));
+    RAISERROR(@14j2_msg, 10, 1) WITH NOWAIT;
+END
+
+-- 14J-3: @TopN >= target count returns all (no trimming)
+TRUNCATE TABLE #Results;
+INSERT #Results
+EXEC dbo.sp_HeapDoctor
+    @ResumeRunID = @PlanRunID,
+    @TopN        = 25,
+    @PlanOnly    = 1;
+
+DECLARE @14j3_count int = (SELECT COUNT(*) FROM #Results);
+IF @14j3_count = 2
+    RAISERROR(N'  PASS 14J-3: @TopN=25 returned all 2 targets (no trimming).', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @14j3_msg nvarchar(200) = N'  *** FAIL 14J-3: Expected 2 targets, found ' + CAST(@14j3_count AS nvarchar(10));
+    RAISERROR(@14j3_msg, 10, 1) WITH NOWAIT;
 END
 GO
 
