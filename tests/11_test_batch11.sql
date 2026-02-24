@@ -4,7 +4,7 @@ sp_HeapDoctor Test Harness - Batch 11: Enhanced Logging & Impact Projections
 Tests Batch 11 additions:
   -- Smoke Tests --
   11A - size_mb column populated and correct (page_count / 128)
-  11B - Version is 1.0.2026.0224
+  11B - Version is 1.0.2026.0226
 
   -- Unit Tests (deterministic) --
   11C - size_mb = page_count / 128.0 for all targets (arithmetic check)
@@ -75,6 +75,7 @@ CREATE TABLE #Results
     qs_query_count         int           NULL,
     usage_hint             varchar(30)   NULL,
     ranking_score          decimal(8,4)  NULL,
+    ranking_algo_version   nvarchar(10)  NULL,
     heap_compression       varchar(4)    NULL,
     replication_hint       varchar(20)   NULL,
     lock_escalation        varchar(10)   NULL,
@@ -87,7 +88,9 @@ CREATE TABLE #Results
     est_space_savings_mb   decimal(18,2) NULL,
     est_ci_swap_overhead_mb decimal(18,2) NULL,
     est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL
+    days_since_last_rebuild int           NULL,
+    sqlserver_start_time   datetime      NULL,
+    uptime_hours           decimal(10,1) NULL
 );
 GO
 
@@ -155,20 +158,20 @@ END
 GO
 
 ------------------------------------------------------------------------
--- 11B: Smoke test - Version is 1.0.2026.0224
+-- 11B: Smoke test - Version is 1.0.2026.0226
 ------------------------------------------------------------------------
 RAISERROR(N'--- 11B: Version check ---', 10, 1) WITH NOWAIT;
 
-IF EXISTS (SELECT 1 FROM #Results WHERE version = N'1.0.2026.0224')
+IF EXISTS (SELECT 1 FROM #Results WHERE version = N'1.0.2026.0226')
 BEGIN
-    RAISERROR(N'  PASS 11B: Version is 1.0.2026.0224.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 11B: Version is 1.0.2026.0226.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @actual_ver nvarchar(20);
     SELECT TOP 1 @actual_ver = version FROM #Results;
-    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version 1.0.2026.0224, got ' + ISNULL(@actual_ver, N'NULL');
+    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version 1.0.2026.0226, got ' + ISNULL(@actual_ver, N'NULL');
     RAISERROR(@ver_msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END

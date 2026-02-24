@@ -50,6 +50,7 @@ CREATE TABLE #Results
     qs_query_count         int           NULL,
     usage_hint             varchar(30)   NULL,
     ranking_score          decimal(8,4)  NULL,
+    ranking_algo_version   nvarchar(10)  NULL,
     heap_compression       varchar(4)    NULL,
     replication_hint       varchar(20)   NULL,
     lock_escalation        varchar(10)   NULL,
@@ -62,7 +63,9 @@ CREATE TABLE #Results
     est_space_savings_mb   decimal(18,2) NULL,
     est_ci_swap_overhead_mb decimal(18,2) NULL,
     est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL
+    days_since_last_rebuild int           NULL,
+    sqlserver_start_time   datetime      NULL,
+    uptime_hours           decimal(10,1) NULL
 );
 GO
 
@@ -303,7 +306,7 @@ VALUES
     N'HEAP_SCAN_SUMMARY',
     SYSDATETIME(), SYSDATETIME(), 0, NULL,
     CAST(N'<ScanSummary>
-        <Version>1.0.2026.0224</Version>
+        <Version>1.0.2026.0226</Version>
         <RunID>' + CAST(@ObfuRunID AS nvarchar(36)) + N'</RunID>
         <TargetCount>1</TargetCount>
         <ObfuscatedMappingHex>DEADBEEF0123456789</ObfuscatedMappingHex>

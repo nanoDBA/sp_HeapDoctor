@@ -3,7 +3,7 @@ sp_HeapDoctor Test Harness - Batch 12: Throughput/ETA Improvements
 
 Tests:
   -- Smoke Tests --
-  12A - Version is 1.0.2026.0224
+  12A - Version is 1.0.2026.0226
   12B - DurationMs populated in per-rebuild success ExtendedInfo
   12C - ActualPagesPerSec populated in per-rebuild success ExtendedInfo
 
@@ -99,11 +99,11 @@ WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_S
   AND ISNULL(ErrorNumber, 0) = 0
 ORDER BY ID;
 
-IF @12a_version = N'1.0.2026.0224'
-    RAISERROR(N'  PASS 12A: Version is 1.0.2026.0224.', 10, 1) WITH NOWAIT;
+IF @12a_version = N'1.0.2026.0226'
+    RAISERROR(N'  PASS 12A: Version is 1.0.2026.0226.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @12a_msg nvarchar(200) = N'  *** FAIL 12A: Expected version 1.0.2026.0224, got ' + ISNULL(@12a_version, N'NULL');
+    DECLARE @12a_msg nvarchar(200) = N'  *** FAIL 12A: Expected version 1.0.2026.0226, got ' + ISNULL(@12a_version, N'NULL');
     RAISERROR(@12a_msg, 16, 1) WITH NOWAIT;
 END
 GO
@@ -295,6 +295,7 @@ CREATE TABLE #EstResults (
     qs_query_count         int           NULL,
     usage_hint             varchar(30)   NULL,
     ranking_score          decimal(8,4)  NULL,
+    ranking_algo_version   nvarchar(10)  NULL,
     heap_compression       varchar(4)    NULL,
     replication_hint       varchar(20)   NULL,
     lock_escalation        varchar(10)   NULL,
@@ -307,7 +308,9 @@ CREATE TABLE #EstResults (
     est_space_savings_mb   decimal(18,2) NULL,
     est_ci_swap_overhead_mb decimal(18,2) NULL,
     est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL
+    days_since_last_rebuild int           NULL,
+    sqlserver_start_time   datetime      NULL,
+    uptime_hours           decimal(10,1) NULL
 );
 
 INSERT #EstResults

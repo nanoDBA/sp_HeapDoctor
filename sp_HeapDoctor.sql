@@ -50,9 +50,26 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0224
+Version:    1.0.2026.0226
 
-History:    1.0.2026.0224 - @Tables parameter and @ResumeRunID (plan-then-execute workflow)
+History:    1.0.2026.0226 - GitHub issues #1-3, #7-12: observability, filtering, HEAP_SCAN_SUMMARY enhancements
+                          - Full @invocation_command in CommandLog Command column (fixes truncation)
+                          - sqlserver_start_time/uptime_hours in result set and HEAP_SCAN_SUMMARY XML
+                          - ranking_algo_version column in result set and HEAP_SCAN_SUMMARY XML
+                          - @SkipWriteHeavy parameter to exclude write-heavy heaps entirely
+                          - @MinDaysSinceRebuild parameter to skip recently-rebuilt heaps
+                          - HEAP_SCAN_SUMMARY written even with zero targets for trending
+                          - Churn detection warning (>= 5 rebuilds in 90 days)
+                          - Per-database breakdown in HEAP_SCAN_SUMMARY (Databases element)
+                          - Resume staleness warning + superseded plan-only run detection
+            1.0.2026.0225 - Two-phase ranking + plan_hash dedup for QS XML parsing performance
+                          - Structural ranking first (forwarded_fetch_count + forwarded_pct), QS enrichment after
+                          - QS XML parsing only for top @TopN targets per database (not all heaps)
+                          - plan_hash dedup: TRY_CONVERT(xml) once per unique query_plan_hash, fan out to all plan_ids
+                          - LIKE pre-filter checks #Targets instead of #Heaps (~8x fewer string scans)
+                          - Global sort_order re-rank after enrichment (matches QUICKIESTORE pattern)
+                          - Forced plan check uses lightweight LIKE on sys.query_store_plan (no XML)
+            1.0.2026.0224 - @Tables parameter and @ResumeRunID (plan-then-execute workflow)
                           - @Tables: Include/exclude specific tables: @Tables = 'dbo.Orders, -dbo.Staging%'
                           - Schema optional: 'Orders' matches any schema, 'dbo.Orders' matches exact
                           - Wildcards (%), exclusions (-), comma-separated (same syntax as @Databases)
@@ -402,6 +419,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @MinPages                bigint         = 1000,
     @MaxPages                bigint         = NULL,            -- NULL = no cap; else only heaps with page_count <= @MaxPages
     @MinForwardedPct         decimal(6,2)   = 2.00,
+    @SkipWriteHeavy          bit            = 0,               -- 1 = exclude WRITE_HEAVY and WRITE_ONLY heaps entirely
+    @MinDaysSinceRebuild     int            = NULL,            -- NULL = no filter; skip heaps rebuilt fewer than N days ago
 
     -- CPU source
     @CpuSource               varchar(20)    = 'QUERY_STORE',   -- QUERY_STORE | QUICKIESTORE | NONE
@@ -452,13 +471,19 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0224';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0226';
+    -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
+    -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
+    DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
     DECLARE @RunID uniqueidentifier = NEWID();
 
     -- Obfuscation state
     DECLARE @obfuscate      bit            = CASE WHEN @ObfuscateKey IS NOT NULL THEN 1 ELSE 0 END;
     DECLARE @passphrase     nvarchar(max)  = NULL;
     DECLARE @effective_seed nvarchar(128)  = NULL;
+
+    -- Reproducible invocation command for CommandLog (built after input validation)
+    DECLARE @invocation_command nvarchar(max) = NULL;
 
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
@@ -483,6 +508,8 @@ COMMON PARAMETERS:
   @TopN              int     = 25      Max targets per database.
   @MinPages          bigint  = 1000    Skip heaps smaller than this (page_count).
   @MinForwardedPct   decimal = 2.00    Min forwarded record %% to qualify.
+  @SkipWriteHeavy    bit     = 0       1=exclude WRITE_HEAVY and WRITE_ONLY heaps entirely.
+  @MinDaysSinceRebuild int   = NULL    Skip heaps rebuilt fewer than N days ago (requires CommandLog).
   @LogToTable        nvarchar(1) = Y   Y=log to dbo.CommandLog, N=no logging.
 
 ADVANCED PARAMETERS:
@@ -549,6 +576,20 @@ EXAMPLES:
   EXEC sp_HeapDoctor @ResumeRunID = N''<RunID>'', @PlanOnly = 0;
   -- Resume a subset:
   EXEC sp_HeapDoctor @ResumeRunID = N''<RunID>'', @Tables = N''dbo.Orders'', @PlanOnly = 0;
+
+WRITE-HEAVY HEAPS:
+  Heaps flagged as WRITE_HEAVY or WRITE_ONLY have more updates than reads. Forwarded
+  records will recur quickly after a rebuild because the same update patterns that
+  caused the problem will recreate it. The cumulative penalties of doing nothing:
+    - I/O amplification: every forwarded fetch is an extra page read per scan
+    - Buffer pool waste: forwarding stubs and scattered rows consume more memory
+    - Space bloat: original pages retain stubs; the heap grows beyond what data needs
+  The best fix is adding a clustered index, which eliminates forwarded records permanently.
+  When a CI is not possible (vendor schema, LOB-heavy tables), rebuild periodically on a
+  less aggressive schedule. Use @SkipWriteHeavy=1 to focus maintenance windows on heaps
+  where rebuilds last longer, then run a separate pass for write-heavy heaps less often.
+  The churn warning (>= 5 rebuilds in 90 days) flags heaps that need a CI, not more rebuilds.
+  Use @MinDaysSinceRebuild to prevent wasteful back-to-back rebuilds on churning heaps.
 
 REQUIREMENTS: SQL Server 2017+ (STRING_AGG). Enterprise/Developer for ONLINE.
 COMMANDLOG:   dbo.CommandLog (Ola Hallengren). https://ola.hallengren.com/scripts/CommandLog.sql
@@ -838,6 +879,55 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             SET @commandlog_exists = 0;
         END
     END
+
+    -- Build reproducible invocation command for CommandLog (all non-default parameters)
+    SET @invocation_command = N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N'''';
+    IF @Tables IS NOT NULL
+        SET @invocation_command += N', @Tables = N''' + REPLACE(@Tables, N'''', N'''''') + N'''';
+    SET @invocation_command += N', @PlanOnly = ' + CAST(@PlanOnly AS nvarchar(1));
+    IF @LookbackDays <> 7
+        SET @invocation_command += N', @LookbackDays = ' + CAST(@LookbackDays AS nvarchar(10));
+    IF @TopN <> 25
+        SET @invocation_command += N', @TopN = ' + CAST(@TopN AS nvarchar(10));
+    IF @MinPages <> 1000
+        SET @invocation_command += N', @MinPages = ' + CAST(@MinPages AS nvarchar(20));
+    IF @MaxPages IS NOT NULL
+        SET @invocation_command += N', @MaxPages = ' + CAST(@MaxPages AS nvarchar(20));
+    IF @MinForwardedPct <> 2.00
+        SET @invocation_command += N', @MinForwardedPct = ' + CAST(@MinForwardedPct AS nvarchar(10));
+    IF @SkipWriteHeavy = 1
+        SET @invocation_command += N', @SkipWriteHeavy = 1';
+    IF @MinDaysSinceRebuild IS NOT NULL
+        SET @invocation_command += N', @MinDaysSinceRebuild = ' + CAST(@MinDaysSinceRebuild AS nvarchar(10));
+    IF @CpuSourceUpper <> N'QUERY_STORE'
+        SET @invocation_command += N', @CpuSource = N''' + @CpuSourceUpper + N'''';
+    IF UPPER(@OnlinePreference) <> N'AUTO'
+        SET @invocation_command += N', @OnlinePreference = N''' + UPPER(@OnlinePreference) + N'''';
+    IF @AllowCiSwap = 1
+        SET @invocation_command += N', @AllowCiSwap = 1';
+    IF @PreferCiSwap = 1
+        SET @invocation_command += N', @PreferCiSwap = 1';
+    IF @Maxdop IS NOT NULL
+        SET @invocation_command += N', @Maxdop = ' + CAST(@Maxdop AS nvarchar(10));
+    IF @LockTimeoutMs IS NOT NULL
+        SET @invocation_command += N', @LockTimeoutMs = ' + CAST(@LockTimeoutMs AS nvarchar(10));
+    IF @MaxRunSeconds IS NOT NULL
+        SET @invocation_command += N', @MaxRunSeconds = ' + CAST(@MaxRunSeconds AS nvarchar(10));
+    IF @ScanThrottleMs IS NOT NULL
+        SET @invocation_command += N', @ScanThrottleMs = ' + CAST(@ScanThrottleMs AS nvarchar(10));
+    IF @LogToTable <> N'Y'
+        SET @invocation_command += N', @LogToTable = N''' + @LogToTable + N'''';
+    IF @EstimateTime = 1
+        SET @invocation_command += N', @EstimateTime = 1';
+    IF @EstimateLookbackDays <> 90
+        SET @invocation_command += N', @EstimateLookbackDays = ' + CAST(@EstimateLookbackDays AS nvarchar(10));
+    IF @ObfuscateKey IS NOT NULL
+        SET @invocation_command += N', @ObfuscateKey = N''***''';
+    IF @ObfuscateSeed IS NOT NULL
+        SET @invocation_command += N', @ObfuscateSeed = N''' + REPLACE(@ObfuscateSeed, N'''', N'''''') + N'''';
+    IF @ResumeRunID IS NOT NULL
+        SET @invocation_command += N', @ResumeRunID = ''' + CAST(@ResumeRunID AS nvarchar(36)) + N'''';
+    SET @invocation_command += N';';
 
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
     RAISERROR(N' sp_HeapDoctor - Heap Forwarded Record Mitigation', 10, 1) WITH NOWAIT;
@@ -1296,7 +1386,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         END
 
         -- Look up HEAP_SCAN_SUMMARY by RunID
-        SELECT TOP (1) @resume_xml = ExtendedInfo
+        DECLARE @resume_scan_time datetime2(3);
+        SELECT TOP (1) @resume_xml = ExtendedInfo, @resume_scan_time = StartTime
         FROM dbo.CommandLog
         WHERE CommandType = N'HEAP_SCAN_SUMMARY'
           AND ExtendedInfo.exist(N'/ScanSummary/RunID[text()=sql:variable("@ResumeRunID")]') = 1
@@ -1343,6 +1434,15 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             RAISERROR(N'Cannot resume from an obfuscated plan-only scan. Run without @ObfuscateKey first.', 16, 1);
             EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
+        END
+
+        -- Staleness warning: warn if plan-only scan is > 7 days old
+        IF @resume_scan_time IS NOT NULL AND DATEDIFF(DAY, @resume_scan_time, SYSDATETIME()) > 7
+        BEGIN
+            SET @Msg = N'WARNING: Resuming RunID ' + CAST(@ResumeRunID AS nvarchar(36))
+                     + N' which was scanned ' + CAST(DATEDIFF(DAY, @resume_scan_time, SYSDATETIME()) AS nvarchar(10))
+                     + N' days ago. Forwarded record counts and structural stats may have changed. Consider a fresh scan.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         END
 
         -- Populate #Targets from XML
@@ -1486,8 +1586,37 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             END
         END
 
+        -- Apply @MinDaysSinceRebuild to resumed targets (uses days_since_last_rebuild from XML)
+        IF @MinDaysSinceRebuild IS NOT NULL
+        BEGIN
+            DECLARE @pre_mdsrb_cnt int = (SELECT COUNT(*) FROM #Targets);
+            DELETE FROM #Targets
+            WHERE days_since_last_rebuild IS NOT NULL
+              AND days_since_last_rebuild < @MinDaysSinceRebuild;
+
+            DECLARE @post_mdsrb_cnt int = (SELECT COUNT(*) FROM #Targets);
+            IF @post_mdsrb_cnt < @pre_mdsrb_cnt
+            BEGIN
+                SET @Msg = N'  @MinDaysSinceRebuild filter applied: ' + CAST(@pre_mdsrb_cnt AS nvarchar(10))
+                         + N' -> ' + CAST(@post_mdsrb_cnt AS nvarchar(10))
+                         + N' target(s) (threshold: ' + CAST(@MinDaysSinceRebuild AS nvarchar(10)) + N' days)';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+        END
+
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END
+
+    ----------------------------------------------------------------------------
+    -- Uptime capture (always, for result set context and fetch-rate normalization)
+    ----------------------------------------------------------------------------
+    DECLARE @UptimeHours float;
+    DECLARE @SqlServerStartTime datetime;
+    SELECT @SqlServerStartTime = sqlserver_start_time,
+           @UptimeHours = DATEDIFF(SECOND, sqlserver_start_time, GETUTCDATE()) / 3600.0
+    FROM sys.dm_os_sys_info;
+    -- Guard: minimum 1 hour to avoid division-by-near-zero on fresh restarts
+    SET @UptimeHours = CASE WHEN @UptimeHours < 1.0 THEN 1.0 ELSE @UptimeHours END;
 
     ----------------------------------------------------------------------------
     -- Per-database discovery loop (skipped in resume mode)
@@ -1500,13 +1629,15 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         @discovery_sql       nvarchar(max),
         @discovery_errors    int = 0;
 
-    -- Uptime hours for fetch-rate normalization (converts cumulative dm_db_index_operational_stats
-    -- counters to per-hour rates, making them comparable across servers with different uptimes).
-    DECLARE @UptimeHours float;
-    SELECT @UptimeHours = DATEDIFF(SECOND, sqlserver_start_time, GETUTCDATE()) / 3600.0
-    FROM sys.dm_os_sys_info;
-    -- Guard: minimum 1 hour to avoid division-by-near-zero on fresh restarts
-    SET @UptimeHours = CASE WHEN @UptimeHours < 1.0 THEN 1.0 ELSE @UptimeHours END;
+    -- Per-database scan stats (for HEAP_SCAN_SUMMARY XML)
+    DECLARE @DbScanStats TABLE (
+        DatabaseName sysname NOT NULL,
+        HeapsFound   int     NOT NULL DEFAULT 0,
+        HeapsQualified int   NOT NULL DEFAULT 0,
+        ScanSeconds  int     NOT NULL DEFAULT 0
+    );
+    DECLARE @db_scan_start datetime2(3);
+    DECLARE @db_pre_target_count int;
 
     WHILE EXISTS (SELECT 1 FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
     BEGIN
@@ -1519,6 +1650,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
         SET @Msg = N'Scanning database: ' + @CurrentDatabaseName;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+        SET @db_scan_start = SYSDATETIME();
+        SET @db_pre_target_count = (SELECT COUNT(*) FROM #Targets);
 
         /*
         Build per-database discovery SQL.
@@ -1723,14 +1857,16 @@ CREATE TABLE #PlanObjMap
 ';
 
         -- 2) CPU source (conditional)
+        -- Two-phase approach: structural ranking first, QS enrichment after INSERT #Targets.
+        -- QS state detection runs before the Ranked CTE (cheap), heavy XML parsing runs after.
         IF @CpuSourceUpper = 'QUERY_STORE'
         BEGIN
             SET @discovery_sql += N'
--- 2) CPU from Query Store
+-- 2) QS state detection (lightweight, before ranking)
 DECLARE @QsActualState nvarchar(60);
 DECLARE @QsDesiredState nvarchar(60);
 DECLARE @QsRetentionDays int;
-DECLARE @QsRw bit;
+DECLARE @QsRw bit = 0;
 
 SELECT
     @QsActualState  = actual_state_desc,
@@ -1740,18 +1876,16 @@ FROM sys.database_query_store_options;
 
 SET @QsRw = CASE WHEN @QsActualState = ''READ_WRITE'' THEN 1 ELSE 0 END;
 
--- Warn if QS is READ_ONLY (data may be stale)
 IF @QsActualState = ''READ_ONLY'' AND @QsDesiredState = ''READ_WRITE''
 BEGIN
     RAISERROR(N''  WARNING: Query Store is READ_ONLY (desired READ_WRITE). Data may be stale - check MAX_STORAGE_SIZE_MB.'', 10, 1) WITH NOWAIT;
-    SET @QsRw = 1; -- still read QS data, just warn
+    SET @QsRw = 1;
 END
 ELSE IF @QsActualState NOT IN (''READ_WRITE'', ''READ_ONLY'')
 BEGIN
     RAISERROR(N''  WARNING: Query Store is not active (state: %s). CPU data unavailable.'', 10, 1, @QsActualState) WITH NOWAIT;
 END
 
--- Warn if lookback exceeds retention policy
 IF @QsRw = 1 AND @QsRetentionDays IS NOT NULL AND @LookbackDays_param > @QsRetentionDays
 BEGIN
     DECLARE @QsRetMsg nvarchar(200) = N''  WARNING: @LookbackDays ('' + CAST(@LookbackDays_param AS nvarchar(10))
@@ -1759,110 +1893,9 @@ BEGIN
     RAISERROR(@QsRetMsg, 10, 1) WITH NOWAIT;
 END
 
-IF @QsRw = 1
-BEGIN
-    ;WITH CpuByPlan AS
-    (
-        SELECT
-            rs.plan_id,
-            total_cpu_us = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_cpu_time)),
-            total_logical_reads = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_logical_io_reads)),
-            total_physical_reads = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_physical_io_reads)),
-            total_duration_us = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_duration)),
-            total_executions = SUM(CONVERT(bigint, rs.count_executions))
-        FROM sys.query_store_runtime_stats rs
-        JOIN sys.query_store_runtime_stats_interval rsi
-          ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-        WHERE rsi.start_time >= DATEADD(DAY, -@LookbackDays_param, SYSUTCDATETIME())
-        GROUP BY rs.plan_id
-    )
-    INSERT #CpuByPlan(plan_id, total_cpu_ms, total_logical_reads, total_physical_reads, total_duration_ms, total_executions)
-    SELECT plan_id,
-        CONVERT(bigint, total_cpu_us / 1000),
-        total_logical_reads,
-        total_physical_reads,
-        CONVERT(bigint, total_duration_us / 1000),
-        total_executions
-    FROM CpuByPlan
-    WHERE total_cpu_us > 0;
-
-    -- 3) Map plan CPU to heap objects via showplan XML
-    IF EXISTS (SELECT 1 FROM #CpuByPlan)
-    BEGIN
-        ;WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan''),
-        HeapPlans AS
-        (
-            -- Pre-filter: only parse plans whose text contains a heap table name
-            SELECT p.plan_id, p.query_id, q.query_hash,
-                TRY_CONVERT(xml, p.query_plan) AS plan_xml
-            FROM sys.query_store_plan p
-            JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
-            JOIN sys.query_store_query q ON p.query_id = q.query_id
-            WHERE EXISTS (SELECT 1 FROM #Heaps h WHERE p.query_plan LIKE N''%Table="[[]'' + h.table_name + N'']%'')
-        )
-        -- Filter to Table Scan RelOps only. These are the operations that traverse
-        -- forwarded record pointers. Index Seeks/Scans on NCIs don''t hit them.
-        INSERT #PlanObjMap (plan_id, query_id, query_hash, schema_name, table_name)
-        SELECT DISTINCT
-            hp.plan_id,
-            hp.query_id,
-            hp.query_hash,
-            REPLACE(REPLACE(obj.value(''@Schema'',''sysname''), N''['', N''''), N'']'', N'''') AS schema_name,
-            REPLACE(REPLACE(obj.value(''@Table'', ''sysname''), N''['', N''''), N'']'', N'''') AS table_name
-        FROM HeapPlans hp
-        CROSS APPLY hp.plan_xml.nodes(''//RelOp[@PhysicalOp="Table Scan"]/*/Object[@Schema and @Table]'') AS n(obj)
-        WHERE hp.plan_xml IS NOT NULL;
-
-        -- Aggregate metrics by object
-        INSERT #CpuByObject(object_id, total_cpu_ms, total_logical_reads, total_physical_reads, total_duration_ms, total_executions, plan_count, query_count)
-        SELECT h.object_id,
-            SUM(cp.total_cpu_ms),
-            SUM(cp.total_logical_reads),
-            SUM(cp.total_physical_reads),
-            SUM(cp.total_duration_ms),
-            SUM(cp.total_executions),
-            COUNT(DISTINCT pm.plan_id),
-            COUNT(DISTINCT pm.query_id)
-        FROM #Heaps h
-        JOIN #PlanObjMap pm ON pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
-                           AND pm.table_name  COLLATE DATABASE_DEFAULT = h.table_name  COLLATE DATABASE_DEFAULT
-        JOIN #CpuByPlan cp ON cp.plan_id = pm.plan_id
-        GROUP BY h.object_id;
-
-        -- Collect distinct query_hash values per heap object (for performance tracking)
-        ;WITH DistinctHashes AS
-        (
-            SELECT DISTINCT h.object_id, pm.query_hash
-            FROM #Heaps h
-            JOIN #PlanObjMap pm ON pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
-                               AND pm.table_name  COLLATE DATABASE_DEFAULT = h.table_name  COLLATE DATABASE_DEFAULT
-        )
-        UPDATE cbo
-        SET cbo.query_hashes = sub.query_hashes
-        FROM #CpuByObject cbo
-        JOIN (
-            SELECT object_id, STRING_AGG(CONVERT(varchar(18), query_hash, 1), '','') AS query_hashes
-            FROM DistinctHashes
-            GROUP BY object_id
-        ) sub ON cbo.object_id = sub.object_id;
-        -- Report unmatchable plan coverage
-        DECLARE @qs_total_plans int = (SELECT COUNT(*) FROM #CpuByPlan);
-        DECLARE @qs_matched_plans int = (SELECT COUNT(DISTINCT plan_id) FROM #PlanObjMap);
-        DECLARE @qs_unmatched int = @qs_total_plans - @qs_matched_plans;
-
-        IF @qs_unmatched > 0
-        BEGIN
-            DECLARE @qs_cov_msg nvarchar(200) = N''  QS coverage: '' + CAST(@qs_matched_plans AS nvarchar(10))
-                + N''/'' + CAST(@qs_total_plans AS nvarchar(10)) + N'' plans mapped to heaps (''
-                + CAST(@qs_unmatched AS nvarchar(10)) + N'' had NULL XML or no Table Scan on target heaps).'';
-            RAISERROR(@qs_cov_msg, 10, 1) WITH NOWAIT;
-        END
-    END
-END
-ELSE
-BEGIN
+IF @QsRw = 0
     RAISERROR(N''  Query Store not READ_WRITE; ranking by forwarded_pct only.'', 10, 1) WITH NOWAIT;
-END
+-- Heavy QS XML parsing deferred to after INSERT #Targets (two-phase ranking)
 ';
         END
         ELSE IF @CpuSourceUpper = 'NONE'
@@ -1945,11 +1978,13 @@ Ranked AS
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = h.object_id
              AND name = N''CX__Temp__'' + LEFT(h.table_name, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
         -- 8I: Forced plan check - CI swap invalidates forced plans
-        CASE WHEN EXISTS (SELECT 1 FROM #PlanObjMap pm
-             JOIN sys.query_store_plan qp ON qp.plan_id = pm.plan_id
-             WHERE pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name
-               AND pm.table_name  COLLATE DATABASE_DEFAULT = h.table_name
-               AND qp.is_forced_plan = 1) THEN 1 ELSE 0 END AS has_forced_plans,
+        -- Lightweight LIKE on forced plans only (no XML parsing needed).
+        -- sys.query_store_plan is safe to query when QS is OFF (returns empty set).
+        CASE WHEN @CpuSource_param = N''QUERY_STORE''
+             AND EXISTS (SELECT 1 FROM sys.query_store_plan fp
+                         WHERE fp.is_forced_plan = 1
+                         AND fp.query_plan LIKE N''%Table="[[]'' + h.table_name + N'']%'')
+        THEN 1 ELSE 0 END AS has_forced_plans,
         -- QS performance snapshot (NULL when CpuSource=NONE or QS not available)
         CASE WHEN cbo.object_id IS NOT NULL THEN SYSUTCDATETIME() ELSE NULL END AS qs_snapshot_time_utc,
         cbo.total_logical_reads  AS qs_total_logical_reads,
@@ -2129,28 +2164,22 @@ BEGIN
 END
 
 -- 8I: Forced plan warning
-IF EXISTS (SELECT 1 FROM #Targets t
-           WHERE t.database_name = DB_NAME()
-             AND t.action_chosen <> ''CI_SWAP_ONLINE''
-             AND t.temp_key_cols IS NOT NULL
-             AND t.has_lob_columns = 0
-             AND EXISTS (SELECT 1 FROM #PlanObjMap pm
-                         JOIN sys.query_store_plan qp ON qp.plan_id = pm.plan_id
-                         WHERE pm.schema_name COLLATE DATABASE_DEFAULT = t.schema_name
-                           AND pm.table_name  COLLATE DATABASE_DEFAULT = t.table_name
-                           AND qp.is_forced_plan = 1))
+-- has_forced_plans in Ranked CTE uses lightweight LIKE on sys.query_store_plan.
+-- If CI_SWAP conditions are met but action_chosen is not CI_SWAP_ONLINE, forced plans caused the downgrade.
+IF @CpuSource_param = N''QUERY_STORE''
+   AND @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
+   AND EXISTS (SELECT 1 FROM #Targets t
+               WHERE t.database_name = DB_NAME()
+                 AND t.action_chosen <> ''CI_SWAP_ONLINE''
+                 AND t.temp_key_cols IS NOT NULL
+                 AND t.has_lob_columns = 0)
 BEGIN
     DECLARE fp_cursor CURSOR LOCAL FAST_FORWARD FOR
         SELECT t.schema_name, t.table_name FROM #Targets t
         WHERE t.database_name = DB_NAME()
           AND t.action_chosen <> ''CI_SWAP_ONLINE''
           AND t.temp_key_cols IS NOT NULL
-          AND t.has_lob_columns = 0
-          AND EXISTS (SELECT 1 FROM #PlanObjMap pm
-                      JOIN sys.query_store_plan qp ON qp.plan_id = pm.plan_id
-                      WHERE pm.schema_name COLLATE DATABASE_DEFAULT = t.schema_name
-                        AND pm.table_name  COLLATE DATABASE_DEFAULT = t.table_name
-                        AND qp.is_forced_plan = 1);
+          AND t.has_lob_columns = 0;
     DECLARE @fp_schema sysname, @fp_table sysname;
     OPEN fp_cursor;
     FETCH NEXT FROM fp_cursor INTO @fp_schema, @fp_table;
@@ -2165,6 +2194,149 @@ BEGIN
     DEALLOCATE fp_cursor;
 END
 ';
+
+        -- QS enrichment: after structural ranking + INSERT #Targets, enrich with CPU data.
+        -- Two-phase approach: structural ranking first (fast), QS XML parsing only for targets (bounded).
+        -- plan_hash dedup: TRY_CONVERT once per unique query_plan_hash, fan out to all plan_ids.
+        IF @CpuSourceUpper = 'QUERY_STORE'
+        BEGIN
+            SET @discovery_sql += N'
+-- QS enrichment phase (two-phase ranking: structural first, CPU enrichment second)
+IF @QsRw = 1 AND EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME())
+BEGIN
+    ;WITH CpuByPlan AS
+    (
+        SELECT
+            rs.plan_id,
+            total_cpu_us = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_cpu_time)),
+            total_logical_reads = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_logical_io_reads)),
+            total_physical_reads = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_physical_io_reads)),
+            total_duration_us = SUM(CONVERT(bigint, rs.count_executions) * CONVERT(bigint, rs.avg_duration)),
+            total_executions = SUM(CONVERT(bigint, rs.count_executions))
+        FROM sys.query_store_runtime_stats rs
+        JOIN sys.query_store_runtime_stats_interval rsi
+          ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+        WHERE rsi.start_time >= DATEADD(DAY, -@LookbackDays_param, SYSUTCDATETIME())
+        GROUP BY rs.plan_id
+    )
+    INSERT #CpuByPlan(plan_id, total_cpu_ms, total_logical_reads, total_physical_reads, total_duration_ms, total_executions)
+    SELECT plan_id,
+        CONVERT(bigint, total_cpu_us / 1000),
+        total_logical_reads,
+        total_physical_reads,
+        CONVERT(bigint, total_duration_us / 1000),
+        total_executions
+    FROM CpuByPlan
+    WHERE total_cpu_us > 0;
+';
+
+            SET @discovery_sql += N'
+    IF EXISTS (SELECT 1 FROM #CpuByPlan)
+    BEGIN
+        -- plan_hash dedup: parse XML once per unique query_plan_hash.
+        -- LIKE pre-filter checks #Targets (max @TopN per db) instead of #Heaps (all heaps).
+        CREATE TABLE #ParsedPlans (query_plan_hash binary(8) NOT NULL PRIMARY KEY, plan_xml xml NULL);
+
+        INSERT #ParsedPlans (query_plan_hash, plan_xml)
+        SELECT sub.query_plan_hash, TRY_CONVERT(xml, sub.query_plan)
+        FROM (
+            SELECT p.query_plan_hash, p.query_plan,
+                ROW_NUMBER() OVER (PARTITION BY p.query_plan_hash ORDER BY p.plan_id) AS rn
+            FROM sys.query_store_plan p
+            JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
+            WHERE EXISTS (SELECT 1 FROM #Targets t
+                          WHERE t.database_name = DB_NAME()
+                          AND p.query_plan LIKE N''%Table="[[]'' + t.table_name + N'']%'')
+        ) sub
+        WHERE sub.rn = 1;
+
+        -- XPath extraction: fan out parsed plans to all plan_ids sharing each plan_hash
+        ;WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan'')
+        INSERT #PlanObjMap (plan_id, query_id, query_hash, schema_name, table_name)
+        SELECT DISTINCT
+            p.plan_id,
+            p.query_id,
+            q.query_hash,
+            REPLACE(REPLACE(obj.value(''@Schema'',''sysname''), N''['', N''''), N'']'', N'''') AS schema_name,
+            REPLACE(REPLACE(obj.value(''@Table'', ''sysname''), N''['', N''''), N'']'', N'''') AS table_name
+        FROM #ParsedPlans pp
+        CROSS APPLY pp.plan_xml.nodes(''//RelOp[@PhysicalOp="Table Scan"]/*/Object[@Schema and @Table]'') AS n(obj)
+        JOIN sys.query_store_plan p ON p.query_plan_hash = pp.query_plan_hash
+        JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
+        JOIN sys.query_store_query q ON p.query_id = q.query_id
+        WHERE pp.plan_xml IS NOT NULL;
+';
+
+            SET @discovery_sql += N'
+        -- Aggregate metrics by object
+        INSERT #CpuByObject(object_id, total_cpu_ms, total_logical_reads, total_physical_reads, total_duration_ms, total_executions, plan_count, query_count)
+        SELECT h.object_id,
+            SUM(cp.total_cpu_ms),
+            SUM(cp.total_logical_reads),
+            SUM(cp.total_physical_reads),
+            SUM(cp.total_duration_ms),
+            SUM(cp.total_executions),
+            COUNT(DISTINCT pm.plan_id),
+            COUNT(DISTINCT pm.query_id)
+        FROM #Heaps h
+        JOIN #PlanObjMap pm ON pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
+                           AND pm.table_name  COLLATE DATABASE_DEFAULT = h.table_name  COLLATE DATABASE_DEFAULT
+        JOIN #CpuByPlan cp ON cp.plan_id = pm.plan_id
+        GROUP BY h.object_id;
+
+        -- Collect distinct query_hash values per heap object
+        ;WITH DistinctHashes AS
+        (
+            SELECT DISTINCT h.object_id, pm.query_hash
+            FROM #Heaps h
+            JOIN #PlanObjMap pm ON pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
+                               AND pm.table_name  COLLATE DATABASE_DEFAULT = h.table_name  COLLATE DATABASE_DEFAULT
+        )
+        UPDATE cbo
+        SET cbo.query_hashes = sub.query_hashes
+        FROM #CpuByObject cbo
+        JOIN (
+            SELECT object_id, STRING_AGG(CONVERT(varchar(18), query_hash, 1), '','') AS query_hashes
+            FROM DistinctHashes
+            GROUP BY object_id
+        ) sub ON cbo.object_id = sub.object_id;
+';
+
+            SET @discovery_sql += N'
+        -- Enrich #Targets with CPU data from QS
+        UPDATE t
+        SET t.total_cpu_ms          = cbo.total_cpu_ms,
+            t.ranking_basis         = N''QS_CPU'',
+            t.qs_snapshot_time_utc  = SYSUTCDATETIME(),
+            t.qs_total_logical_reads  = cbo.total_logical_reads,
+            t.qs_total_physical_reads = cbo.total_physical_reads,
+            t.qs_total_duration_ms    = cbo.total_duration_ms,
+            t.qs_total_executions     = cbo.total_executions,
+            t.qs_plan_count           = cbo.plan_count,
+            t.qs_query_count          = cbo.query_count,
+            t.qs_query_hashes         = cbo.query_hashes
+        FROM #Targets t
+        JOIN #CpuByObject cbo ON t.object_id = cbo.object_id
+        WHERE t.database_name = DB_NAME();
+
+        -- Report coverage
+        DECLARE @qs_total_plans int = (SELECT COUNT(*) FROM #CpuByPlan);
+        DECLARE @qs_unique_hashes int = (SELECT COUNT(*) FROM #ParsedPlans);
+        DECLARE @qs_matched_plans int = (SELECT COUNT(DISTINCT plan_id) FROM #PlanObjMap);
+        DECLARE @qs_targets_enriched int = (SELECT COUNT(*) FROM #Targets WHERE database_name = DB_NAME() AND ranking_basis = N''QS_CPU'');
+        DECLARE @qs_targets_total int = (SELECT COUNT(*) FROM #Targets WHERE database_name = DB_NAME());
+
+        SET @Msg_inner = N''  QS enrichment: '' + CAST(@qs_targets_enriched AS nvarchar(10))
+            + N''/'' + CAST(@qs_targets_total AS nvarchar(10)) + N'' targets enriched with CPU data (''
+            + CAST(@qs_unique_hashes AS nvarchar(10)) + N'' unique plans parsed from ''
+            + CAST(@qs_total_plans AS nvarchar(10)) + N'' total).'';
+        RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+
+        DROP TABLE #ParsedPlans;
+    END
+END
+';
+        END
 
         /*
         Execute the per-database discovery.
@@ -2202,6 +2374,14 @@ END
         -- Mark database as completed
         UPDATE @tmpDatabases SET Completed = 1 WHERE ID = @CurrentDatabaseID;
 
+        -- Track per-database scan stats
+        INSERT INTO @DbScanStats (DatabaseName, HeapsQualified, ScanSeconds)
+        VALUES (
+            @CurrentDatabaseName,
+            (SELECT COUNT(*) FROM #Targets) - @db_pre_target_count,
+            DATEDIFF(SECOND, @db_scan_start, SYSDATETIME())
+        );
+
         -- Scan throttle: WAITFOR between database scans
         -- Reduces dm_db_index_physical_stats latch contention on busy servers.
         IF @ScanThrottleMs IS NOT NULL AND @ScanThrottleMs > 0
@@ -2229,6 +2409,41 @@ END
             END
             BREAK;
         END
+    END
+
+    /*
+    QUERY_STORE re-rank: after per-database discovery + enrichment, recalculate
+    ranking_score with updated CPU data and reassign sort_order globally.
+    This mirrors the QUICKIESTORE re-rank pattern below.
+    */
+    IF @CpuSourceUpper = 'QUERY_STORE'
+       AND EXISTS (SELECT 1 FROM #Targets WHERE ranking_basis = 'QS_CPU')
+    BEGIN
+        -- Recalculate ranking_score with updated CPU
+        UPDATE #Targets
+        SET ranking_score = CAST(
+            (0.4 * LOG10(ISNULL(forwarded_fetch_count, 0) / @UptimeHours + 1)
+           + 0.4 * LOG10(COALESCE(total_cpu_ms, 0) + 1)
+           + 0.2 * LOG10(forwarded_pct + 1))
+          * CASE usage_hint
+                WHEN 'WRITE_ONLY' THEN 0.25
+                WHEN 'WRITE_HEAVY' THEN 0.5
+                ELSE 1.0
+            END
+        AS decimal(8,4));
+
+        -- Global re-rank sort_order by updated ranking_score
+        ;WITH Reranked AS
+        (
+            SELECT
+                target_id,
+                sort_order,
+                ROW_NUMBER() OVER (
+                    ORDER BY ranking_score DESC
+                ) AS new_rank
+            FROM #Targets
+        )
+        UPDATE Reranked SET sort_order = new_rank;
     END
 
     /*
@@ -2476,6 +2691,37 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     END
 
+    -- @SkipWriteHeavy: remove write-heavy heaps entirely when requested
+    IF @SkipWriteHeavy = 1
+    BEGIN
+        DECLARE @skip_wh_cnt int;
+        SELECT @skip_wh_cnt = COUNT(*) FROM #Targets WHERE usage_hint IN (N'WRITE_HEAVY', N'WRITE_ONLY');
+
+        IF @skip_wh_cnt > 0
+        BEGIN
+            DECLARE @skip_wh_name nvarchar(512);
+            DECLARE skip_wh_cursor CURSOR LOCAL FAST_FORWARD FOR
+                SELECT QUOTENAME(database_name) + N'.' + QUOTENAME(schema_name) + N'.' + QUOTENAME(table_name)
+                FROM #Targets WHERE usage_hint IN (N'WRITE_HEAVY', N'WRITE_ONLY') ORDER BY sort_order;
+            OPEN skip_wh_cursor;
+            FETCH NEXT FROM skip_wh_cursor INTO @skip_wh_name;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @Msg = N'SKIPPED (write-heavy): ' + @skip_wh_name + N' -- @SkipWriteHeavy = 1';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                FETCH NEXT FROM skip_wh_cursor INTO @skip_wh_name;
+            END
+            CLOSE skip_wh_cursor;
+            DEALLOCATE skip_wh_cursor;
+
+            DELETE FROM #Targets WHERE usage_hint IN (N'WRITE_HEAVY', N'WRITE_ONLY');
+            SET @TargetCount = (SELECT COUNT(*) FROM #Targets);
+
+            SET @Msg = CAST(@skip_wh_cnt AS nvarchar(10)) + N' write-heavy heap(s) excluded by @SkipWriteHeavy = 1.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+    END
+
     -- RCSI version store pressure warning
     -- Online rebuilds on RCSI databases generate version store data in tempdb.
     BEGIN
@@ -2605,6 +2851,56 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     IF @TargetCount = 0
     BEGIN
         RAISERROR(N'No heaps met thresholds in any database. Nothing to do.', 10, 1) WITH NOWAIT;
+
+        -- Write HEAP_SCAN_SUMMARY even for zero targets (confirms "proc ran, found nothing")
+        IF @PlanOnly = 1 AND @LogToTable = 'Y' AND @commandlog_exists = 1 AND @resume_loaded = 0
+        BEGIN
+            INSERT INTO dbo.CommandLog
+                (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
+                 StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+            VALUES
+            (
+                ISNULL(@Databases, DB_NAME()),
+                N'dbo',
+                N'sp_HeapDoctor',
+                N'P',
+                @invocation_command,
+                N'HEAP_SCAN_SUMMARY',
+                @start_time,
+                SYSDATETIME(),
+                0,
+                NULL,
+                (
+                    SELECT
+                        @Version AS Version,
+                        @RankingAlgoVersion AS RankingAlgoVersion,
+                        @RunID AS RunID,
+                        0 AS TargetCount,
+                        @DatabaseCount AS DatabasesScanned,
+                        0 AS TotalPageCount,
+                        CAST(0 AS decimal(18,2)) AS TotalSizeMB,
+                        @CpuSourceUpper AS CpuSource,
+                        DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS ElapsedSeconds,
+                        CONVERT(nvarchar(30), @SqlServerStartTime, 126) AS SqlServerStartTime,
+                        CAST(@UptimeHours AS decimal(10,1)) AS UptimeHours,
+                        0 AS DatabasesWithTargets,
+                        CAST(0 AS bigint) AS TotalCpuMs,
+                        CAST(0 AS bigint) AS TotalForwardedRecordCount,
+                        CAST(0 AS bigint) AS TotalForwardedFetchCount,
+                        (
+                            SELECT
+                                DatabaseName AS [Name],
+                                HeapsQualified,
+                                ScanSeconds
+                            FROM @DbScanStats
+                            ORDER BY DatabaseName
+                            FOR XML RAW(N'Database'), TYPE
+                        ) AS Databases
+                    FOR XML RAW(N'ScanSummary'), ELEMENTS, TYPE
+                )
+            );
+        END
+
         EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
         RETURN;
     END
@@ -2828,6 +3124,81 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         WHERE d.recovery_model_desc = N'FULL';
     END
 
+    -- Churn detection: warn about heaps rebuilt 5+ times in 90 days
+    IF EXISTS (SELECT 1 FROM #Targets WHERE rebuilds_in_90d >= 5)
+    BEGIN
+        DECLARE @churn_name nvarchar(512);
+        DECLARE @churn_cnt int;
+        DECLARE churn_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT QUOTENAME(database_name) + N'.' + QUOTENAME(schema_name) + N'.' + QUOTENAME(table_name),
+                   rebuilds_in_90d
+            FROM #Targets WHERE rebuilds_in_90d >= 5 ORDER BY sort_order;
+        OPEN churn_cursor;
+        FETCH NEXT FROM churn_cursor INTO @churn_name, @churn_cnt;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @Msg = N'WARNING: ' + @churn_name + N' has been rebuilt '
+                     + CAST(@churn_cnt AS nvarchar(10))
+                     + N' times in the last 90 days. Consider investigating root cause (ETL pattern, row expansion) rather than repeated rebuilds.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            FETCH NEXT FROM churn_cursor INTO @churn_name, @churn_cnt;
+        END
+        CLOSE churn_cursor;
+        DEALLOCATE churn_cursor;
+    END
+
+    -- @MinDaysSinceRebuild: skip recently-rebuilt heaps
+    IF @MinDaysSinceRebuild IS NOT NULL
+    BEGIN
+        IF @commandlog_exists = 0
+        BEGIN
+            RAISERROR(N'WARNING: @MinDaysSinceRebuild requires dbo.CommandLog for rebuild history. Filter cannot be applied without CommandLog.', 10, 1) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            DECLARE @skip_recent_cnt int;
+            SELECT @skip_recent_cnt = COUNT(*)
+            FROM #Targets
+            WHERE days_since_last_rebuild IS NOT NULL
+              AND days_since_last_rebuild < @MinDaysSinceRebuild;
+
+            IF @skip_recent_cnt > 0
+            BEGIN
+                DECLARE @skip_recent_name nvarchar(512);
+                DECLARE @skip_recent_days int;
+                DECLARE skip_recent_cursor CURSOR LOCAL FAST_FORWARD FOR
+                    SELECT QUOTENAME(database_name) + N'.' + QUOTENAME(schema_name) + N'.' + QUOTENAME(table_name),
+                           days_since_last_rebuild
+                    FROM #Targets
+                    WHERE days_since_last_rebuild IS NOT NULL
+                      AND days_since_last_rebuild < @MinDaysSinceRebuild
+                    ORDER BY sort_order;
+                OPEN skip_recent_cursor;
+                FETCH NEXT FROM skip_recent_cursor INTO @skip_recent_name, @skip_recent_days;
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    SET @Msg = N'SKIPPED (recently rebuilt): ' + @skip_recent_name
+                             + N' -- rebuilt ' + CAST(@skip_recent_days AS nvarchar(10))
+                             + N' day(s) ago (threshold: ' + CAST(@MinDaysSinceRebuild AS nvarchar(10)) + N')';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    FETCH NEXT FROM skip_recent_cursor INTO @skip_recent_name, @skip_recent_days;
+                END
+                CLOSE skip_recent_cursor;
+                DEALLOCATE skip_recent_cursor;
+
+                DELETE FROM #Targets
+                WHERE days_since_last_rebuild IS NOT NULL
+                  AND days_since_last_rebuild < @MinDaysSinceRebuild;
+                SET @TargetCount = (SELECT COUNT(*) FROM #Targets);
+
+                SET @Msg = CAST(@skip_recent_cnt AS nvarchar(10))
+                         + N' recently-rebuilt heap(s) excluded by @MinDaysSinceRebuild = '
+                         + CAST(@MinDaysSinceRebuild AS nvarchar(10)) + N'.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+        END
+    END
+
     ----------------------------------------------------------------------------
     -- Obfuscation: build encrypted mapping, then populate pseudo_ columns.
     -- Must build mapping FIRST (needs real names), then populate pseudonyms.
@@ -2994,6 +3365,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         qs_query_count,
         usage_hint,
         ranking_score,
+        @RankingAlgoVersion AS ranking_algo_version,
         CASE heap_compression WHEN 1 THEN 'ROW' WHEN 2 THEN 'PAGE' ELSE 'NONE' END AS heap_compression,
         replication_hint,
         CASE lock_escalation WHEN 0 THEN 'TABLE' WHEN 1 THEN 'DISABLE' WHEN 2 THEN 'AUTO' ELSE 'UNKNOWN' END AS lock_escalation,
@@ -3006,7 +3378,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         est_space_savings_mb,
         est_ci_swap_overhead_mb,
         est_log_mb,
-        days_since_last_rebuild
+        days_since_last_rebuild,
+        @SqlServerStartTime AS sqlserver_start_time,
+        CAST(@UptimeHours AS decimal(10,1)) AS uptime_hours
     FROM #Targets
     ORDER BY sort_order;
 
@@ -3015,6 +3389,47 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     ----------------------------------------------------------------------------
     IF @PlanOnly = 1 AND @LogToTable = 'Y' AND @commandlog_exists = 1 AND @resume_loaded = 0
     BEGIN
+        -- Detect unconsumed (superseded) plan-only scans for overlapping databases
+        BEGIN
+            DECLARE @superseded_cnt int = 0;
+            DECLARE @superseded_info nvarchar(max) = N'';
+
+            SELECT @superseded_cnt = COUNT(*),
+                   @superseded_info = STRING_AGG(
+                       N'  RunID ' + CAST(sub.RunID AS nvarchar(36))
+                       + N' (' + CONVERT(nvarchar(10), sub.ScanTime, 120)
+                       + N', ' + CAST(sub.TargetCount AS nvarchar(10)) + N' targets)',
+                       NCHAR(13) + NCHAR(10))
+            FROM (
+                SELECT
+                    cl.ExtendedInfo.value(N'(/ScanSummary/RunID)[1]', N'uniqueidentifier') AS RunID,
+                    cl.StartTime AS ScanTime,
+                    cl.ExtendedInfo.value(N'(/ScanSummary/TargetCount)[1]', N'int') AS TargetCount
+                FROM dbo.CommandLog cl
+                WHERE cl.CommandType = N'HEAP_SCAN_SUMMARY'
+                  AND cl.StartTime >= DATEADD(DAY, -30, SYSDATETIME())
+                  AND cl.ExtendedInfo.value(N'(/ScanSummary/TargetCount)[1]', N'int') > 0
+            ) sub
+            -- Not consumed by a resume execution
+            WHERE NOT EXISTS (
+                SELECT 1 FROM dbo.CommandLog cl2
+                WHERE cl2.CommandType = N'HEAP_REBUILD_START'
+                  AND cl2.ExtendedInfo.value(N'(/Parameters/ResumedFromRunID)[1]', N'uniqueidentifier') = sub.RunID
+            );
+
+            IF @superseded_cnt > 0
+            BEGIN
+                SET @Msg = N'INFO: Found ' + CAST(@superseded_cnt AS nvarchar(10))
+                         + N' previous plan-only scan(s) from the last 30 days that were never executed:';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                -- Print details (truncate if too long for RAISERROR)
+                IF LEN(@superseded_info) > 3900
+                    SET @superseded_info = LEFT(@superseded_info, 3900) + N'...';
+                RAISERROR(@superseded_info, 10, 1) WITH NOWAIT;
+                RAISERROR(N'  These are now superseded by the current scan.', 10, 1) WITH NOWAIT;
+            END
+        END
+
         INSERT INTO dbo.CommandLog
             (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
              StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
@@ -3024,7 +3439,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             N'dbo',
             N'sp_HeapDoctor',
             N'P',
-            N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N''', @PlanOnly = 1...',
+            @invocation_command,
             N'HEAP_SCAN_SUMMARY',
             @start_time,
             SYSDATETIME(),
@@ -3033,6 +3448,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             (
                 SELECT
                     @Version AS Version,
+                    @RankingAlgoVersion AS RankingAlgoVersion,
                     @RunID AS RunID,
                     @TargetCount AS TargetCount,
                     @DatabaseCount AS DatabasesScanned,
@@ -3040,8 +3456,23 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     CAST((SELECT SUM(page_count) FROM #Targets) AS decimal(18,2)) / 128.0 AS TotalSizeMB,
                     @CpuSourceUpper AS CpuSource,
                     DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS ElapsedSeconds,
+                    CONVERT(nvarchar(30), @SqlServerStartTime, 126) AS SqlServerStartTime,
+                    CAST(@UptimeHours AS decimal(10,1)) AS UptimeHours,
+                    (SELECT COUNT(DISTINCT database_name) FROM #Targets) AS DatabasesWithTargets,
+                    (SELECT SUM(ISNULL(total_cpu_ms, 0)) FROM #Targets) AS TotalCpuMs,
+                    (SELECT SUM(ISNULL(forwarded_record_count, 0)) FROM #Targets) AS TotalForwardedRecordCount,
+                    (SELECT SUM(ISNULL(forwarded_fetch_count, 0)) FROM #Targets) AS TotalForwardedFetchCount,
                     CASE WHEN @obfuscate = 1 THEN @effective_seed ELSE NULL END AS ObfuscateSeed,
                     CASE WHEN @obfuscate = 1 THEN CONVERT(nvarchar(max), @obfu_mapping_encrypted, 2) ELSE NULL END AS ObfuscatedMappingHex,
+                    (
+                        SELECT
+                            DatabaseName AS [Name],
+                            HeapsQualified,
+                            ScanSeconds
+                        FROM @DbScanStats
+                        ORDER BY DatabaseName
+                        FOR XML RAW(N'Database'), TYPE
+                    ) AS Databases,
                     (
                         SELECT
                             CASE WHEN @obfuscate = 1 THEN pseudo_database_name ELSE database_name END AS DatabaseName,
@@ -3214,7 +3645,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 N'dbo',
                 N'sp_HeapDoctor',
                 N'P',
-                N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N'''...',
+                @invocation_command,
                 N'HEAP_REBUILD_START',
                 @start_time,
                 (
@@ -3236,6 +3667,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         CASE WHEN @PreferCiSwap = 1 THEN N'Y' ELSE N'N' END AS PreferCiSwap,
                         CASE WHEN @EstimateTime = 1 THEN N'Y' ELSE N'N' END AS EstimateTime,
                         @RunID AS RunID,
+                        CONVERT(nvarchar(30), @SqlServerStartTime, 126) AS SqlServerStartTime,
+                        CAST(@UptimeHours AS decimal(10,1)) AS UptimeHours,
                         CASE WHEN @resume_loaded = 1 THEN @ResumeRunID ELSE NULL END AS ResumedFromRunID,
                         CASE WHEN @obfuscate = 1 THEN @effective_seed ELSE NULL END AS ObfuscateSeed,
                         CASE WHEN @obfuscate = 1 THEN CONVERT(nvarchar(max), @obfu_mapping_encrypted, 2) ELSE NULL END AS ObfuscatedMappingHex
@@ -3935,7 +4368,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 N'dbo',
                 N'sp_HeapDoctor',
                 N'P',
-                N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N'''...',
+                @invocation_command,
                 N'HEAP_REBUILD_END',
                 @start_time,
                 SYSDATETIME(),

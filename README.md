@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0224
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0225
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -113,6 +113,33 @@ EXEC dbo.sp_HeapDoctor
     @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
 ```
 
+## Before You Run @PlanOnly = 0
+
+Plan-only mode is the default for a reason.  Before switching to execution, walk through this checklist:
+
+- [ ] **Run @PlanOnly = 1 first** and validate the target list against your knowledge of which heaps are actually hot.  The proc ranks by CPU and forwarded fetch rate, but you know your workload better than any formula.
+- [ ] **Set @LockTimeoutMs explicitly.**  The default is NULL (wait forever).  A rebuild that can't acquire Sch-M will block indefinitely, and anything waiting behind it blocks too.  Start with 5000-30000 ms for production.
+- [ ] **Set @MaxRunSeconds explicitly.**  The default is NULL (no time limit).  The proc will run until it finishes or is killed, ignoring your maintenance window entirely.  Size this to your available window minus a safety margin.
+- [ ] **On Standard Edition, raise @MinPages** beyond the default (1000 pages / 8 MB).  Every rebuild is offline on Standard, holding Sch-M for the full duration.  See the [Standard Edition note](#standard-edition) below.
+- [ ] **Check open [GitHub issues](https://github.com/nanoDBA/sp_HeapDoctor/issues)** for known limitations before your first production run.
+
+The quick-start examples above already show `@LockTimeoutMs = 5000` and `@MaxRunSeconds = 3600`.  The checklist just makes the *why* explicit.
+
+## Standard Edition
+
+On Standard Edition (and when `@OnlinePreference = 'OFF'` on any edition), all rebuilds are **offline**.  The Sch-M lock is held for the entire rebuild duration, blocking all readers and writers on the target table.  For a large heap, that can be minutes.
+
+This changes the meaning of `@MinPages`.  On Enterprise with online rebuilds, the default of 1000 (8 MB) is a reasonable floor because the lock is brief.  On Standard Edition, 8 MB heaps that take seconds to rebuild still block queries for those seconds, and you may have dozens of them in the target list.  Small heaps with forwarded records are usually not worth an offline rebuild.
+
+**Before running @PlanOnly = 0 on Standard Edition:**
+
+- **Raise @MinPages** to 5000-10000 (40-80 MB) as a starting point.  Tune based on your tolerance for blocking.
+- **Run @PlanOnly = 1 first** and sort by `page_count` to confirm you're comfortable with the size of every heap in the target list.
+- **Use @MaxRunSeconds** and schedule for off-hours.  Offline rebuilds during business hours cause user-visible blocking even on "small" tables.
+- **Consider @TopN** to limit the batch size.  Rebuilding 3 large heaps in a maintenance window is better than queuing 25 and timing out partway through.
+
+The proc detects Standard Edition automatically and falls back to offline with a warning.  It does not adjust `@MinPages` for you.
+
 ## Parameters
 
 ### Target Selection
@@ -126,6 +153,8 @@ EXEC dbo.sp_HeapDoctor
 | `@MinPages` | `1000` | Skip heaps smaller than this (page count) |
 | `@MaxPages` | `NULL` | Skip heaps larger than this (`NULL` = no cap) |
 | `@MinForwardedPct` | `2.00` | Minimum forwarded record % to qualify |
+| `@SkipWriteHeavy` | `0` | `1` = completely exclude `WRITE_HEAVY` and `WRITE_ONLY` heaps.  Default ranking penalties still apply when `0` |
+| `@MinDaysSinceRebuild` | `NULL` | Skip heaps rebuilt fewer than N days ago (requires CommandLog for rebuild history).  `NULL` = no filtering |
 
 ### CPU Source
 
@@ -290,6 +319,7 @@ The target list result set (returned in both plan-only and execute modes) contai
 |--------|------|-------------|
 | `usage_hint` | varchar(30) | `WRITE_ONLY` (zero reads), `WRITE_HEAVY` (more updates than reads), or NULL (normal read pattern).  Forwarded records recur on write-heavy heaps |
 | `ranking_score` | decimal(8,4) | LOG10-normalized composite score.  Higher = more impactful.  Formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`, penalized for write-heavy patterns |
+| `ranking_algo_version` | nvarchar(10) | Ranking formula version (e.g., `v1`).  Incremented only when the formula changes, enabling apples-to-apples CommandLog trending |
 | `heap_compression` | varchar(4) | Data compression on the heap: `NONE`, `ROW`, or `PAGE`.  Preserved during rebuild |
 | `replication_hint` | varchar(20) | Replication status: `PUBLISHED`, `MERGE_PUBLISHED`, `CDC`, combinations, or NULL.  CDC + CI swap warns about capture instance |
 | `lock_escalation` | varchar(10) | Lock escalation setting: `TABLE`, `AUTO`, or `DISABLE`.  `TABLE` warns for online rebuilds |
@@ -301,6 +331,13 @@ The target list result set (returned in both plan-only and execute modes) contai
 | `prev_forwarded_pct` | decimal(6,2) | Forwarded record % at the last rebuild of this table (from CommandLog).  NULL if never rebuilt |
 | `rebuilds_in_90d` | int | Number of times this table was rebuilt in the last 90 days.  High values suggest a clustered index may be more appropriate than repeated rebuilds |
 
+### Server Context
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `sqlserver_start_time` | datetime | SQL Server instance start time (from `sys.dm_os_sys_info`).  Contextualizes `forwarded_fetch_count` age: low counts after a recent restart mean little |
+| `uptime_hours` | decimal(10,1) | Hours since SQL Server started.  Used internally for fetch-rate normalization (min 1.0).  Helps operators gauge counter reliability |
+
 ## How It Works
 
 1. **Database selection** - parses `@Databases` using the Ola Hallengren pattern (wildcards, exclusions, AG awareness).  AG secondaries are automatically skipped because you can't rebuild on a read-only replica, no matter how badly you want to.
@@ -310,6 +347,32 @@ The target list result set (returned in both plan-only and execute modes) contai
 5. **LOB guard** - CI swap is skipped if the table has `text`, `ntext`, `image`, `xml`, or `MAX`-length columns (`DROP INDEX ONLINE` doesn't support LOB).
 6. **Command generation** - builds 3-part-name commands (`[DB].[Schema].[Table]`) so execution is context-agnostic.  Run it from master, run it from the target database, doesn't matter.
 7. **Execution** - iterates targets with lock timeout prefix/suffix, time limit checks, per-rebuild CommandLog entries, and post-rebuild verification that the forwarded records are actually gone.
+
+## CPU Ranking: Where Query Store Can Mislead
+
+CPU-prioritized ranking is a headline feature of sp_HeapDoctor, but it depends on Query Store showplan XML parsing, which has edge cases worth understanding.  The `ranking_basis` column tells you which signal was used (`QS_CPU`, `QS_NO_DATA`, or `FWD_PCT`), but doesn't explain *why*.
+
+### How plan parsing works
+
+The proc extracts heap references from showplan XML by finding `//RelOp[@PhysicalOp="Table Scan"]` nodes whose `Table` attribute matches a target heap name.  To avoid redundant XML parsing, plans are deduplicated by `query_plan_hash`: each unique hash is parsed once via `TRY_CONVERT(xml)`, then the mapping fans out to all plan_ids sharing that hash.
+
+### Failure modes and fallback behavior
+
+**NULL or truncated plan XML.**  Query Store can store plans without XML in certain configurations (deferred compilation, memory pressure during plan capture).  Very large plans may also be truncated beyond the Query Store size limit.  `TRY_CONVERT(xml)` returns NULL for these, and they are silently excluded from enrichment.  No warning is emitted per plan; however, the coverage summary message (`"X/Y targets enriched with CPU data (Z unique plans parsed from W total)"`) will show a gap between plans parsed and plans available.  If you see significantly fewer parsed plans than total plans, truncation is a likely cause.
+
+**Stale plans after recompilation.**  QS CPU data is tied to plan_ids.  When a plan recompiles, the old plan_id retains its accumulated stats for the `@LookbackDays` window (default 7 days).  The new plan_id starts fresh.  This means recently recompiled plans may show artificially low CPU, underranking the heap.  The `query_hash`-based before/after comparison is immune to this (query_hash survives recompilation), but the ranking formula uses plan-level CPU, not query-level.
+
+**Multi-statement plans referencing multiple heaps.**  A single plan may contain Table Scan operators on multiple heaps.  The proc attributes the full plan-level CPU to *each* heap it references.  If plan P costs 100K CPU ms and scans heaps A and B, both get 100K attributed.  This is intentional over-attribution: it ensures no heap is missed, at the cost of inflating scores for heaps that share plans with genuinely hot tables.  The `qs_plan_count` and `qs_query_count` columns help identify this: a heap with many plans is more likely to have shared attribution.
+
+**QS enabled but empty or sparse.**  When Query Store is active but has little data (recently enabled, recently purged, or low-traffic database), some or all heaps will have no matching plans.  These targets get `ranking_basis = 'QS_NO_DATA'` and the CPU component of the ranking score is zero (`LOG10(0+1) = 0`).  Ranking falls back to `forwarded_fetch_count` (40% weight) and `forwarded_pct` (20% weight).  This is a reasonable degradation: the proc still finds and ranks heaps, just without the CPU signal.
+
+**QS not in READ_WRITE state.**  If Query Store is in READ_ONLY, ERROR, or OFF state, the proc skips QS enrichment entirely with a warning: `"Query Store not READ_WRITE; ranking by forwarded_pct only."` All targets get `ranking_basis = 'FWD_PCT'`.
+
+**@LookbackDays exceeds QS retention.**  The proc warns when `@LookbackDays` is larger than the QS retention policy, but proceeds with whatever data is available.  The effective lookback is capped by what QS actually retained, not by the parameter value.
+
+### When QS_CPU ranking is unreliable
+
+If you suspect QS data quality issues, run with `@CpuSource = 'NONE'` to rank purely by structural metrics (forwarded_fetch_count + forwarded_pct).  This skips all QS overhead and gives a conservative ranking based on physical stats and runtime fetch counters.  Compare the two rankings to see whether QS data is meaningfully changing the priority order.
 
 ## What's Automatically Excluded
 
@@ -356,6 +419,39 @@ This eliminates forwarded records by physically reordering the data.  The temp C
 - Not on Enterprise/Developer edition
 
 **Trade-off:** Every nonclustered index on the table gets rebuilt when the clustered index is created, *and again* when it's dropped.  Check the `nci_count` column in the output before committing to this.  A table with 2 NCIs?  Sure.  A table with 15 NCIs?  Maybe just do the heap rebuild.
+
+## Write-Heavy Heaps
+
+Heaps flagged as `WRITE_HEAVY` or `WRITE_ONLY` have more updates than reads.  Rebuilding these is a band-aid: the same update patterns that created the forwarded records will recreate them.  sp_HeapDoctor deprioritizes them in the ranking (0.5x penalty for WRITE_HEAVY, 0.25x for WRITE_ONLY), but "deprioritize" doesn't mean "ignore forever."
+
+### The cost of doing nothing
+
+Forwarded records don't plateau.  They accumulate, and the penalties get worse the longer you wait:
+
+- **I/O amplification** - every forwarded fetch is an extra page read.  A scan that should touch 1,000 pages ends up touching 1,500+ because half the rows have been shunted elsewhere.  Multiply that by concurrency and it adds up fast.
+- **Buffer pool pollution** - those extra page reads push useful data out of cache, so now other queries are slower too.
+- **Space waste** - the forwarding stub (~9 bytes) stays on the original page even though the row left.  Pages get less dense, the heap grows, and you're paying for storage that holds pointers instead of data.
+- **It only goes one direction** - `forwarded_record_count` can go up or stay the same.  It never goes down without a rebuild.
+
+### The real fix is a clustered index
+
+A CI eliminates forwarded records permanently.  Row growth causes page splits, not forwarding pointers.  For most write-heavy tables, the cost of maintaining a CI during writes is far less than the cumulative read penalty from forwarded records piling up.  If the table has a natural key, just add the CI.
+
+### When the heap has to stay a heap
+
+Vendor schema you can't touch, LOB-heavy tables where a CI won't help, staging tables that get truncated anyway.  In those cases:
+
+1. **Rebuild on a separate schedule.**  Use `@SkipWriteHeavy = 1` for your regular maintenance window so you spend that time on heaps where rebuilds actually last.  Then run a separate, less frequent pass for the write-heavy ones.
+2. **Don't rebuild too often.**  Use `@MinDaysSinceRebuild` to enforce a cooldown period so you're not burning I/O rebuilding the same table every week.
+3. **Pay attention to the churn warning.**  If a heap triggers ">= 5 rebuilds in 90 days," that's the proc telling you this table needs a CI, not more rebuilds.
+
+```sql
+-- Weekly: skip write-heavy heaps, spend the window on high-ROI targets
+EXEC dbo.sp_HeapDoctor @Databases = N'USER_DATABASES', @SkipWriteHeavy = 1, @PlanOnly = 0;
+
+-- Monthly: write-heavy heaps only, skip anything rebuilt in the last 14 days
+EXEC dbo.sp_HeapDoctor @Databases = N'USER_DATABASES', @MinDaysSinceRebuild = 14, @PlanOnly = 0;
+```
 
 ## Remediation Time Estimation
 
