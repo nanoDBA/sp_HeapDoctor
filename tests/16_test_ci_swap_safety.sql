@@ -79,6 +79,8 @@ CREATE TABLE #Results
     partition_count        int           NULL,
     has_schema_bound_views int           NULL,
     has_indexed_views      int           NULL,
+    has_fk_references      int           NULL,
+    fk_ref_count           int           NULL,
     filegroup_name         sysname       NULL,
     command_text           nvarchar(max) NULL,
     ci_drop_command        nvarchar(max) NULL,

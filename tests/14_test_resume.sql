@@ -57,6 +57,8 @@ CREATE TABLE #Results
     partition_count        int           NULL,
     has_schema_bound_views int           NULL,
     has_indexed_views      int           NULL,
+    has_fk_references      int           NULL,
+    fk_ref_count           int           NULL,
     filegroup_name         sysname       NULL,
     command_text           nvarchar(max) NULL,
     ci_drop_command        nvarchar(max) NULL,
@@ -310,7 +312,7 @@ VALUES
     N'HEAP_SCAN_SUMMARY',
     SYSDATETIME(), SYSDATETIME(), 0, NULL,
     CAST(N'<ScanSummary>
-        <Version>1.0.2026.0227</Version>
+        <Version>1.0.2026.0302b</Version>
         <RunID>' + CAST(@ObfuRunID AS nvarchar(36)) + N'</RunID>
         <TargetCount>1</TargetCount>
         <ObfuscatedMappingHex>DEADBEEF0123456789</ObfuscatedMappingHex>

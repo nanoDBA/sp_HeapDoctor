@@ -1,3 +1,4 @@
+/*#region 00-HEADER -- License, version history, CREATE PROCEDURE, parameters */
 SET ANSI_NULLS ON;
 GO
 SET QUOTED_IDENTIFIER ON;
@@ -477,14 +478,20 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @RevealRunID             uniqueidentifier = NULL,           -- required with @RevealKey; RunID from the run to decrypt
 
     -- Resume from prior plan-only scan
-    @ResumeRunID             uniqueidentifier = NULL            -- load targets from a prior @PlanOnly=1 HEAP_SCAN_SUMMARY; skips discovery
+    @ResumeRunID             uniqueidentifier = NULL,           -- load targets from a prior @PlanOnly=1 HEAP_SCAN_SUMMARY; skips discovery
+
+    -- Safety
+    @Force                   bit            = 0                 -- bypass re-entrancy guard (use when prior run was KILLed and applock is orphaned)
 )
+/*#endregion 00-HEADER */
+
+/*#region 01-PREAMBLE -- SET options, version constants, state variables */
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0227';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302b';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -498,6 +505,9 @@ BEGIN
     -- Reproducible invocation command for CommandLog (built after input validation)
     DECLARE @invocation_command nvarchar(max) = NULL;
 
+/*#endregion 01-PREAMBLE */
+
+/*#region 02-HELP -- @Help parameter documentation output */
     ----------------------------------------------------------------------------
     -- @Help: print parameter documentation and return
     ----------------------------------------------------------------------------
@@ -539,6 +549,7 @@ ADVANCED PARAMETERS:
   @Debug             bit     = 0       Extra diagnostic output.
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays int  = 90      CommandLog history window for throughput rates.
+  @Force             bit     = 0       Bypass re-entrancy guard (orphaned applock from KILLed run).
 ', 10, 1, @Version) WITH NOWAIT;
 
         RAISERROR(N'
@@ -614,6 +625,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RETURN;
     END
 
+/*#endregion 02-HELP */
+
+/*#region 03-REVEAL -- @RevealKey short-circuit decryption */
     ----------------------------------------------------------------------------
     -- @RevealKey: decrypt obfuscated mapping from a prior run's CommandLog
     -- Short-circuits before re-entrancy guard (read-only, should not block).
@@ -730,6 +744,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RETURN;
     END
 
+/*#endregion 03-REVEAL */
+
+/*#region 04-VALIDATION -- @Execute alias, lock timeout, input validation */
     ----------------------------------------------------------------------------
     -- @Execute alias (Ola Hallengren convention): Y = execute, N = plan only
     -- When provided, overrides @PlanOnly.
@@ -812,6 +829,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     IF @ObfuscateSeed IS NOT NULL AND @ObfuscateKey IS NULL
         RAISERROR(N'WARNING: @ObfuscateSeed is ignored without @ObfuscateKey.', 10, 1) WITH NOWAIT;
 
+/*#endregion 04-VALIDATION */
+
+/*#region 05-REENTRY-GUARD -- sp_getapplock, obfuscation passphrase init */
     ----------------------------------------------------------------------------
     -- 8B: Re-entrancy guard
     -- Prevents concurrent executions from interfering with each other.
@@ -824,10 +844,14 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         @LockTimeout = 0,
         @LockOwner = N'Session';
 
-    IF @lock_result < 0
+    IF @lock_result < 0 AND @Force = 0
     BEGIN
-        RAISERROR(N'Another instance of sp_HeapDoctor is already running in this SQL Server instance. Aborting.', 16, 1);
+        RAISERROR(N'Another instance of sp_HeapDoctor is already running in this SQL Server instance. Use @Force = 1 to bypass if the previous run was KILLed. Aborting.', 16, 1);
         RETURN;
+    END
+    ELSE IF @lock_result < 0 AND @Force = 1
+    BEGIN
+        RAISERROR(N'WARNING: Bypassing re-entrancy guard via @Force = 1. Ensure no concurrent instance is actually running.', 10, 1) WITH NOWAIT;
     END
 
     -- Initialize obfuscation passphrase (after re-entrancy guard succeeds)
@@ -837,6 +861,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @passphrase     = @ObfuscateKey + @effective_seed;
     END
 
+/*#endregion 05-REENTRY-GUARD */
+
+/*#region 06-ENVIRONMENT -- Edition detection, CommandLog, banner, resume flag */
     ----------------------------------------------------------------------------
     -- Environment / capability gating
     ----------------------------------------------------------------------------
@@ -886,6 +913,45 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         )
         BEGIN
             SET @commandlog_exists = 1;
+
+            -- #40: Validate CommandLog schema compatibility before first write.
+            -- Ola Hallengren's schema has evolved; older versions may lack columns we need.
+            DECLARE @cl_missing nvarchar(max) = NULL;
+            SELECT @cl_missing = STRING_AGG(r.col_name, N', ')
+            FROM (VALUES
+                (N'DatabaseName'), (N'SchemaName'), (N'ObjectName'), (N'ObjectType'),
+                (N'IndexName'), (N'IndexType'), (N'Command'), (N'CommandType'),
+                (N'StartTime'), (N'EndTime'), (N'ErrorNumber'), (N'ErrorMessage'),
+                (N'ExtendedInfo')
+            ) AS r(col_name)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM sys.columns c
+                WHERE c.object_id = OBJECT_ID(N'dbo.CommandLog')
+                  AND c.name = r.col_name COLLATE DATABASE_DEFAULT
+            );
+
+            IF @cl_missing IS NOT NULL
+            BEGIN
+                SET @Msg = N'WARNING: dbo.CommandLog is missing columns: ' + @cl_missing
+                         + N'. Logging disabled. Recreate from https://ola.hallengren.com/scripts/CommandLog.sql';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                SET @commandlog_exists = 0;
+            END
+            ELSE
+            BEGIN
+                -- Validate ExtendedInfo is xml type (some shops use nvarchar(max) which breaks XPath)
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.columns c
+                    JOIN sys.types t ON t.user_type_id = c.user_type_id
+                    WHERE c.object_id = OBJECT_ID(N'dbo.CommandLog')
+                      AND c.name = N'ExtendedInfo'
+                      AND t.name = N'xml'
+                )
+                BEGIN
+                    RAISERROR(N'WARNING: dbo.CommandLog.ExtendedInfo is not xml type. XPath features disabled. Logging disabled for this run.', 10, 1) WITH NOWAIT;
+                    SET @commandlog_exists = 0;
+                END
+            END
         END
         ELSE
         BEGIN
@@ -941,6 +1007,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @ObfuscateSeed = N''' + REPLACE(@ObfuscateSeed, N'''', N'''''') + N'''';
     IF @ResumeRunID IS NOT NULL
         SET @invocation_command += N', @ResumeRunID = ''' + CAST(@ResumeRunID AS nvarchar(36)) + N'''';
+    IF @Force = 1
+        SET @invocation_command += N', @Force = 1';
     SET @invocation_command += N';';
 
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
@@ -964,6 +1032,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     DECLARE @resume_loaded bit = 0;
     DECLARE @resume_xml xml = NULL;
 
+/*#endregion 06-ENVIRONMENT */
+
+/*#region 07-DATABASES-PARSE -- @Databases recursive CTE parser */
     ----------------------------------------------------------------------------
     -- Parse @Databases (Ola Hallengren pattern)
     -- Supports: USER_DATABASES, ALL_DATABASES, SYSTEM_DATABASES,
@@ -1190,6 +1261,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
+/*#endregion 07-DATABASES-PARSE */
+
+/*#region 08-TABLES-PARSE -- @Tables recursive CTE parser, #SelectedTables */
     ----------------------------------------------------------------------------
     -- Parse @Tables (Ola Hallengren pattern)
     -- Supports: schema.table, wildcards (%), exclusions (-), comma-separated.
@@ -1300,6 +1374,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         END
     END
 
+/*#endregion 08-TABLES-PARSE */
+
+/*#region 09-TEMP-TABLES -- #Targets and #ExecLog creation */
     ----------------------------------------------------------------------------
     -- Temp tables (shared across database iterations)
     ----------------------------------------------------------------------------
@@ -1349,6 +1426,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         has_schema_bound_views   bit            NOT NULL DEFAULT 0,
         has_indexed_views        bit            NOT NULL DEFAULT 0,
         data_space_name          sysname        NULL,
+        has_fk_references        bit            NOT NULL DEFAULT 0,
+        fk_ref_count             int            NOT NULL DEFAULT 0,
         verify_command           nvarchar(max)  NULL,
         prev_forwarded_pct       decimal(6,2)   NULL,
         rebuilds_in_90d          int            NULL,
@@ -1382,6 +1461,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         error_message nvarchar(4000) NULL
     );
 
+/*#endregion 09-TEMP-TABLES */
+
+/*#region 10-RESUME-LOAD -- @ResumeRunID loading from HEAP_SCAN_SUMMARY XML */
     ----------------------------------------------------------------------------
     -- @ResumeRunID: load targets from a prior plan-only HEAP_SCAN_SUMMARY
     ----------------------------------------------------------------------------
@@ -1475,6 +1557,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             usage_hint, ranking_score,
             heap_compression, replication_hint, lock_escalation,
             partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
+            has_fk_references, fk_ref_count,
             sort_order,
             prev_forwarded_pct, rebuilds_in_90d,
             size_mb, est_space_savings_mb, est_ci_swap_overhead_mb, est_log_mb,
@@ -1517,6 +1600,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             ISNULL(t.c.value(N'@HasSchemaBoundViews',  N'bit'), 0),
             ISNULL(t.c.value(N'@HasIndexedViews',      N'bit'), 0),
             t.c.value(N'@DataSpaceName',        N'sysname'),
+            ISNULL(t.c.value(N'@HasFkReferences',      N'bit'), 0),
+            ISNULL(t.c.value(N'@FkRefCount',           N'int'), 0),
             t.c.value(N'@SortOrder',             N'int'),
             t.c.value(N'@PrevForwardedPct',      N'decimal(6,2)'),
             t.c.value(N'@RebuildsIn90d',         N'int'),
@@ -1630,6 +1715,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END
 
+/*#endregion 10-RESUME-LOAD */
+
+/*#region 11-UPTIME -- sqlserver_start_time, uptime normalization */
     ----------------------------------------------------------------------------
     -- Uptime capture (always, for result set context and fetch-rate normalization)
     ----------------------------------------------------------------------------
@@ -1641,6 +1729,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     -- Guard: minimum 1 hour to avoid division-by-near-zero on fresh restarts
     SET @UptimeHours = CASE WHEN @UptimeHours < 1.0 THEN 1.0 ELSE @UptimeHours END;
 
+/*#endregion 11-UPTIME */
+
+/*#region 12-DISCOVERY -- Per-database discovery loop (dynamic SQL) */
     ----------------------------------------------------------------------------
     -- Per-database discovery loop (skipped in resume mode)
     ----------------------------------------------------------------------------
@@ -1718,7 +1809,9 @@ CREATE TABLE #Heaps
     partition_count        int           NOT NULL DEFAULT 1,           -- #27: partitioned heap detection
     has_schema_bound_views bit           NOT NULL DEFAULT 0,           -- #42: schema-bound views block CI swap
     has_indexed_views      bit           NOT NULL DEFAULT 0,           -- #50: indexed views block CI swap
-    data_space_name        sysname       NULL                          -- #26: filegroup for CI swap ON clause
+    data_space_name        sysname       NULL,                         -- #26: filegroup for CI swap ON clause
+    has_fk_references      bit           NOT NULL DEFAULT 0,           -- #44: FKs referencing this heap
+    fk_ref_count           int           NOT NULL DEFAULT 0            -- #44: count of FK references TO this heap
 );
 
 CREATE TABLE #CpuByPlan
@@ -1793,7 +1886,7 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
 SET ANSI_WARNINGS OFF;  -- suppress "Null value is eliminated by an aggregate" from DMV aggregation
 
-INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation, partition_count, has_schema_bound_views, has_indexed_views, data_space_name)
+INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation, partition_count, has_schema_bound_views, has_indexed_views, data_space_name, has_fk_references, fk_ref_count)
 SELECT
     ho.object_id,
     ho.schema_name,
@@ -1828,7 +1921,10 @@ SELECT
     -- #50: Indexed views referencing this heap
     ISNULL(ixv.has_indexed_views, 0),
     -- #26: Filegroup name for CI swap ON clause
-    fg.filegroup_name
+    fg.filegroup_name,
+    -- #44: Foreign key references TO this heap
+    ISNULL(fkr.has_fk_references, 0),
+    ISNULL(fkr.fk_ref_count, 0)
 FROM #HeapObjects ho
 CROSS APPLY (
     -- Aggregate per-partition rows for partitioned heaps.
@@ -1895,6 +1991,15 @@ OUTER APPLY (
     JOIN sys.data_spaces ds ON i.data_space_id = ds.data_space_id
     WHERE i.object_id = ho.object_id AND i.index_id = 0
 ) fg
+OUTER APPLY (
+    -- #44: Foreign keys referencing this heap (the heap is the referenced/parent table).
+    -- CI swap changes the row locator from RID to CI key; FK lookups may change performance.
+    SELECT
+        CAST(CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS bit) AS has_fk_references,
+        COUNT(*) AS fk_ref_count
+    FROM sys.foreign_keys fk
+    WHERE fk.referenced_object_id = ho.object_id
+) fkr
 WHERE ips.forwarded_record_count > 0
   AND ips.page_count >= @MinPages_param
   AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param)
@@ -2045,6 +2150,8 @@ Ranked AS
         h.has_schema_bound_views,
         h.has_indexed_views,
         h.data_space_name,
+        h.has_fk_references,
+        h.fk_ref_count,
         -- Leftover temp CI from failed previous run
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = h.object_id
              AND name = N''CX__Temp__'' + LEFT(h.table_name, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
@@ -2120,6 +2227,7 @@ INSERT #Targets
     key_source_index, temp_key_cols, has_lob_columns, heap_compression,
     replication_hint, lock_escalation,
     partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
+    has_fk_references, fk_ref_count,
     action_chosen, command_text, ci_drop_command,
     qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
     qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count, qs_query_hashes,
@@ -2135,6 +2243,7 @@ SELECT TOP (@TopN_param)
     r.key_source_index, r.temp_key_cols, r.has_lob_columns, r.heap_compression,
     r.replication_hint, r.lock_escalation,
     r.partition_count, r.has_schema_bound_views, r.has_indexed_views, r.data_space_name,
+    r.has_fk_references, r.fk_ref_count,
     -- action_chosen (8I: forced plans prevent CI swap; #53: CDC blocks CI swap; #27: partitioned heaps skip CI swap)
     CASE
         WHEN @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
@@ -2358,6 +2467,29 @@ BEGIN
     CLOSE sv_cursor;
     DEALLOCATE sv_cursor;
 END
+
+-- #44: FK reference warnings (informational -- FK relationships survive CI swap, but lookup paths change)
+IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME() AND has_fk_references = 1
+           AND action_chosen = ''CI_SWAP_ONLINE'')
+BEGIN
+    DECLARE fk_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT schema_name, table_name, fk_ref_count FROM #Targets
+        WHERE database_name = DB_NAME() AND has_fk_references = 1
+          AND action_chosen = ''CI_SWAP_ONLINE'';
+    DECLARE @fk_schema sysname, @fk_table sysname, @fk_cnt int;
+    OPEN fk_cursor;
+    FETCH NEXT FROM fk_cursor INTO @fk_schema, @fk_table, @fk_cnt;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @Msg_inner = N''  INFO: '' + QUOTENAME(@fk_schema) + N''.'' + QUOTENAME(@fk_table)
+            + N'' has '' + CAST(@fk_cnt AS nvarchar(10)) + N'' foreign key(s) referencing it. ''
+            + N''CI swap will change FK lookup path from RID to CI key. Verify FK query performance after rebuild.'';
+        RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+        FETCH NEXT FROM fk_cursor INTO @fk_schema, @fk_table, @fk_cnt;
+    END
+    CLOSE fk_cursor;
+    DEALLOCATE fk_cursor;
+END
 ';
 
         -- QS enrichment: after structural ranking + INSERT #Targets, enrich with CPU data.
@@ -2576,6 +2708,9 @@ END
         END
     END
 
+/*#endregion 12-DISCOVERY */
+
+/*#region 13-QS-RERANK -- QUERY_STORE global re-rank after discovery */
     /*
     QUERY_STORE re-rank: after per-database discovery + enrichment, recalculate
     ranking_score with updated CPU data and reassign sort_order globally.
@@ -2611,6 +2746,9 @@ END
         UPDATE Reranked SET sort_order = new_rank;
     END
 
+/*#endregion 13-QS-RERANK */
+
+/*#region 14-QUICKIESTORE -- sp_QuickieStore path (single-database) */
     /*
     QUICKIESTORE: handled outside the database loop because sp_QuickieStore
     typically runs in the current database context and returns cross-database results.
@@ -2828,6 +2966,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
     END -- IF @resume_loaded = 0 (skip discovery + QUICKIESTORE in resume mode)
 
+/*#endregion 14-QUICKIESTORE */
+
+/*#region 15-POST-DISCOVERY -- Target count, warnings, zero-target exit */
     ----------------------------------------------------------------------------
     -- Final target count
     ----------------------------------------------------------------------------
@@ -3011,6 +3152,40 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         END
     END
 
+    -- #20: Tempdb free space pre-flight check for CI swap targets
+    IF EXISTS (SELECT 1 FROM #Targets WHERE action_chosen = 'CI_SWAP_ONLINE')
+    BEGIN
+        DECLARE @tempdb_free_mb decimal(18,2) = NULL;
+        DECLARE @largest_ci_swap_mb decimal(18,2);
+        DECLARE @largest_ci_swap_table sysname;
+
+        BEGIN TRY
+            SELECT @tempdb_free_mb = SUM(unallocated_extent_page_count) * 8.0 / 1024.0
+            FROM tempdb.sys.dm_db_file_space_usage;
+        END TRY
+        BEGIN CATCH
+            SET @tempdb_free_mb = NULL;
+        END CATCH
+
+        -- Estimate tempdb sort space: page_count * 8KB * 1.2 (20% buffer) converted to MB
+        SELECT TOP (1)
+            @largest_ci_swap_mb = CAST(page_count * 8.0 * 1.2 / 1024.0 AS decimal(18,2)),
+            @largest_ci_swap_table = QUOTENAME(database_name) + N'.' + QUOTENAME(schema_name) + N'.' + QUOTENAME(table_name)
+        FROM #Targets
+        WHERE action_chosen = 'CI_SWAP_ONLINE'
+        ORDER BY page_count DESC;
+
+        IF @tempdb_free_mb IS NOT NULL AND @largest_ci_swap_mb IS NOT NULL
+           AND @largest_ci_swap_mb > @tempdb_free_mb
+        BEGIN
+            SET @Msg = N'WARNING: Tempdb has ' + CAST(CAST(@tempdb_free_mb AS int) AS nvarchar(20))
+                     + N' MB free. Largest CI swap target (' + @largest_ci_swap_table
+                     + N') requires approximately ' + CAST(CAST(@largest_ci_swap_mb AS int) AS nvarchar(20))
+                     + N' MB for sort space. Consider reducing concurrent maintenance jobs or increasing tempdb.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+    END
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     IF @TargetCount = 0
@@ -3101,6 +3276,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         DEALLOCATE dbg_tgt;
     END
 
+/*#endregion 15-POST-DISCOVERY */
+
+/*#region 16-THROUGHPUT -- History-based throughput estimation */
     ----------------------------------------------------------------------------
     -- Throughput estimation (history-based)
     ----------------------------------------------------------------------------
@@ -3206,6 +3384,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END
 
+/*#endregion 16-THROUGHPUT */
+
+/*#region 17-FILTERS-PROJECTIONS -- Write-heavy, trending, impact projections, churn */
     -- Warn about write-heavy heaps (rebuilding is a band-aid for staging/ETL tables)
     IF EXISTS (SELECT 1 FROM #Targets WHERE usage_hint IS NOT NULL)
     BEGIN
@@ -3364,6 +3545,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         END
     END
 
+/*#endregion 17-FILTERS-PROJECTIONS */
+
+/*#region 18-OBFUSCATION -- Encrypted mapping, pseudo_ columns */
     ----------------------------------------------------------------------------
     -- Obfuscation: build encrypted mapping, then populate pseudo_ columns.
     -- Must build mapping FIRST (needs real names), then populate pseudonyms.
@@ -3495,6 +3679,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END
 
+/*#endregion 18-OBFUSCATION */
+
+/*#region 19-OUTPUT -- Result set SELECT */
     ----------------------------------------------------------------------------
     -- Output: target list + commands (single result set for INSERT...EXEC compatibility)
     ----------------------------------------------------------------------------
@@ -3537,6 +3724,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         partition_count,
         CAST(has_schema_bound_views AS int) AS has_schema_bound_views,
         CAST(has_indexed_views AS int) AS has_indexed_views,
+        CAST(has_fk_references AS int) AS has_fk_references,
+        fk_ref_count,
         data_space_name AS filegroup_name,
         CASE WHEN @obfuscate = 1 THEN pseudo_command_text   ELSE command_text   END AS command_text,
         CASE WHEN @obfuscate = 1 THEN pseudo_ci_drop        ELSE ci_drop_command END AS ci_drop_command,
@@ -3553,6 +3742,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     FROM #Targets
     ORDER BY sort_order;
 
+/*#endregion 19-OUTPUT */
+
+/*#region 20-SCAN-SUMMARY -- HEAP_SCAN_SUMMARY CommandLog entry */
     ----------------------------------------------------------------------------
     -- Plan-only scan logging: persist discovery results to CommandLog
     ----------------------------------------------------------------------------
@@ -3674,6 +3866,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             CAST(has_schema_bound_views AS int) AS HasSchemaBoundViews,
                             CAST(has_indexed_views AS int) AS HasIndexedViews,
                             data_space_name AS DataSpaceName,
+                            CAST(has_fk_references AS int) AS HasFkReferences,
+                            fk_ref_count AS FkRefCount,
                             sort_order AS SortOrder,
                             est_pages_per_sec AS EstPagesPerSec,
                             est_seconds AS EstSeconds,
@@ -3701,6 +3895,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         );
     END
 
+/*#endregion 20-SCAN-SUMMARY */
+
+/*#region 21-EXECUTION -- WHILE loop with rebuilds */
     ----------------------------------------------------------------------------
     -- Execute if requested
     ----------------------------------------------------------------------------
@@ -3787,7 +3984,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @pseudo_tbl             sysname,
             @pseudo_cmd             nvarchar(max),
             @pseudo_ci_drop         nvarchar(max),
-            @pseudo_cur_index_name  sysname;
+            @pseudo_cur_index_name  sysname,
+            -- #33: LOB re-check at execution time
+            @cur_heap_compression   tinyint,
+            @cur_has_lob            bit,
+            -- #49: Log space pre-flight check
+            @cur_log_free_mb        decimal(18,2),
+            @cur_est_log_mb         decimal(18,2);
 
         /*
         Build LOCK_TIMEOUT prefix/suffix to prepend/append to each command.
@@ -3892,6 +4095,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @cur_nci_count         = nci_count,
                 @cur_est_seconds       = est_seconds,
                 @cur_days_since_rebuild = days_since_last_rebuild,
+                @cur_heap_compression  = heap_compression,
+                @cur_est_log_mb        = est_log_mb,
                 -- Obfuscation: pseudo values (NULL when not obfuscating)
                 @pseudo_db             = pseudo_database_name,
                 @pseudo_schema         = pseudo_schema_name,
@@ -3930,6 +4135,136 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          ELSE @full END,
                     @action, SYSDATETIME(), SYSDATETIME(), NULL, N'SKIPPED: Object no longer exists.');
                 CONTINUE;
+            END
+
+            /*
+            #33: LOB column re-check for CI swap targets (TOCTOU defense).
+            Schema may have changed since discovery (especially with @ResumeRunID).
+            If LOB columns were added after discovery, fall back to heap rebuild.
+            */
+            SET @cur_has_lob = 0;
+            IF @action = 'CI_SWAP_ONLINE'
+            BEGIN
+                SET @verify_sql = N'SELECT @has_lob = CASE WHEN EXISTS (
+                    SELECT 1 FROM ' + QUOTENAME(@db) + N'.sys.columns c
+                    WHERE c.object_id = OBJECT_ID(@full_param)
+                      AND c.is_computed = 0
+                      AND (c.max_length = -1 OR c.system_type_id IN (34, 35, 99, 241))
+                ) THEN 1 ELSE 0 END;';
+                BEGIN TRY
+                    EXEC sys.sp_executesql @verify_sql,
+                        N'@full_param nvarchar(512), @has_lob bit OUTPUT',
+                        @full_param = @full, @has_lob = @cur_has_lob OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @cur_has_lob = 0; -- don't block on metadata errors
+                END CATCH
+
+                IF @cur_has_lob = 1
+                BEGIN
+                    SET @Msg = N'  WARNING: LOB column detected on ' + @full + N' at execution time (schema changed since discovery). Falling back to heap rebuild.';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+                    -- Generate fallback ALTER TABLE REBUILD command
+                    SET @action = CASE WHEN @Online = 1 THEN 'HEAP_REBUILD_ONLINE' ELSE 'HEAP_REBUILD_OFFLINE' END;
+                    SET @cmd = N'ALTER TABLE ' + @full + N' REBUILD'
+                        + CASE WHEN @Online = 1 OR @cur_heap_compression > 0 OR @Maxdop IS NOT NULL
+                            THEN N' WITH ('
+                                + CASE WHEN @Online = 1 THEN N'ONLINE = ON' ELSE N'' END
+                                + CASE WHEN @Online = 1 AND (@cur_heap_compression > 0 OR @Maxdop IS NOT NULL) THEN N', ' ELSE N'' END
+                                + CASE WHEN @cur_heap_compression = 1 THEN N'DATA_COMPRESSION = ROW'
+                                       WHEN @cur_heap_compression = 2 THEN N'DATA_COMPRESSION = PAGE'
+                                       ELSE N'' END
+                                + CASE WHEN @cur_heap_compression > 0 AND @Maxdop IS NOT NULL THEN N', ' ELSE N'' END
+                                + ISNULL(N'MAXDOP = ' + CAST(@Maxdop AS nvarchar(10)), N'')
+                                + N')'
+                            ELSE N'' END
+                        + N';';
+                    SET @ci_drop = NULL;
+                    SET @cur_index_name = NULL;
+                    SET @pseudo_cur_index_name = NULL;
+
+                    -- Update #Targets so ExecLog/CommandLog reflect the fallback
+                    UPDATE #Targets
+                    SET action_chosen = @action,
+                        command_text = @cmd,
+                        ci_drop_command = NULL,
+                        has_lob_columns = 1
+                    WHERE target_id = @tid;
+                END
+            END
+
+            /*
+            #49: Log space pre-flight check before rebuild.
+            Compare est_log_mb against available log free space.
+            Skip rebuild if estimated log consumption exceeds available free space.
+            */
+            IF @cur_est_log_mb IS NOT NULL AND @cur_est_log_mb > 0
+            BEGIN
+                SET @cur_log_free_mb = NULL;
+                SET @verify_sql = N'USE ' + QUOTENAME(@db) + N';
+                    SELECT @free = SUM(CAST(size AS bigint) * 8.0 / 1024.0
+                                     - CAST(FILEPROPERTY(name, N''SpaceUsed'') AS bigint) * 8.0 / 1024.0)
+                    FROM sys.database_files WHERE type = 1;';
+                BEGIN TRY
+                    EXEC sys.sp_executesql @verify_sql,
+                        N'@free decimal(18,2) OUTPUT',
+                        @free = @cur_log_free_mb OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @cur_log_free_mb = NULL; -- can't determine, proceed
+                END CATCH
+
+                IF @cur_log_free_mb IS NOT NULL AND @cur_est_log_mb > @cur_log_free_mb
+                BEGIN
+                    SET @Msg = N'  SKIPPED: ' + @full + N' - estimated log consumption ('
+                        + CAST(CAST(@cur_est_log_mb AS int) AS nvarchar(20)) + N' MB) exceeds available log free space ('
+                        + CAST(CAST(@cur_log_free_mb AS int) AS nvarchar(20)) + N' MB). '
+                        + N'Free log space or increase log file size before rebuilding.';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    SET @skipped_cnt += 1;
+                    INSERT #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
+                    VALUES (@tid,
+                        CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
+                        CASE WHEN @obfuscate = 1
+                             THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                             ELSE @full END,
+                        @action, SYSDATETIME(), SYSDATETIME(), NULL,
+                        N'SKIPPED: LOG_SPACE_INSUFFICIENT (est=' + CAST(CAST(@cur_est_log_mb AS int) AS nvarchar(20))
+                            + N'MB, free=' + CAST(CAST(@cur_log_free_mb AS int) AS nvarchar(20)) + N'MB)');
+
+                    IF @commandlog_exists = 1
+                    BEGIN
+                        INSERT INTO dbo.CommandLog
+                            (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
+                             Command, CommandType,
+                             StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+                        VALUES
+                        (
+                            CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
+                            CASE WHEN @obfuscate = 1 THEN @pseudo_schema ELSE @schema END,
+                            CASE WHEN @obfuscate = 1 THEN @pseudo_tbl ELSE @tbl END,
+                            N'U',
+                            @cur_index_name,
+                            0,
+                            CASE WHEN @obfuscate = 1 THEN @pseudo_cmd ELSE @cmd END,
+                            @action,
+                            SYSDATETIME(),
+                            SYSDATETIME(),
+                            NULL,
+                            N'SKIPPED: LOG_SPACE_INSUFFICIENT',
+                            (
+                                SELECT
+                                    @Version AS Version,
+                                    @cur_est_log_mb AS EstLogMB,
+                                    @cur_log_free_mb AS LogFreeMB,
+                                    @RunID AS RunID
+                                FOR XML RAW(N'ExtendedInfo'), ELEMENTS
+                            )
+                        );
+                    END
+                    CONTINUE;
+                END
             END
 
             /*
@@ -4601,6 +4936,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         SELECT * FROM #ExecLog ORDER BY start_time, target_id;
     END
 
+/*#endregion 21-EXECUTION */
+
+/*#region 22-CLEANUP -- Output parameters, sp_releaseapplock, RETURN */
     -- Populate output parameters for automation
     SET @TargetsFound = @TargetCount;
     IF @PlanOnly = 0
@@ -4621,3 +4959,4 @@ GO
 
 EXEC sp_MS_marksystemobject 'sp_HeapDoctor';
 GO
+/*#endregion 22-CLEANUP */

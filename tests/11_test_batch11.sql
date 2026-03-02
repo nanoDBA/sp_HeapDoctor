@@ -4,7 +4,7 @@ sp_HeapDoctor Test Harness - Batch 11: Enhanced Logging & Impact Projections
 Tests Batch 11 additions:
   -- Smoke Tests --
   11A - size_mb column populated and correct (page_count / 128)
-  11B - Version is 1.0.2026.0227
+  11B - Version is 1.0.2026.0302b
 
   -- Unit Tests (deterministic) --
   11C - size_mb = page_count / 128.0 for all targets (arithmetic check)
@@ -82,6 +82,8 @@ CREATE TABLE #Results
     partition_count        int           NULL,
     has_schema_bound_views int           NULL,
     has_indexed_views      int           NULL,
+    has_fk_references      int           NULL,
+    fk_ref_count           int           NULL,
     filegroup_name         sysname       NULL,
     command_text           nvarchar(max) NULL,
     ci_drop_command        nvarchar(max) NULL,
@@ -162,20 +164,20 @@ END
 GO
 
 ------------------------------------------------------------------------
--- 11B: Smoke test - Version is 1.0.2026.0227
+-- 11B: Smoke test - Version is 1.0.2026.0302b
 ------------------------------------------------------------------------
 RAISERROR(N'--- 11B: Version check ---', 10, 1) WITH NOWAIT;
 
-IF EXISTS (SELECT 1 FROM #Results WHERE version = N'1.0.2026.0227')
+IF EXISTS (SELECT 1 FROM #Results WHERE version = N'1.0.2026.0302b')
 BEGIN
-    RAISERROR(N'  PASS 11B: Version is 1.0.2026.0227.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 11B: Version is 1.0.2026.0302b.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @actual_ver nvarchar(20);
     SELECT TOP 1 @actual_ver = version FROM #Results;
-    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version 1.0.2026.0227, got ' + ISNULL(@actual_ver, N'NULL');
+    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version 1.0.2026.0302b, got ' + ISNULL(@actual_ver, N'NULL');
     RAISERROR(@ver_msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
