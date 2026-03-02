@@ -50,9 +50,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0226
+Version:    1.0.2026.0227
 
-History:    1.0.2026.0226 - GitHub issues #1-3, #7-12: observability, filtering, HEAP_SCAN_SUMMARY enhancements
+History:    1.0.2026.0227 - CI swap safety guards (#26, #27, #32, #42, #43, #46, #50, #53)
+                          - SET XACT_ABORT OFF at proc start (prevents CATCH block skip when caller sets ON)
+                          - Computed columns excluded from CandidateKeys CTE (c.is_computed = 0)
+                          - Schema-bound view detection: CI swap blocked, falls back to heap rebuild
+                          - Indexed view detection: CI swap blocked, falls back to heap rebuild
+                          - CDC-tracked tables: CI swap blocked to protect capture instances
+                          - Partitioned heap detection: CI swap blocked (partition_count > 1)
+                          - Filegroup-aware CI swap: ON [filegroup] clause preserves heap's data_space
+                          - Row count validation after rebuild (warns on > 1% + 10 row variance)
+                          - New result set columns: partition_count, has_schema_bound_views, has_indexed_views, filegroup_name
+                          - HEAP_SCAN_SUMMARY XML and resume mode updated for new columns
+                          - Test runner regex fix for PASS/FAIL counting (#14)
+            1.0.2026.0226 - GitHub issues #1-3, #7-12: observability, filtering, HEAP_SCAN_SUMMARY enhancements
                           - Full @invocation_command in CommandLog Command column (fixes truncation)
                           - sqlserver_start_time/uptime_hours in result set and HEAP_SCAN_SUMMARY XML
                           - ranking_algo_version column in result set and HEAP_SCAN_SUMMARY XML
@@ -470,8 +482,9 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0226';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0227';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -561,8 +574,9 @@ RESUME PARAMETER:
   @Tables and @TopN are applied as post-load filters (select a subset to execute).
   Execution params (@MaxRunSeconds, @LockTimeoutMs) are honored.
   Cannot resume obfuscated scans. Version must match.
+', 10, 1) WITH NOWAIT;
 
-EXAMPLES:
+        RAISERROR(N'EXAMPLES:
   EXEC sp_HeapDoctor;
   EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @PlanOnly = 0;
   EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @Execute = N''Y'';
@@ -1331,6 +1345,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         heap_compression         tinyint        NOT NULL DEFAULT 0,
         replication_hint         varchar(20)    NULL,
         lock_escalation          tinyint        NOT NULL DEFAULT 0,
+        partition_count          int            NOT NULL DEFAULT 1,
+        has_schema_bound_views   bit            NOT NULL DEFAULT 0,
+        has_indexed_views        bit            NOT NULL DEFAULT 0,
+        data_space_name          sysname        NULL,
         verify_command           nvarchar(max)  NULL,
         prev_forwarded_pct       decimal(6,2)   NULL,
         rebuilds_in_90d          int            NULL,
@@ -1456,6 +1474,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             est_pages_per_sec, est_seconds, est_duration,
             usage_hint, ranking_score,
             heap_compression, replication_hint, lock_escalation,
+            partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
             sort_order,
             prev_forwarded_pct, rebuilds_in_90d,
             size_mb, est_space_savings_mb, est_ci_swap_overhead_mb, est_log_mb,
@@ -1494,6 +1513,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             t.c.value(N'@HeapCompression',       N'tinyint'),
             t.c.value(N'@ReplicationHint',       N'varchar(20)'),
             t.c.value(N'@LockEscalation',        N'tinyint'),
+            ISNULL(t.c.value(N'@PartitionCount',       N'int'), 1),
+            ISNULL(t.c.value(N'@HasSchemaBoundViews',  N'bit'), 0),
+            ISNULL(t.c.value(N'@HasIndexedViews',      N'bit'), 0),
+            t.c.value(N'@DataSpaceName',        N'sysname'),
             t.c.value(N'@SortOrder',             N'int'),
             t.c.value(N'@PrevForwardedPct',      N'decimal(6,2)'),
             t.c.value(N'@RebuildsIn90d',         N'int'),
@@ -1691,7 +1714,11 @@ CREATE TABLE #Heaps
     user_updates           bigint        NULL,
     heap_compression       tinyint       NOT NULL DEFAULT 0,
     replication_hint       varchar(20)   NULL,
-    lock_escalation        tinyint       NOT NULL DEFAULT 0
+    lock_escalation        tinyint       NOT NULL DEFAULT 0,
+    partition_count        int           NOT NULL DEFAULT 1,           -- #27: partitioned heap detection
+    has_schema_bound_views bit           NOT NULL DEFAULT 0,           -- #42: schema-bound views block CI swap
+    has_indexed_views      bit           NOT NULL DEFAULT 0,           -- #50: indexed views block CI swap
+    data_space_name        sysname       NULL                          -- #26: filegroup for CI swap ON clause
 );
 
 CREATE TABLE #CpuByPlan
@@ -1766,7 +1793,7 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
 SET ANSI_WARNINGS OFF;  -- suppress "Null value is eliminated by an aggregate" from DMV aggregation
 
-INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation)
+INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation, partition_count, has_schema_bound_views, has_indexed_views, data_space_name)
 SELECT
     ho.object_id,
     ho.schema_name,
@@ -1793,7 +1820,15 @@ SELECT
         WHEN tp.is_tracked_by_cdc = 1 THEN N''CDC''
         ELSE NULL
     END,
-    ISNULL(tp.lock_escalation, 0)
+    ISNULL(tp.lock_escalation, 0),
+    -- #27: Partition count for partitioned heap detection
+    ISNULL(pc.partition_count, 1),
+    -- #42: Schema-bound views referencing this heap
+    ISNULL(sbv.has_schema_bound_views, 0),
+    -- #50: Indexed views referencing this heap
+    ISNULL(ixv.has_indexed_views, 0),
+    -- #26: Filegroup name for CI swap ON clause
+    fg.filegroup_name
 FROM #HeapObjects ho
 CROSS APPLY (
     -- Aggregate per-partition rows for partitioned heaps.
@@ -1829,6 +1864,37 @@ OUTER APPLY (
     FROM sys.tables t
     WHERE t.object_id = ho.object_id
 ) tp
+OUTER APPLY (
+    -- #27: Count partitions for partitioned heap detection.
+    SELECT COUNT(*) AS partition_count
+    FROM sys.partitions
+    WHERE object_id = ho.object_id AND index_id = 0
+) pc
+OUTER APPLY (
+    -- #42: Detect schema-bound views referencing this table (CI swap DDL will fail).
+    SELECT CAST(CASE WHEN EXISTS (
+        SELECT 1 FROM sys.sql_expression_dependencies sed
+        JOIN sys.views v ON sed.referencing_id = v.object_id
+        WHERE sed.referenced_id = ho.object_id
+          AND OBJECTPROPERTY(v.object_id, N''IsSchemaBound'') = 1
+    ) THEN 1 ELSE 0 END AS bit) AS has_schema_bound_views
+) sbv
+OUTER APPLY (
+    -- #50: Detect indexed views referencing this table (CI swap may fail or be slow).
+    SELECT CAST(CASE WHEN EXISTS (
+        SELECT 1 FROM sys.sql_expression_dependencies sed
+        JOIN sys.views v ON sed.referencing_id = v.object_id
+        JOIN sys.indexes i ON i.object_id = v.object_id AND i.type = 1
+        WHERE sed.referenced_id = ho.object_id
+    ) THEN 1 ELSE 0 END AS bit) AS has_indexed_views
+) ixv
+OUTER APPLY (
+    -- #26: Filegroup name for the heap (index_id=0). CI swap must land on same filegroup.
+    SELECT ds.name AS filegroup_name
+    FROM sys.indexes i
+    JOIN sys.data_spaces ds ON i.data_space_id = ds.data_space_id
+    WHERE i.object_id = ho.object_id AND i.index_id = 0
+) fg
 WHERE ips.forwarded_record_count > 0
   AND ips.page_count >= @MinPages_param
   AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param)
@@ -1937,6 +2003,7 @@ CandidateKeys AS
       AND ic.key_ordinal > 0
       AND c.is_nullable = 0
       AND ISNULL(c.encryption_type, 0) = 0
+      AND c.is_computed = 0                        -- exclude computed columns (#46)
       AND c.max_length <> -1
       AND t.name NOT IN (N''text'',N''ntext'',N''image'',N''xml'')
     GROUP BY i.object_id, i.name
@@ -1974,6 +2041,10 @@ Ranked AS
         h.heap_compression,
         h.replication_hint,
         h.lock_escalation,
+        h.partition_count,
+        h.has_schema_bound_views,
+        h.has_indexed_views,
+        h.data_space_name,
         -- Leftover temp CI from failed previous run
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = h.object_id
              AND name = N''CX__Temp__'' + LEFT(h.table_name, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
@@ -2048,6 +2119,7 @@ INSERT #Targets
     total_cpu_ms, ranking_basis, nci_count,
     key_source_index, temp_key_cols, has_lob_columns, heap_compression,
     replication_hint, lock_escalation,
+    partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
     action_chosen, command_text, ci_drop_command,
     qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
     qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count, qs_query_hashes,
@@ -2062,11 +2134,16 @@ SELECT TOP (@TopN_param)
     r.ranking_basis, r.nci_count,
     r.key_source_index, r.temp_key_cols, r.has_lob_columns, r.heap_compression,
     r.replication_hint, r.lock_escalation,
-    -- action_chosen (8I: forced plans prevent CI swap)
+    r.partition_count, r.has_schema_bound_views, r.has_indexed_views, r.data_space_name,
+    -- action_chosen (8I: forced plans prevent CI swap; #53: CDC blocks CI swap; #27: partitioned heaps skip CI swap)
     CASE
         WHEN @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
              AND r.temp_key_cols IS NOT NULL AND r.has_lob_columns = 0
              AND r.has_forced_plans = 0
+             AND (r.replication_hint IS NULL OR r.replication_hint NOT LIKE N''%%CDC%%'')  -- #53: CDC breaks capture instance
+             AND r.partition_count <= 1                                                    -- #27: partitioned heaps cannot CI swap
+             AND r.has_schema_bound_views = 0                                              -- #42: schema-bound views block CI swap
+             AND r.has_indexed_views = 0                                                   -- #50: indexed views block CI swap
             THEN ''CI_SWAP_ONLINE''
         WHEN @Online_param = 1 THEN ''HEAP_REBUILD_ONLINE''
         ELSE ''HEAP_REBUILD_OFFLINE''
@@ -2076,6 +2153,10 @@ SELECT TOP (@TopN_param)
         WHEN @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
              AND r.temp_key_cols IS NOT NULL AND r.has_lob_columns = 0
              AND r.has_forced_plans = 0
+             AND (r.replication_hint IS NULL OR r.replication_hint NOT LIKE N''%%CDC%%'')
+             AND r.partition_count <= 1
+             AND r.has_schema_bound_views = 0
+             AND r.has_indexed_views = 0
         THEN
             -- Leftover temp CI cleanup: prepend DROP if a previous run left a temp CI
             CASE WHEN r.has_leftover_ci = 1
@@ -2089,7 +2170,10 @@ SELECT TOP (@TopN_param)
             CASE WHEN r.heap_compression = 1 THEN N'', DATA_COMPRESSION = ROW''
                  WHEN r.heap_compression = 2 THEN N'', DATA_COMPRESSION = PAGE''
                  ELSE N'''' END +
-            COALESCE(N'', MAXDOP = '' + CAST(@Maxdop_param AS nvarchar(10)), N'''') + N'');''
+            COALESCE(N'', MAXDOP = '' + CAST(@Maxdop_param AS nvarchar(10)), N'''') + N'')'' +
+            -- #26: CI swap must land on same filegroup as the heap
+            CASE WHEN r.data_space_name IS NOT NULL AND r.data_space_name <> N''PRIMARY''
+                 THEN N'' ON '' + QUOTENAME(r.data_space_name) ELSE N'''' END + N'';''
         WHEN @Online_param = 1
         THEN
             N''ALTER TABLE '' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) +
@@ -2116,6 +2200,11 @@ SELECT TOP (@TopN_param)
     CASE
         WHEN @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
              AND r.temp_key_cols IS NOT NULL AND r.has_lob_columns = 0
+             AND r.has_forced_plans = 0
+             AND (r.replication_hint IS NULL OR r.replication_hint NOT LIKE N''%%CDC%%'')
+             AND r.partition_count <= 1
+             AND r.has_schema_bound_views = 0
+             AND r.has_indexed_views = 0
         THEN
             N''DROP INDEX '' +
             QUOTENAME(N''CX__Temp__'' + LEFT(r.table_name, 108)) +
@@ -2192,6 +2281,82 @@ BEGIN
     END
     CLOSE fp_cursor;
     DEALLOCATE fp_cursor;
+END
+
+-- #53: CDC CI swap guard warnings
+IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME()
+           AND action_chosen <> ''CI_SWAP_ONLINE''
+           AND replication_hint LIKE N''%%CDC%%''
+           AND temp_key_cols IS NOT NULL AND has_lob_columns = 0)
+BEGIN
+    DECLARE cdc_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT schema_name, table_name FROM #Targets
+        WHERE database_name = DB_NAME()
+          AND action_chosen <> ''CI_SWAP_ONLINE''
+          AND replication_hint LIKE N''%%CDC%%''
+          AND temp_key_cols IS NOT NULL AND has_lob_columns = 0;
+    DECLARE @cdc_schema sysname, @cdc_table sysname;
+    OPEN cdc_cursor;
+    FETCH NEXT FROM cdc_cursor INTO @cdc_schema, @cdc_table;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @Msg_inner = N''  WARNING: '' + QUOTENAME(@cdc_schema) + N''.'' + QUOTENAME(@cdc_table)
+            + N'' is CDC-tracked. Using heap rebuild instead of CI swap to protect capture instance.'';
+        RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+        FETCH NEXT FROM cdc_cursor INTO @cdc_schema, @cdc_table;
+    END
+    CLOSE cdc_cursor;
+    DEALLOCATE cdc_cursor;
+END
+
+-- #27: Partitioned heap warnings
+IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME()
+           AND partition_count > 1
+           AND temp_key_cols IS NOT NULL AND has_lob_columns = 0)
+BEGIN
+    DECLARE pt_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT schema_name, table_name, partition_count FROM #Targets
+        WHERE database_name = DB_NAME() AND partition_count > 1
+          AND temp_key_cols IS NOT NULL AND has_lob_columns = 0;
+    DECLARE @pt_schema sysname, @pt_table sysname, @pt_cnt int;
+    OPEN pt_cursor;
+    FETCH NEXT FROM pt_cursor INTO @pt_schema, @pt_table, @pt_cnt;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @Msg_inner = N''  WARNING: '' + QUOTENAME(@pt_schema) + N''.'' + QUOTENAME(@pt_table)
+            + N'' has '' + CAST(@pt_cnt AS nvarchar(10)) + N'' partitions. Using heap rebuild instead of CI swap.'';
+        RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+        FETCH NEXT FROM pt_cursor INTO @pt_schema, @pt_table, @pt_cnt;
+    END
+    CLOSE pt_cursor;
+    DEALLOCATE pt_cursor;
+END
+
+-- #42/#50: Schema-bound/indexed view warnings
+IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME()
+           AND (has_schema_bound_views = 1 OR has_indexed_views = 1)
+           AND temp_key_cols IS NOT NULL AND has_lob_columns = 0)
+BEGIN
+    DECLARE sv_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT schema_name, table_name, has_schema_bound_views, has_indexed_views FROM #Targets
+        WHERE database_name = DB_NAME()
+          AND (has_schema_bound_views = 1 OR has_indexed_views = 1)
+          AND temp_key_cols IS NOT NULL AND has_lob_columns = 0;
+    DECLARE @sv_schema sysname, @sv_table sysname, @sv_sb bit, @sv_ix bit;
+    OPEN sv_cursor;
+    FETCH NEXT FROM sv_cursor INTO @sv_schema, @sv_table, @sv_sb, @sv_ix;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @Msg_inner = N''  WARNING: '' + QUOTENAME(@sv_schema) + N''.'' + QUOTENAME(@sv_table)
+            + N'' has '' + CASE WHEN @sv_sb = 1 AND @sv_ix = 1 THEN N''schema-bound and indexed views''
+                                WHEN @sv_sb = 1 THEN N''schema-bound views''
+                                ELSE N''indexed views'' END
+            + N''. Using heap rebuild instead of CI swap.'';
+        RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+        FETCH NEXT FROM sv_cursor INTO @sv_schema, @sv_table, @sv_sb, @sv_ix;
+    END
+    CLOSE sv_cursor;
+    DEALLOCATE sv_cursor;
 END
 ';
 
@@ -3369,6 +3534,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         CASE heap_compression WHEN 1 THEN 'ROW' WHEN 2 THEN 'PAGE' ELSE 'NONE' END AS heap_compression,
         replication_hint,
         CASE lock_escalation WHEN 0 THEN 'TABLE' WHEN 1 THEN 'DISABLE' WHEN 2 THEN 'AUTO' ELSE 'UNKNOWN' END AS lock_escalation,
+        partition_count,
+        CAST(has_schema_bound_views AS int) AS has_schema_bound_views,
+        CAST(has_indexed_views AS int) AS has_indexed_views,
+        data_space_name AS filegroup_name,
         CASE WHEN @obfuscate = 1 THEN pseudo_command_text   ELSE command_text   END AS command_text,
         CASE WHEN @obfuscate = 1 THEN pseudo_ci_drop        ELSE ci_drop_command END AS ci_drop_command,
         CASE WHEN @obfuscate = 1 THEN pseudo_verify_cmd     ELSE verify_command  END AS verify_command,
@@ -3501,6 +3670,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             heap_compression AS HeapCompression,
                             replication_hint AS ReplicationHint,
                             lock_escalation AS LockEscalation,
+                            partition_count AS PartitionCount,
+                            CAST(has_schema_bound_views AS int) AS HasSchemaBoundViews,
+                            CAST(has_indexed_views AS int) AS HasIndexedViews,
+                            data_space_name AS DataSpaceName,
                             sort_order AS SortOrder,
                             est_pages_per_sec AS EstPagesPerSec,
                             est_seconds AS EstSeconds,
@@ -3571,6 +3744,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @err_message         nvarchar(4000),
             @verify_sql          nvarchar(max),
             @post_fwd_count      bigint,
+            @post_row_count      bigint,       -- #43: row count validation
             @ci_drop_failed      bit,
             @cur_index_name      sysname,
             -- QS performance snapshot (per-target, from #Targets)
@@ -4064,6 +4238,33 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     ELSE IF @post_fwd_count = 0
                     BEGIN
                         SET @Msg = N'  Verified: 0 forwarded records.';
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END
+                END
+
+                -- #43: Row count validation after rebuild (detect data loss)
+                IF @ci_drop_failed = 0 AND @cur_record_count IS NOT NULL
+                BEGIN
+                    BEGIN TRY
+                        SET @verify_sql = N'SELECT @rows_out = SUM(record_count)
+                            FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, ''SAMPLED'')
+                            WHERE index_id = 0;';
+                        SET @post_row_count = NULL;
+                        EXEC sys.sp_executesql @verify_sql,
+                            N'@db_param sysname, @full_param nvarchar(512), @rows_out bigint OUTPUT',
+                            @db_param = @db, @full_param = @full, @rows_out = @post_row_count OUTPUT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @post_row_count = NULL;
+                    END CATCH
+
+                    IF @post_row_count IS NOT NULL
+                       AND ABS(@post_row_count - @cur_record_count) > (@cur_record_count * 0.01 + 10)
+                    BEGIN
+                        SET @Msg = N'  WARNING: Row count changed from '
+                            + CAST(@cur_record_count AS nvarchar(20)) + N' to '
+                            + CAST(@post_row_count AS nvarchar(20)) + N' on ' + @full
+                            + N'. Investigate potential data loss or concurrent DML.';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
                 END

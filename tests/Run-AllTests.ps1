@@ -96,7 +96,13 @@ $ProcFile = Join-Path $RepoRoot "sp_HeapDoctor.sql"
 
 # Available test files in execution order
 $AllTests = [ordered]@{
+    # Plan-only tests first (before execution tests that rebuild heaps and change state)
     "02" = "02_test_planonly.sql"
+    "13" = "13_test_tables_param.sql"
+    "14" = "14_test_resume.sql"
+    "15" = "15_test_batch15.sql"
+    "16" = "16_test_ci_swap_safety.sql"
+    # Execution tests (rebuild heaps, change state)
     "03" = "03_test_execute.sql"
     "04" = "04_test_negative.sql"
     "05" = "05_test_batch6.sql"
@@ -374,8 +380,8 @@ ALTER DATABASE HeapDoctorTest SET MULTI_USER;
         }
 
         # Parse PASS/FAIL
-        $passLines = @($testOutput | Select-String "^\s*(\*+\s+)?(PASS: |PASS \d)")
-        $failLines = @($testOutput | Select-String "^\s*(\*+\s+)?(FAIL: |FAIL \d)")
+        $passLines = @($testOutput | Select-String "\bPASS[\s:]+\w")
+        $failLines = @($testOutput | Select-String "\bFAIL[\s:]+\w")
         $passCount = $passLines.Count
         $failCount = $failLines.Count
         $script:TotalPass += $passCount
@@ -478,8 +484,8 @@ WITH MOVE 'HeapDoctorTest' TO '/var/opt/mssql/data/${DbName}.mdf',
                     $sw.Stop()
 
                     # 3. Parse results
-                    $passLines = @($output | Select-String "^\s*(\*+\s+)?(PASS: |PASS \d)")
-                    $failLines = @($output | Select-String "^\s*(\*+\s+)?(FAIL: |FAIL \d)")
+                    $passLines = @($output | Select-String "\bPASS[\s:]+\w")
+                    $failLines = @($output | Select-String "\bFAIL[\s:]+\w")
 
                     [PSCustomObject]@{
                         TestNum     = $TestNum

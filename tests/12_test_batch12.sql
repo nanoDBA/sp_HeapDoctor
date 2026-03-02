@@ -3,7 +3,7 @@ sp_HeapDoctor Test Harness - Batch 12: Throughput/ETA Improvements
 
 Tests:
   -- Smoke Tests --
-  12A - Version is 1.0.2026.0226
+  12A - Version is 1.0.2026.0227
   12B - DurationMs populated in per-rebuild success ExtendedInfo
   12C - ActualPagesPerSec populated in per-rebuild success ExtendedInfo
 
@@ -99,11 +99,11 @@ WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_S
   AND ISNULL(ErrorNumber, 0) = 0
 ORDER BY ID;
 
-IF @12a_version = N'1.0.2026.0226'
-    RAISERROR(N'  PASS 12A: Version is 1.0.2026.0226.', 10, 1) WITH NOWAIT;
+IF @12a_version = N'1.0.2026.0227'
+    RAISERROR(N'  PASS 12A: Version is 1.0.2026.0227.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @12a_msg nvarchar(200) = N'  *** FAIL 12A: Expected version 1.0.2026.0226, got ' + ISNULL(@12a_version, N'NULL');
+    DECLARE @12a_msg nvarchar(200) = N'  *** FAIL 12A: Expected version 1.0.2026.0227, got ' + ISNULL(@12a_version, N'NULL');
     RAISERROR(@12a_msg, 16, 1) WITH NOWAIT;
 END
 GO
@@ -299,6 +299,10 @@ CREATE TABLE #EstResults (
     heap_compression       varchar(4)    NULL,
     replication_hint       varchar(20)   NULL,
     lock_escalation        varchar(10)   NULL,
+    partition_count        int           NULL,
+    has_schema_bound_views int           NULL,
+    has_indexed_views      int           NULL,
+    filegroup_name         sysname       NULL,
     command_text           nvarchar(max) NULL,
     ci_drop_command        nvarchar(max) NULL,
     verify_command         nvarchar(max) NULL,
