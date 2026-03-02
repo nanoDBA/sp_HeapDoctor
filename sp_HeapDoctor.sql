@@ -529,13 +529,14 @@ COMMON PARAMETERS:
   @PlanOnly          bit     = 1       1=print commands only, 0=execute.
   @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
   @TopN              int     = 25      Max targets per database.
-  @MinPages          bigint  = 1000    Skip heaps smaller than this (page_count).
-  @MinForwardedPct   decimal = 2.00    Min forwarded record %% to qualify.
+  @MinPages          bigint  = 1000    Discovery filter: heaps below this page count are excluded.
+  @MinForwardedPct   decimal = 2.00    Min forwarded %% (= forwarded_records / total_rows * 100).
   @SkipWriteHeavy    bit     = 0       1=exclude WRITE_HEAVY and WRITE_ONLY heaps entirely.
   @MinDaysSinceRebuild int   = NULL    Skip heaps rebuilt fewer than N days ago (requires CommandLog).
   @LogToTable        nvarchar(1) = Y   Y=log to dbo.CommandLog, N=no logging.
+', 10, 1, @Version) WITH NOWAIT;
 
-ADVANCED PARAMETERS:
+        RAISERROR(N'ADVANCED PARAMETERS:
   @CpuSource         varchar = QUERY_STORE  QUERY_STORE | QUICKIESTORE | NONE
   @LookbackDays      int     = 7       Query Store lookback window in days.
   @MaxPages          bigint  = NULL    Skip heaps larger than this (NULL=no cap).
@@ -550,7 +551,7 @@ ADVANCED PARAMETERS:
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays int  = 90      CommandLog history window for throughput rates.
   @Force             bit     = 0       Bypass re-entrancy guard (orphaned applock from KILLed run).
-', 10, 1, @Version) WITH NOWAIT;
+', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'
 QUICKIESTORE PARAMETERS:
@@ -615,6 +616,25 @@ WRITE-HEAVY HEAPS:
   where rebuilds last longer, then run a separate pass for write-heavy heaps less often.
   The churn warning (>= 5 rebuilds in 90 days) flags heaps that need a CI, not more rebuilds.
   Use @MinDaysSinceRebuild to prevent wasteful back-to-back rebuilds on churning heaps.
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'CI SWAP LOCKING:
+  Sch-M locks acquired during CI swap block ALL readers, including NOLOCK/READ UNCOMMITTED.
+  Applications that rely on NOLOCK for non-blocking reads will queue during CI swap.
+  Tables with lock_escalation=TABLE compound this risk. Use @LockTimeoutMs to limit wait.
+
+DISCOVERY FILTERS:
+  @MinPages, @MinForwardedPct, and @TopN are discovery-time filters. Heaps that do not
+  meet these thresholds are excluded from results entirely, even in @PlanOnly mode.
+  Set @MinPages=0, @MinForwardedPct=0 for a complete audit of all heaps.
+  forwarded_pct formula: forwarded_record_count / record_count * 100. The denominator
+  is total rows (record_count), not pages. forwarded_record_count counts pointer stubs
+  on original pages (one per forwarded row). Example: 1M rows, 50K forwarded = 5.0%%.
+
+SCOPE:
+  Operates within the current SQL Server instance. Linked server tables are out of scope.
+  Cross-database heaps are discovered when their database is included in @Databases.
+  For multi-instance environments, run sp_HeapDoctor on each instance separately.
 
 REQUIREMENTS: SQL Server 2017+ (STRING_AGG). Enterprise/Developer for ONLINE.
 COMMANDLOG:   dbo.CommandLog (Ola Hallengren). https://ola.hallengren.com/scripts/CommandLog.sql
