@@ -9,3 +9,5 @@
 !tests/
 !tests/*.sql
 !tests/*.ps1
+!tools/
+!tools/*.sql

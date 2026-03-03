@@ -501,7 +501,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302e';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302f';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -650,10 +650,16 @@ SCOPE:
   Cross-database heaps are discovered when their database is included in @Databases.
   For multi-instance environments, run sp_HeapDoctor on each instance separately.
 
+MONITORING:
+  sp_HeapDoctor emits sp_trace_generateevent (event class 82) per rebuild. SQL Trace
+  is deprecated in SQL 2022+. For Extended Events monitoring, see the XE session in
+  tools/sp_HeapDoctor_XE_Session.sql. Intra-rebuild progress is not possible for
+  atomic DDL operations (ALTER TABLE REBUILD is a single call that returns on completion).
+
 REQUIREMENTS: SQL Server 2017+ (STRING_AGG). Enterprise/Developer for ONLINE.
 COMMANDLOG:   dbo.CommandLog (Ola Hallengren). https://ola.hallengren.com/scripts/CommandLog.sql
 PERMISSIONS:  VIEW DATABASE STATE, ALTER on target tables, INSERT on dbo.CommandLog,
-              ALTER TRACE (optional, for XE events).
+              ALTER TRACE (optional, for sp_trace_generateevent observability).
 TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETIME).
 ', 10, 1) WITH NOWAIT;
         RETURN;
@@ -1165,6 +1171,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     SET @Msg = N'Mode:        ' + CASE WHEN @PlanOnly = 1 THEN N'PLAN ONLY' ELSE N'EXECUTE' END;
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     RAISERROR(N'Scan mode:   SAMPLED (forwarded record counts are estimates)', 10, 1) WITH NOWAIT;
+
+    -- #31: Deprecation advisory for sp_trace_generateevent on SQL 2022+
+    IF CAST(SERVERPROPERTY(N'ProductMajorVersion') AS int) >= 16
+        RAISERROR(N'ADVISORY: sp_trace_generateevent (SQL Trace) is deprecated in SQL 2022+. See tools/sp_HeapDoctor_XE_Session.sql for Extended Events monitoring.', 10, 1) WITH NOWAIT;
 
     -- Resume mode flag (set to 1 when @ResumeRunID loads targets from CommandLog)
     DECLARE @resume_loaded bit = 0;
@@ -4976,6 +4986,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         END
                     END
                 END
+
+                -- #34: Cumulative progress after each successful rebuild
+                SET @Msg = N'  Progress: '
+                         + CAST(@succeeded_cnt + @failed_cnt + @skipped_cnt AS nvarchar(10)) + N'/' + CAST(@TargetCount AS nvarchar(10))
+                         + N' (' + CAST(CAST((@succeeded_cnt + @failed_cnt + @skipped_cnt) * 100.0 / NULLIF(@TargetCount, 0) AS decimal(5,1)) AS nvarchar(10)) + N'%%)'
+                         + N'  |  Pages rebuilt: ' + CAST(@live_pages_rebuilt AS nvarchar(20))
+                         + CASE WHEN @live_pps IS NOT NULL
+                                THEN N'  |  Avg: ' + CAST(CAST(@live_pps AS int) AS nvarchar(20)) + N' pages/sec'
+                                ELSE N'' END;
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                 /*
                 Log success to CommandLog
