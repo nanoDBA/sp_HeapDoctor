@@ -486,6 +486,9 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     -- CI swap options
     @FillFactor              tinyint        = 0,                -- #47: fill factor for CI swap CREATE INDEX (0 = server default)
 
+    -- Post-rebuild
+    @UpdateStatsAfterRebuild bit            = 0,                -- #19: run UPDATE STATISTICS WITH FULLSCAN after each rebuild
+
     -- Safety
     @AllowReplicationRebuild bit            = 0,                -- #59: opt-in for published heaps (default: skip)
     @Force                   bit            = 0                 -- bypass re-entrancy guard (use when prior run was KILLed and applock is orphaned)
@@ -498,7 +501,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302d';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302e';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -558,6 +561,7 @@ COMMON PARAMETERS:
   @Debug             bit     = 0       Extra diagnostic output.
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays int  = 90      CommandLog history window for throughput rates.
+  @UpdateStatsAfterRebuild bit = 0    Run UPDATE STATISTICS WITH FULLSCAN after each rebuild.
   @CheckPermissionsOnly bit  = 0       Check required permissions per database and return.
   @AllowReplicationRebuild bit = 0    Published heaps skipped unless 1 (replication log flood risk).
   @Force             bit     = 0       Bypass re-entrancy guard (orphaned applock from KILLed run).
@@ -1135,6 +1139,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @ResumeRunID = ''' + CAST(@ResumeRunID AS nvarchar(36)) + N'''';
     IF @FillFactor > 0
         SET @invocation_command += N', @FillFactor = ' + CAST(@FillFactor AS nvarchar(3));
+    IF @UpdateStatsAfterRebuild = 1
+        SET @invocation_command += N', @UpdateStatsAfterRebuild = 1';
     IF @AllowReplicationRebuild = 1
         SET @invocation_command += N', @AllowReplicationRebuild = 1';
     IF @CheckPermissionsOnly = 1
@@ -4840,9 +4846,30 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END
                 END
 
-                -- 8J: Statistics invalidation warning
-                SET @Msg = N'  Note: Statistics on ' + @full + N' are now stale. Auto-update will trigger on next query.';
-                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                -- #19/#61: Post-rebuild statistics handling
+                IF @UpdateStatsAfterRebuild = 1
+                BEGIN
+                    BEGIN TRY
+                        DECLARE @stats_sql nvarchar(max) = N'UPDATE STATISTICS ' + @full + N' WITH FULLSCAN;';
+                        DECLARE @stats_start datetime2(3) = SYSDATETIME();
+                        EXEC sys.sp_executesql @stats_sql;
+                        DECLARE @stats_ms int = DATEDIFF(MILLISECOND, @stats_start, SYSDATETIME());
+                        SET @Msg = N'  Statistics updated on ' + @full
+                                 + N' (' + CAST(@cur_nci_count AS nvarchar(10)) + N' NCI(s), '
+                                 + CAST(@stats_ms AS nvarchar(10)) + N'ms).';
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @Msg = N'  WARNING: UPDATE STATISTICS failed on ' + @full + N': ' + LEFT(ERROR_MESSAGE(), 500);
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END CATCH
+                END
+                ELSE
+                BEGIN
+                    SET @Msg = N'  Note: Statistics on ' + @full + N' are now stale (heap + '
+                             + CAST(@cur_nci_count AS nvarchar(10)) + N' NCI(s)). Auto-update will trigger on next query.';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                END
 
                 -- XE observability: rebuild succeeded with key metrics
                 BEGIN TRY
