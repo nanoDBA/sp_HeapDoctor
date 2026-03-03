@@ -51,9 +51,27 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0227
+Version:    1.0.2026.0302i
 
-History:    1.0.2026.0227 - CI swap safety guards (#26, #62, #66, #72, #73, #76, #80, #83)
+History:    1.0.2026.0302i - Resumable CI swap + temporal history (#85, #84)
+                          - @UseResumable: RESUMABLE = ON for CI swap CREATE INDEX (SQL 2017+, default ON)
+                          - Paused operations auto-detected via sys.index_resumable_operations and resumed
+                          - @IncludeTemporalHistory: includes temporal history table heaps in discovery
+                          - SYSTEM_VERSIONING disable/enable lifecycle wraps rebuild for history tables
+                          - CI swap blocked for temporal history tables (REBUILD only)
+                          - New column: is_temporal_history
+            1.0.2026.0302h - @OutputTable + @GenerateScript (#16, #23)
+            1.0.2026.0302g - IO latch wait stats + cold-start ETA (#22, #88)
+            1.0.2026.0302f - Observability (#65, #82, #67)
+            1.0.2026.0302e - @UpdateStatsAfterRebuild + stale stats NCI message (#19, #91)
+            1.0.2026.0302d - @Debug scheduler/memory, @FillFactor, memory-optimized exclusion (#24, #77, #70, #21)
+            1.0.2026.0302c - Safety guards + new parameters (#68, #75, #78, #63, #89, #18)
+                          - SQL 2017 version check, INSTEAD OF trigger detection, lock_escalation warning
+                          - AG failover check, @AllowReplicationRebuild, @CheckPermissionsOnly
+            1.0.2026.0302b - Pre-flight safety checks (#74, #79, #20)
+                          - FK reference detection, per-rebuild log space pre-flight, tempdb pre-flight warning
+            1.0.2026.0302  - Region markers + @Force + LOB TOCTOU + CommandLog schema validation (#25, #33, #71)
+            1.0.2026.0227 - CI swap safety guards (#26, #62, #66, #72, #73, #76, #80, #83)
                           - SET XACT_ABORT OFF at proc start (prevents CATCH block skip when caller sets ON)
                           - Computed columns excluded from CandidateKeys CTE (c.is_computed = 0)
                           - Schema-bound view detection: CI swap blocked, falls back to heap rebuild
