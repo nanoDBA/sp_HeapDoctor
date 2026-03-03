@@ -2,14 +2,14 @@
 sp_HeapDoctor Test Harness - v1.0.2026.0302i: Batch F observability
 
 Tests:
-  -- Issue #31: Deprecation advisory for sp_trace on SQL 2022+ --
+  -- Issue #65: Deprecation advisory for sp_trace on SQL 2022+ --
   22A - Deprecation advisory code exists in proc definition
   22B - sp_trace_generateevent calls wrapped in TRY/CATCH
 
-  -- Issue #52: XE session template --
+  -- Issue #82: XE session template --
   22C - @Help mentions XE session file
 
-  -- Issue #34: Progress reporting --
+  -- Issue #67: Progress reporting --
   22D - Progress message emitted after execution (code check)
   22E - Execution with @PlanOnly=0 succeeds (progress visible in output)
 
@@ -87,12 +87,12 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 22: v1.0.2026.0302f (#31, #52, #34) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 22: v1.0.2026.0302f (#65, #82, #67) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
--- 22A: #31 - Deprecation advisory code exists in proc
+-- 22A: #65 - Deprecation advisory code exists in proc
 ------------------------------------------------------------------------
-RAISERROR(N'Test 22A: Deprecation advisory code exists (#31)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 22A: Deprecation advisory code exists (#65)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_deprecation bit = 0;
 EXEC master.sys.sp_executesql
@@ -111,9 +111,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 22B: #31 - sp_trace_generateevent calls wrapped in TRY/CATCH
+-- 22B: #65 - sp_trace_generateevent calls wrapped in TRY/CATCH
 ------------------------------------------------------------------------
-RAISERROR(N'Test 22B: sp_trace_generateevent calls wrapped in TRY/CATCH (#31)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 22B: sp_trace_generateevent calls wrapped in TRY/CATCH (#65)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_trycatch bit = 0;
 EXEC master.sys.sp_executesql
@@ -132,9 +132,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 22C: #52 - @Help mentions XE session
+-- 22C: #82 - @Help mentions XE session
 ------------------------------------------------------------------------
-RAISERROR(N'Test 22C: @Help mentions XE session file (#52)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 22C: @Help mentions XE session file (#82)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_xe_help bit = 0;
 EXEC master.sys.sp_executesql
@@ -153,9 +153,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 22D: #34 - Progress message code exists in proc
+-- 22D: #67 - Progress message code exists in proc
 ------------------------------------------------------------------------
-RAISERROR(N'Test 22D: Progress message code exists (#34)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 22D: Progress message code exists (#67)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_progress bit = 0;
 EXEC master.sys.sp_executesql
@@ -174,9 +174,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 22E: #34 - Execution succeeds with progress (functional test)
+-- 22E: #67 - Execution succeeds with progress (functional test)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 22E: Execution with progress reporting (#34)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 22E: Execution with progress reporting (#67)...', 10, 1) WITH NOWAIT;
 
 -- Create a small inline test heap
 IF OBJECT_ID(N'dbo.HeapProgress') IS NOT NULL DROP TABLE dbo.HeapProgress;

@@ -2,7 +2,7 @@
 sp_HeapDoctor Test Harness - v1.0.2026.0302i: Batch A+C features
 
 Tests:
-  -- Issue #36: SQL 2017 version check --
+  -- Issue #68: SQL 2017 version check --
   19A - SQL 2017 version check code exists in proc definition
 
   -- Issue #18: @CheckPermissionsOnly --
@@ -11,16 +11,16 @@ Tests:
   19D - @CheckPermissionsOnly with @Databases scopes correctly
   19E - @CheckPermissionsOnly returns early (no targets)
 
-  -- Issue #45: INSTEAD OF trigger detection --
+  -- Issue #75: INSTEAD OF trigger detection --
   19F - CI swap succeeds on table with INSTEAD OF trigger (DDL not affected by DML triggers)
 
-  -- Issue #48: Enhanced lock_escalation for CI swap --
+  -- Issue #78: Enhanced lock_escalation for CI swap --
   19G - lock_escalation=TABLE shown for CI swap target
 
-  -- Issue #28: AG failover check --
+  -- Issue #63: AG failover check --
   19H - AG failover check code exists in proc definition
 
-  -- Issue #59: @AllowReplicationRebuild --
+  -- Issue #89: @AllowReplicationRebuild --
   19I - @AllowReplicationRebuild=0 accepted without error
   19J - @AllowReplicationRebuild=1 appears in invocation_command
 
@@ -101,12 +101,12 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 19: v1.0.2026.0302i (#36, #18, #45, #48, #28, #59) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 19: v1.0.2026.0302i (#68, #18, #75, #78, #63, #89) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
--- 19A: #36 - SQL 2017 version check code exists in proc definition
+-- 19A: #68 - SQL 2017 version check code exists in proc definition
 ------------------------------------------------------------------------
-RAISERROR(N'Test 19A: SQL 2017 version check (#36)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 19A: SQL 2017 version check (#68)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_version_check bit = 0;
 EXEC master.sys.sp_executesql
@@ -204,10 +204,10 @@ END CATCH
 GO
 
 ------------------------------------------------------------------------
--- 19F: #45 - INSTEAD OF trigger on CI swap target
+-- 19F: #75 - INSTEAD OF trigger on CI swap target
 -- DDL (CREATE INDEX) does not fire DML triggers, so CI swap should succeed.
 ------------------------------------------------------------------------
-RAISERROR(N'Test 19F: INSTEAD OF trigger on CI swap target (#45)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 19F: INSTEAD OF trigger on CI swap target (#75)...', 10, 1) WITH NOWAIT;
 
 -- Create test heap eligible for CI swap
 IF OBJECT_ID(N'dbo.HeapTriggerTest') IS NOT NULL DROP TABLE dbo.HeapTriggerTest;
@@ -286,9 +286,9 @@ IF OBJECT_ID(N'dbo.HeapTriggerTest') IS NOT NULL DROP TABLE dbo.HeapTriggerTest;
 GO
 
 ------------------------------------------------------------------------
--- 19G: #48 - lock_escalation=TABLE shown for CI swap target
+-- 19G: #78 - lock_escalation=TABLE shown for CI swap target
 ------------------------------------------------------------------------
-RAISERROR(N'Test 19G: lock_escalation=TABLE for CI swap target (#48)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 19G: lock_escalation=TABLE for CI swap target (#78)...', 10, 1) WITH NOWAIT;
 
 -- Create test heap with TABLE lock escalation + CI swap eligibility
 IF OBJECT_ID(N'dbo.HeapLockEscTest') IS NOT NULL DROP TABLE dbo.HeapLockEscTest;
@@ -333,9 +333,9 @@ IF OBJECT_ID(N'dbo.HeapLockEscTest') IS NOT NULL DROP TABLE dbo.HeapLockEscTest;
 GO
 
 ------------------------------------------------------------------------
--- 19H: #28 - AG failover check code exists in proc definition
+-- 19H: #63 - AG failover check code exists in proc definition
 ------------------------------------------------------------------------
-RAISERROR(N'Test 19H: AG failover check code exists (#28)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 19H: AG failover check code exists (#63)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_ag_check bit = 0;
 EXEC master.sys.sp_executesql
@@ -354,9 +354,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 19I: #59 - @AllowReplicationRebuild=0 accepted without error
+-- 19I: #89 - @AllowReplicationRebuild=0 accepted without error
 ------------------------------------------------------------------------
-RAISERROR(N'Test 19I: @AllowReplicationRebuild=0 accepted (#59)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 19I: @AllowReplicationRebuild=0 accepted (#89)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -373,9 +373,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 19J: #59 - @AllowReplicationRebuild=1 in invocation_command
+-- 19J: #89 - @AllowReplicationRebuild=1 in invocation_command
 ------------------------------------------------------------------------
-RAISERROR(N'Test 19J: @AllowReplicationRebuild=1 in invocation_command (#59)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 19J: @AllowReplicationRebuild=1 in invocation_command (#89)...', 10, 1) WITH NOWAIT;
 
 -- Mark start point
 DECLARE @pre_id19j int;

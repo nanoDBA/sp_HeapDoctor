@@ -2,25 +2,25 @@
 sp_HeapDoctor Test Harness - Batch 16: CI Swap Safety Guards
 
 Tests:
-  -- Issue #32: XACT_ABORT OFF --
+  -- Issue #66: XACT_ABORT OFF --
   16A - Proc runs successfully when caller has SET XACT_ABORT ON
 
-  -- Issue #46: Computed column exclusion --
+  -- Issue #76: Computed column exclusion --
   16B - CI swap key excludes computed columns from CandidateKeys CTE
 
-  -- Issue #42: Schema-bound view detection --
+  -- Issue #72: Schema-bound view detection --
   16C - CI swap blocked when schema-bound view references the heap
 
-  -- Issue #50: Indexed view detection --
+  -- Issue #80: Indexed view detection --
   16D - CI swap blocked when indexed view references the heap
 
-  -- Issue #27: Partitioned heap detection --
+  -- Issue #62: Partitioned heap detection --
   16E - partition_count column populated for non-partitioned heaps
 
   -- Issue #26: Filegroup --
   16F - filegroup_name column populated in result set
 
-  -- Issue #53: CDC CI swap guard --
+  -- Issue #83: CDC CI swap guard --
   16G - result set columns for new CI swap safety fields exist
 
   -- New result set columns --
@@ -103,7 +103,7 @@ GO
 RAISERROR(N'=== Batch 16: CI Swap Safety Guards ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
--- 16A: XACT_ABORT OFF (#32)
+-- 16A: XACT_ABORT OFF (#66)
 -- Proc should run successfully even when caller has XACT_ABORT ON
 ------------------------------------------------------------------------
 RAISERROR(N'Test 16A: XACT_ABORT ON in caller session...', 10, 1) WITH NOWAIT;
@@ -130,7 +130,7 @@ SET XACT_ABORT OFF;
 GO
 
 ------------------------------------------------------------------------
--- 16B: Computed column exclusion (#46)
+-- 16B: Computed column exclusion (#76)
 -- Create a heap with computed column in a unique NCI key.
 -- CI swap should NOT select that index (computed columns excluded).
 ------------------------------------------------------------------------
@@ -184,7 +184,7 @@ DROP TABLE dbo.HeapComputed;
 GO
 
 ------------------------------------------------------------------------
--- 16C: Schema-bound view detection (#42)
+-- 16C: Schema-bound view detection (#72)
 -- Create a heap with a schema-bound view. CI swap should fall back to
 -- heap rebuild because schema-bound views block DDL on the base table.
 ------------------------------------------------------------------------
@@ -239,7 +239,7 @@ DROP TABLE dbo.HeapSchemaBound;
 GO
 
 ------------------------------------------------------------------------
--- 16D: Indexed view detection (#50)
+-- 16D: Indexed view detection (#80)
 -- Create a heap with an indexed view. CI swap should fall back to
 -- heap rebuild because indexed views add overhead to DDL.
 ------------------------------------------------------------------------
@@ -298,7 +298,7 @@ DROP TABLE dbo.HeapIndexedView;
 GO
 
 ------------------------------------------------------------------------
--- 16E: Partitioned heap detection (#27)
+-- 16E: Partitioned heap detection (#62)
 -- Verify partition_count = 1 for standard (non-partitioned) heaps.
 ------------------------------------------------------------------------
 RAISERROR(N'Test 16E: partition_count populated for non-partitioned heaps...', 10, 1) WITH NOWAIT;

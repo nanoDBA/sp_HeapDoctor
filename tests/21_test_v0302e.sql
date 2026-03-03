@@ -7,7 +7,7 @@ Tests:
   21B - @UpdateStatsAfterRebuild=1 runs UPDATE STATISTICS after rebuild
   21C - @UpdateStatsAfterRebuild=1 in invocation_command
 
-  -- Issue #61: Post-rebuild statistics message --
+  -- Issue #91: Post-rebuild statistics message --
   21D - Stale stats message includes NCI count
   21E - @UpdateStatsAfterRebuild parameter exists in proc definition
 
@@ -85,7 +85,7 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 21: v1.0.2026.0302i (#19, #61) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 21: v1.0.2026.0302i (#19, #91) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- Setup: create inline test heap with NCI for stats tests
@@ -194,9 +194,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 21D: #61 - Stale stats message includes NCI count (code check)
+-- 21D: #91 - Stale stats message includes NCI count (code check)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 21D: Stale stats message includes NCI count (#61)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 21D: Stale stats message includes NCI count (#91)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_nci_msg bit = 0;
 EXEC master.sys.sp_executesql

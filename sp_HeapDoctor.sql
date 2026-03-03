@@ -53,7 +53,7 @@ License:    MIT License
 
 Version:    1.0.2026.0227
 
-History:    1.0.2026.0227 - CI swap safety guards (#26, #27, #32, #42, #43, #46, #50, #53)
+History:    1.0.2026.0227 - CI swap safety guards (#26, #62, #66, #72, #73, #76, #80, #83)
                           - SET XACT_ABORT OFF at proc start (prevents CATCH block skip when caller sets ON)
                           - Computed columns excluded from CandidateKeys CTE (c.is_computed = 0)
                           - Schema-bound view detection: CI swap blocked, falls back to heap rebuild
@@ -485,13 +485,13 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @CheckPermissionsOnly    bit            = 0,                -- #18: check required permissions and return (no DDL/DML)
 
     -- CI swap options
-    @FillFactor              tinyint        = 0,                -- #47: fill factor for CI swap CREATE INDEX (0 = server default)
+    @FillFactor              tinyint        = 0,                -- #77: fill factor for CI swap CREATE INDEX (0 = server default)
 
     -- Post-rebuild
     @UpdateStatsAfterRebuild bit            = 0,                -- #19: run UPDATE STATISTICS WITH FULLSCAN after each rebuild
 
     -- Safety
-    @AllowReplicationRebuild bit            = 0,                -- #59: opt-in for published heaps (default: skip)
+    @AllowReplicationRebuild bit            = 0,                -- #89: opt-in for published heaps (default: skip)
     @Force                   bit            = 0,                -- bypass re-entrancy guard (use when prior run was KILLed and applock is orphaned)
 
     -- Output
@@ -499,10 +499,10 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @GenerateScript          bit            = 0,                -- #23: output executable T-SQL script per target
 
     -- Temporal
-    @IncludeTemporalHistory  bit            = 0,                -- #54: include temporal history heaps in discovery
+    @IncludeTemporalHistory  bit            = 0,                -- #84: include temporal history heaps in discovery
 
     -- Resumable
-    @UseResumable            bit            = 1                 -- #55: use RESUMABLE = ON for CI swap (SQL 2017+, default ON)
+    @UseResumable            bit            = 1                 -- #85: use RESUMABLE = ON for CI swap (SQL 2017+, default ON)
 )
 /*#endregion 00-HEADER */
 
@@ -510,7 +510,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
+    SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66)
 
     DECLARE @Version nvarchar(20) = N'1.0.2026.0302i';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
@@ -840,7 +840,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     DECLARE @CpuSourceUpper varchar(20) = UPPER(@CpuSource);
     SET @OnlinePreference = UPPER(@OnlinePreference);
 
-    -- #36: SQL Server 2017+ version check (STRING_AGG requires v14+)
+    -- #68: SQL Server 2017+ version check (STRING_AGG requires v14+)
     IF CAST(SERVERPROPERTY(N'ProductMajorVersion') AS int) < 14
     BEGIN
         RAISERROR(N'sp_HeapDoctor requires SQL Server 2017 or later. STRING_AGG (used in QS snapshot aggregation) is not available in SQL Server 2016 and earlier.', 16, 1);
@@ -871,7 +871,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RETURN;
     END
 
-    -- #47: @FillFactor validation
+    -- #77: @FillFactor validation
     IF @FillFactor < 0 OR @FillFactor > 100
     BEGIN
         RAISERROR(N'@FillFactor must be between 0 and 100. Use 0 for server default.', 16, 1);
@@ -1093,7 +1093,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         BEGIN
             SET @commandlog_exists = 1;
 
-            -- #40: Validate CommandLog schema compatibility before first write.
+            -- #71: Validate CommandLog schema compatibility before first write.
             -- Ola Hallengren's schema has evolved; older versions may lack columns we need.
             DECLARE @cl_missing nvarchar(max) = NULL;
             SELECT @cl_missing = STRING_AGG(r.col_name, N', ')
@@ -1225,7 +1225,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     RAISERROR(N'Scan mode:   SAMPLED (forwarded record counts are estimates)', 10, 1) WITH NOWAIT;
 
-    -- #31: Deprecation advisory for sp_trace_generateevent on SQL 2022+
+    -- #65: Deprecation advisory for sp_trace_generateevent on SQL 2022+
     IF CAST(SERVERPROPERTY(N'ProductMajorVersion') AS int) >= 16
         RAISERROR(N'ADVISORY: sp_trace_generateevent (SQL Trace) is deprecated in SQL 2022+. See tools/sp_HeapDoctor_XE_Session.sql for Extended Events monitoring.', 10, 1) WITH NOWAIT;
 
@@ -1649,9 +1649,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         fk_ref_count             int            NOT NULL DEFAULT 0,
         page_io_latch_wait_count bigint         NULL,
         page_io_latch_wait_ms    bigint         NULL,
-        is_temporal_history      bit            NOT NULL DEFAULT 0,  -- #54: temporal history table
-        temporal_parent_schema   sysname        NULL,                -- #54: parent versioned table schema
-        temporal_parent_table    sysname        NULL,                -- #54: parent versioned table name
+        is_temporal_history      bit            NOT NULL DEFAULT 0,  -- #84: temporal history table
+        temporal_parent_schema   sysname        NULL,                -- #84: parent versioned table schema
+        temporal_parent_table    sysname        NULL,                -- #84: parent versioned table name
         verify_command           nvarchar(max)  NULL,
         prev_forwarded_pct       decimal(6,2)   NULL,
         rebuilds_in_90d          int            NULL,
@@ -2037,17 +2037,17 @@ CREATE TABLE #Heaps
     heap_compression       tinyint       NOT NULL DEFAULT 0,
     replication_hint       varchar(20)   NULL,
     lock_escalation        tinyint       NOT NULL DEFAULT 0,
-    partition_count        int           NOT NULL DEFAULT 1,           -- #27: partitioned heap detection
-    has_schema_bound_views bit           NOT NULL DEFAULT 0,           -- #42: schema-bound views block CI swap
-    has_indexed_views      bit           NOT NULL DEFAULT 0,           -- #50: indexed views block CI swap
+    partition_count        int           NOT NULL DEFAULT 1,           -- #62: partitioned heap detection
+    has_schema_bound_views bit           NOT NULL DEFAULT 0,           -- #72: schema-bound views block CI swap
+    has_indexed_views      bit           NOT NULL DEFAULT 0,           -- #80: indexed views block CI swap
     data_space_name        sysname       NULL,                         -- #26: filegroup for CI swap ON clause
-    has_fk_references      bit           NOT NULL DEFAULT 0,           -- #44: FKs referencing this heap
-    fk_ref_count           int           NOT NULL DEFAULT 0,           -- #44: count of FK references TO this heap
+    has_fk_references      bit           NOT NULL DEFAULT 0,           -- #74: FKs referencing this heap
+    fk_ref_count           int           NOT NULL DEFAULT 0,           -- #74: count of FK references TO this heap
     page_io_latch_wait_count bigint      NULL,                         -- #22: IO latch waits from operational stats
     page_io_latch_wait_ms  bigint        NULL,                         -- #22: IO latch wait time ms
-    is_temporal_history    bit           NOT NULL DEFAULT 0,            -- #54: temporal history table flag
-    temporal_parent_schema sysname       NULL,                          -- #54: parent versioned table schema
-    temporal_parent_table  sysname       NULL                           -- #54: parent versioned table name
+    is_temporal_history    bit           NOT NULL DEFAULT 0,            -- #84: temporal history table flag
+    temporal_parent_schema sysname       NULL,                          -- #84: parent versioned table schema
+    temporal_parent_table  sysname       NULL                           -- #84: parent versioned table name
 );
 
 CREATE TABLE #CpuByPlan
@@ -2116,7 +2116,7 @@ WHERE o.is_memory_optimized = 0
 
         SET @discovery_sql += N';
 
--- #39: Count memory-optimized tables excluded from discovery
+-- #70: Count memory-optimized tables excluded from discovery
 DECLARE @MemOptCount int = (SELECT COUNT(*) FROM sys.tables WHERE is_memory_optimized = 1);
 DECLARE @HeapTableCount int = (SELECT COUNT(*) FROM #HeapObjects);
 SET @Msg_inner = N''  '' + CAST(@HeapTableCount AS nvarchar(10)) + N'' heap table(s) to scan (non-heap objects skipped).'';
@@ -2154,15 +2154,15 @@ SELECT
         ELSE NULL
     END,
     ISNULL(tp.lock_escalation, 0),
-    -- #27: Partition count for partitioned heap detection
+    -- #62: Partition count for partitioned heap detection
     ISNULL(pc.partition_count, 1),
-    -- #42: Schema-bound views referencing this heap
+    -- #72: Schema-bound views referencing this heap
     ISNULL(sbv.has_schema_bound_views, 0),
-    -- #50: Indexed views referencing this heap
+    -- #80: Indexed views referencing this heap
     ISNULL(ixv.has_indexed_views, 0),
     -- #26: Filegroup name for CI swap ON clause
     fg.filegroup_name,
-    -- #44: Foreign key references TO this heap
+    -- #74: Foreign key references TO this heap
     ISNULL(fkr.has_fk_references, 0),
     ISNULL(fkr.fk_ref_count, 0),
     -- #22: IO latch wait stats from operational stats
@@ -2206,13 +2206,13 @@ OUTER APPLY (
     WHERE t.object_id = ho.object_id
 ) tp
 OUTER APPLY (
-    -- #27: Count partitions for partitioned heap detection.
+    -- #62: Count partitions for partitioned heap detection.
     SELECT COUNT(*) AS partition_count
     FROM sys.partitions
     WHERE object_id = ho.object_id AND index_id = 0
 ) pc
 OUTER APPLY (
-    -- #42: Detect schema-bound views referencing this table (CI swap DDL will fail).
+    -- #72: Detect schema-bound views referencing this table (CI swap DDL will fail).
     SELECT CAST(CASE WHEN EXISTS (
         SELECT 1 FROM sys.sql_expression_dependencies sed
         JOIN sys.views v ON sed.referencing_id = v.object_id
@@ -2221,7 +2221,7 @@ OUTER APPLY (
     ) THEN 1 ELSE 0 END AS bit) AS has_schema_bound_views
 ) sbv
 OUTER APPLY (
-    -- #50: Detect indexed views referencing this table (CI swap may fail or be slow).
+    -- #80: Detect indexed views referencing this table (CI swap may fail or be slow).
     SELECT CAST(CASE WHEN EXISTS (
         SELECT 1 FROM sys.sql_expression_dependencies sed
         JOIN sys.views v ON sed.referencing_id = v.object_id
@@ -2237,7 +2237,7 @@ OUTER APPLY (
     WHERE i.object_id = ho.object_id AND i.index_id = 0
 ) fg
 OUTER APPLY (
-    -- #44: Foreign keys referencing this heap (the heap is the referenced/parent table).
+    -- #74: Foreign keys referencing this heap (the heap is the referenced/parent table).
     -- CI swap changes the row locator from RID to CI key; FK lookups may change performance.
     SELECT
         CAST(CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS bit) AS has_fk_references,
@@ -2252,7 +2252,7 @@ WHERE ips.forwarded_record_count > 0
 
 SET ANSI_WARNINGS ON;
 
--- #54: Populate temporal parent info for history table heaps
+-- #84: Populate temporal parent info for history table heaps
 IF @IncludeTemporalHistory_param = 1
 BEGIN
     UPDATE h SET
@@ -2366,7 +2366,7 @@ CandidateKeys AS
       AND ic.key_ordinal > 0
       AND c.is_nullable = 0
       AND ISNULL(c.encryption_type, 0) = 0
-      AND c.is_computed = 0                        -- exclude computed columns (#46)
+      AND c.is_computed = 0                        -- exclude computed columns (#76)
       AND c.max_length <> -1
       AND t.name NOT IN (N''text'',N''ntext'',N''image'',N''xml'')
     GROUP BY i.object_id, i.name
@@ -2511,16 +2511,16 @@ SELECT TOP (@TopN_param)
     r.has_fk_references, r.fk_ref_count,
     r.page_io_latch_wait_count, r.page_io_latch_wait_ms,
     r.is_temporal_history, r.temporal_parent_schema, r.temporal_parent_table,
-    -- action_chosen (8I: forced plans prevent CI swap; #53: CDC blocks CI swap; #27: partitioned heaps skip CI swap; #54: temporal history blocks CI swap)
+    -- action_chosen (8I: forced plans prevent CI swap; #83: CDC blocks CI swap; #62: partitioned heaps skip CI swap; #84: temporal history blocks CI swap)
     CASE
         WHEN @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
              AND r.temp_key_cols IS NOT NULL AND r.has_lob_columns = 0
              AND r.has_forced_plans = 0
-             AND (r.replication_hint IS NULL OR r.replication_hint NOT LIKE N''%%CDC%%'')  -- #53: CDC breaks capture instance
-             AND r.partition_count <= 1                                                    -- #27: partitioned heaps cannot CI swap
-             AND r.has_schema_bound_views = 0                                              -- #42: schema-bound views block CI swap
-             AND r.has_indexed_views = 0                                                   -- #50: indexed views block CI swap
-             AND r.is_temporal_history = 0                                                  -- #54: temporal history blocks CI swap
+             AND (r.replication_hint IS NULL OR r.replication_hint NOT LIKE N''%%CDC%%'')  -- #83: CDC breaks capture instance
+             AND r.partition_count <= 1                                                    -- #62: partitioned heaps cannot CI swap
+             AND r.has_schema_bound_views = 0                                              -- #72: schema-bound views block CI swap
+             AND r.has_indexed_views = 0                                                   -- #80: indexed views block CI swap
+             AND r.is_temporal_history = 0                                                  -- #84: temporal history blocks CI swap
             THEN ''CI_SWAP_ONLINE''
         WHEN @Online_param = 1 THEN ''HEAP_REBUILD_ONLINE''
         ELSE ''HEAP_REBUILD_OFFLINE''
@@ -2664,7 +2664,7 @@ BEGIN
     DEALLOCATE fp_cursor;
 END
 
--- #53: CDC CI swap guard warnings
+-- #83: CDC CI swap guard warnings
 IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME()
            AND action_chosen <> ''CI_SWAP_ONLINE''
            AND replication_hint LIKE N''%%CDC%%''
@@ -2690,7 +2690,7 @@ BEGIN
     DEALLOCATE cdc_cursor;
 END
 
--- #27: Partitioned heap warnings
+-- #62: Partitioned heap warnings
 IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME()
            AND partition_count > 1
            AND temp_key_cols IS NOT NULL AND has_lob_columns = 0)
@@ -2713,7 +2713,7 @@ BEGIN
     DEALLOCATE pt_cursor;
 END
 
--- #42/#50: Schema-bound/indexed view warnings
+-- #72/#80: Schema-bound/indexed view warnings
 IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME()
            AND (has_schema_bound_views = 1 OR has_indexed_views = 1)
            AND temp_key_cols IS NOT NULL AND has_lob_columns = 0)
@@ -2740,7 +2740,7 @@ BEGIN
     DEALLOCATE sv_cursor;
 END
 
--- #44: FK reference warnings (informational -- FK relationships survive CI swap, but lookup paths change)
+-- #74: FK reference warnings (informational -- FK relationships survive CI swap, but lookup paths change)
 IF EXISTS (SELECT 1 FROM #Targets WHERE database_name = DB_NAME() AND has_fk_references = 1
            AND action_chosen = ''CI_SWAP_ONLINE'')
 BEGIN
@@ -3601,7 +3601,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     BEGIN
         IF @hist_source = 'NONE'
         BEGIN
-            -- #58: Cold-start baseline when no CommandLog history
+            -- #88: Cold-start baseline when no CommandLog history
             IF @BaselineRebuildMBPerMin IS NOT NULL
             BEGIN
                 -- Convert MB/min to pages/sec: (MB/min * 128 pages/MB) / 60 sec/min
@@ -4430,7 +4430,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @err_message         nvarchar(4000),
             @verify_sql          nvarchar(max),
             @post_fwd_count      bigint,
-            @post_row_count      bigint,       -- #43: row count validation
+            @post_row_count      bigint,       -- #73: row count validation
             @ci_drop_failed      bit,
             @cur_index_name      sysname,
             -- QS performance snapshot (per-target, from #Targets)
@@ -4482,7 +4482,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             -- #33: LOB re-check at execution time
             @cur_heap_compression   tinyint,
             @cur_has_lob            bit,
-            -- #49: Log space pre-flight check
+            -- #79: Log space pre-flight check
             @cur_log_free_mb        decimal(18,2),
             @cur_est_log_mb         decimal(18,2);
 
@@ -4635,7 +4635,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /*
-            #28: AG failover safety - check database is still writable before each rebuild.
+            #63: AG failover safety - check database is still writable before each rebuild.
             If a failover occurred mid-run, the database becomes read-only on the new secondary.
             DATABASEPROPERTYEX is fast (no DMV scan) and catches failover + other read-only states.
             */
@@ -4716,7 +4716,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /*
-            #49: Log space pre-flight check before rebuild.
+            #79: Log space pre-flight check before rebuild.
             Compare est_log_mb against available log free space.
             Skip rebuild if estimated log consumption exceeds available free space.
             */
@@ -4975,7 +4975,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
 
-            -- Lock escalation warning for online rebuilds (#48: compound CI swap risk)
+            -- Lock escalation warning for online rebuilds (#78: compound CI swap risk)
             IF @cur_lock_escalation = 0 AND @action IN ('HEAP_REBUILD_ONLINE', 'CI_SWAP_ONLINE')
             BEGIN
                 IF @action = 'CI_SWAP_ONLINE'
@@ -4989,7 +4989,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
 
-            -- #45: INSTEAD OF trigger awareness for CI swap targets
+            -- #75: INSTEAD OF trigger awareness for CI swap targets
             IF @action = 'CI_SWAP_ONLINE'
             BEGIN
                 DECLARE @trigger_names nvarchar(1000) = NULL;
@@ -5014,7 +5014,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 END
             END
 
-            -- #59: Replication guard - skip published heaps unless opt-in
+            -- #89: Replication guard - skip published heaps unless opt-in
             IF @cur_replication_hint IS NOT NULL AND @cur_replication_hint <> N'CDC'
                AND @AllowReplicationRebuild = 0
             BEGIN
@@ -5055,7 +5055,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /*
-            #55: Resumable index resume detection.
+            #85: Resumable index resume detection.
             If @UseResumable=1 and this is a CI_SWAP_ONLINE, check sys.index_resumable_operations
             for a PAUSED operation on this temp index. If found, RESUME instead of re-creating.
             */
@@ -5088,7 +5088,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /*
-            #54: Temporal history table - disable SYSTEM_VERSIONING on parent before rebuild.
+            #84: Temporal history table - disable SYSTEM_VERSIONING on parent before rebuild.
             */
             IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
             BEGIN
@@ -5219,7 +5219,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END
                 END
 
-                -- #43: Row count validation after rebuild (detect data loss)
+                -- #73: Row count validation after rebuild (detect data loss)
                 IF @ci_drop_failed = 0 AND @cur_record_count IS NOT NULL
                 BEGIN
                     BEGIN TRY
@@ -5246,7 +5246,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END
                 END
 
-                -- #19/#61: Post-rebuild statistics handling
+                -- #19/#91: Post-rebuild statistics handling
                 IF @UpdateStatsAfterRebuild = 1
                 BEGIN
                     BEGIN TRY
@@ -5377,7 +5377,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END
                 END
 
-                -- #34: Cumulative progress after each successful rebuild
+                -- #67: Cumulative progress after each successful rebuild
                 SET @Msg = N'  Progress: '
                          + CAST(@succeeded_cnt + @failed_cnt + @skipped_cnt AS nvarchar(10)) + N'/' + CAST(@TargetCount AS nvarchar(10))
                          + N' (' + CAST(CAST((@succeeded_cnt + @failed_cnt + @skipped_cnt) * 100.0 / NULLIF(@TargetCount, 0) AS decimal(5,1)) AS nvarchar(10)) + N'%%)'
@@ -5444,7 +5444,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          @start, @end, 0, NULL, @extended_info);
                 END
 
-                -- #54: Re-enable SYSTEM_VERSIONING after successful temporal history rebuild
+                -- #84: Re-enable SYSTEM_VERSIONING after successful temporal history rebuild
                 IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
                 BEGIN
                     SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
@@ -5555,7 +5555,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          @start, @end, @err_number, @err_message, @extended_info);
                 END
 
-                -- #54: Re-enable SYSTEM_VERSIONING after failed temporal history rebuild
+                -- #84: Re-enable SYSTEM_VERSIONING after failed temporal history rebuild
                 IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
                 BEGIN
                     SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'

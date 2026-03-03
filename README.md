@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0225
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0302i
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -41,6 +41,14 @@ sp_HeapDoctor is built around three ideas:
 - **Scan phase time limit** - when `@MaxRunSeconds` is set, the discovery loop checks elapsed time between databases.  If time is exhausted during scanning, remaining databases are skipped so the execution phase can still process whatever targets were found.
 - **Pre-flight lock check** - before each rebuild, checks `dm_tran_locks` for other sessions holding locks on the target table.  If found, emits a warning that Sch-M acquisition may block or be blocked.  Does not prevent the rebuild.
 - **Obfuscation for external sharing** - `@ObfuscateKey` replaces database/schema/table names with deterministic hex pseudonyms in result sets and CommandLog.  `@RevealKey` decrypts the mapping from a previous run.  `@ObfuscateSeed` enables consistent pseudonyms across environments for side-by-side comparison.
+- **Resumable CI swap** - `@UseResumable = 1` (default) adds `RESUMABLE = ON` to CI swap CREATE INDEX.  If the operation is interrupted, the next run detects the paused index and issues ALTER INDEX ... RESUME instead of starting over.
+- **Temporal history support** - `@IncludeTemporalHistory = 1` discovers forwarded-record history tables that are normally excluded.  Auto-disables SYSTEM_VERSIONING on the parent before rebuild and re-enables after (both success and failure paths).
+- **Permission pre-check** - `@CheckPermissionsOnly = 1` validates ALTER TRACE, VIEW DATABASE STATE, ALTER, and CommandLog INSERT permissions without executing.  Respects `@Databases` for scoping.
+- **Script generation** - `@GenerateScript = 1` outputs an executable T-SQL rebuild script instead of running rebuilds.  Copy, paste, review, run.
+- **Result persistence** - `@OutputTable` writes the result set to a user-specified table for automation and trending.  Creates the table if it doesn't exist.
+- **Pre-flight safety checks** - log space (skips when insufficient), tempdb space (advisory), FK references (informational), AG failover detection, INSTEAD OF trigger detection, LOB TOCTOU re-check at execution time.
+- **Impact projections** - `size_mb`, `est_space_savings_mb`, `est_ci_swap_overhead_mb`, `est_log_mb`, and `days_since_last_rebuild` help operators size maintenance windows and anticipate log growth.
+- **IO latch wait stats** - `page_io_latch_wait_count` and `page_io_latch_wait_ms` per heap from `dm_db_index_operational_stats`.  High values indicate disk pressure independent of forwarded records.
 
 ## Requirements
 
@@ -111,6 +119,29 @@ EXEC dbo.sp_HeapDoctor
 EXEC dbo.sp_HeapDoctor
     @RevealKey   = 'my secret passphrase',
     @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
+
+-- 10) Check permissions before running
+EXEC dbo.sp_HeapDoctor
+    @Databases          = 'USER_DATABASES',
+    @CheckPermissionsOnly = 1;
+
+-- 11) Generate copy-paste rebuild script
+EXEC dbo.sp_HeapDoctor
+    @Databases      = 'USER_DATABASES',
+    @GenerateScript = 1;
+
+-- 12) Include temporal history table heaps
+EXEC dbo.sp_HeapDoctor
+    @IncludeTemporalHistory = 1,
+    @PlanOnly               = 1;
+
+-- 13) Resumable CI swap with fill factor
+EXEC dbo.sp_HeapDoctor
+    @AllowCiSwap  = 1,
+    @PreferCiSwap = 1,
+    @UseResumable = 1,
+    @FillFactor   = 90,
+    @PlanOnly     = 0;
 ```
 
 ## Before You Run @PlanOnly = 0
@@ -173,6 +204,10 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@OnlinePreference` | `'AUTO'` | `AUTO` (edition-based), `ON` (prefer; falls back to offline with warning), `OFF` (force offline) |
 | `@AllowCiSwap` | `0` | Enable CI swap path |
 | `@PreferCiSwap` | `0` | Prefer CI swap when safe key exists + online allowed |
+| `@FillFactor` | `0` | Fill factor for CI swap CREATE INDEX (0 = server default, 1-100) |
+| `@UpdateStatsAfterRebuild` | `0` | Run `UPDATE STATISTICS WITH FULLSCAN` after each successful rebuild |
+| `@UseResumable` | `1` | `RESUMABLE = ON` for CI swap CREATE INDEX (SQL 2017+).  Detects and resumes paused operations |
+| `@IncludeTemporalHistory` | `0` | Include temporal history table heaps.  Auto-manages SYSTEM_VERSIONING during rebuilds |
 
 ### Execution
 
@@ -185,6 +220,9 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@MaxRunSeconds` | `NULL` | Stop after N seconds (`NULL` = no limit) |
 | `@ScanThrottleMs` | `NULL` | Milliseconds to pause between database scans (0-60000).  Reduces latch contention on busy servers |
 | `@ResumeRunID` | `NULL` | Load targets from a prior `@PlanOnly=1` HEAP_SCAN_SUMMARY.  Skips discovery and QS analysis.  Requires `@LogToTable='Y'` on the original run |
+| `@Force` | `0` | Bypass orphaned applock from KILLed sessions.  Use when prior run was killed and the re-entrancy guard blocks new runs |
+| `@AllowReplicationRebuild` | `0` | Allow published heap rebuilds (shows estimated replication events).  Heaps with `replication_hint` are skipped by default |
+| `@CheckPermissionsOnly` | `0` | Check permissions (ALTER TRACE, VIEW DATABASE STATE, ALTER, CommandLog INSERT) and return without executing |
 
 ### Estimation
 
@@ -192,6 +230,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 |-----------|---------|-------------|
 | `@EstimateTime` | `0` | Show estimated rebuild time per target based on CommandLog history and live calibration |
 | `@EstimateLookbackDays` | `90` | CommandLog history window for throughput rates (days) |
+| `@BaselineRebuildMBPerMin` | `NULL` | Cold-start MB/min when no CommandLog history.  Provides ETA on first run without waiting for calibration data |
 
 ### Logging
 
@@ -209,6 +248,13 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@ObfuscateSeed` | `NULL` | Optional seed for cross-environment consistency.  Same key + same seed on different servers produces identical pseudonyms.  When NULL, auto-seeded with RunID (unique per run) |
 | `@RevealKey` | `NULL` | Passphrase to decrypt a previous obfuscated run.  Must match the `@ObfuscateKey` used in the original run.  Requires `@RevealRunID` |
 | `@RevealRunID` | `NULL` | RunID (uniqueidentifier) of the obfuscated run to decrypt.  The RunID is displayed in the RAISERROR output when obfuscation is applied |
+
+### Script & Output
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@OutputTable` | `NULL` | Persist result set to a user-specified table (3-part name).  Creates the table if it doesn't exist |
+| `@GenerateScript` | `0` | Output executable T-SQL rebuild script instead of running rebuilds |
 
 ### Output Parameters
 
@@ -283,6 +329,13 @@ The target list result set (returned in both plan-only and execute modes) contai
 |--------|------|-------------|
 | `nci_count` | int | Nonclustered index count.  Each NCI is rebuilt twice during CI swap |
 | `key_source_index` | sysname | NC index used as CI swap key source.  NULL if no safe key or CI swap disabled |
+| `partition_count` | int | Number of partitions.  > 1 blocks CI swap |
+| `has_schema_bound_views` | int | 1 if schema-bound views depend on this table (blocks CI swap) |
+| `has_indexed_views` | int | 1 if indexed views reference this table (blocks CI swap) |
+| `has_fk_references` | int | 1 if foreign keys reference this table (informational, does not block CI swap) |
+| `fk_ref_count` | int | Count of FK references to this table |
+| `filegroup_name` | sysname | Heap's filegroup.  CI swap uses `ON [filegroup]` clause for non-PRIMARY |
+| `is_temporal_history` | bit | 1 if temporal history table.  CI swap blocked; rebuild only |
 
 ### Action and Commands
 
@@ -338,6 +391,23 @@ The target list result set (returned in both plan-only and execute modes) contai
 | `sqlserver_start_time` | datetime | SQL Server instance start time (from `sys.dm_os_sys_info`).  Contextualizes `forwarded_fetch_count` age: low counts after a recent restart mean little |
 | `uptime_hours` | decimal(10,1) | Hours since SQL Server started.  Used internally for fetch-rate normalization (min 1.0).  Helps operators gauge counter reliability |
 
+### Impact Projections
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `size_mb` | decimal(18,2) | Heap size in MB (`page_count / 128.0`) |
+| `est_space_savings_mb` | decimal(18,2) | Projected space recovery when `avg_page_space_pct < 75%`.  NULL when pages are already dense |
+| `est_ci_swap_overhead_mb` | decimal(18,2) | Temp CI sort space estimate for CI_SWAP targets.  NULL for heap rebuilds |
+| `est_log_mb` | decimal(18,2) | Estimated transaction log consumption (FULL recovery model only).  NULL for SIMPLE recovery |
+| `days_since_last_rebuild` | int | Days since last successful rebuild (from CommandLog).  NULL if never rebuilt or no CommandLog |
+
+### IO Wait Stats
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `page_io_latch_wait_count` | bigint | Page IO latch wait count from `dm_db_index_operational_stats`.  High values indicate disk pressure independent of forwarded records |
+| `page_io_latch_wait_ms` | bigint | Page IO latch wait time in milliseconds |
+
 ## How It Works
 
 1. **Database selection** - parses `@Databases` using the Ola Hallengren pattern (wildcards, exclusions, AG awareness).  AG secondaries are automatically skipped because you can't rebuild on a read-only replica, no matter how badly you want to.
@@ -380,7 +450,7 @@ The discovery phase silently skips objects that would fail or cause problems dur
 
 - **Memory-optimized tables** - in-memory OLTP tables don't have forwarded records
 - **Tables with columnstore indexes** - incompatible with heap rebuild
-- **System-versioned temporal tables** - both the temporal table and its history table are excluded (`sys.tables.temporal_type`)
+- **System-versioned temporal tables** - the temporal parent is always excluded.  History table heaps are excluded by default but can be included via `@IncludeTemporalHistory = 1` (auto-manages SYSTEM_VERSIONING lifecycle during rebuilds)
 - **Graph tables** - node and edge tables are excluded (`is_node`, `is_edge`)
 - **Ledger tables** (SQL Server 2022+) - append-only tables are excluded (`sys.tables.ledger_type`).  Safe no-op on older versions
 - **Always Encrypted columns** - excluded from CI swap key selection only (the heap itself is still rebuilt, but the proc won't pick an AE column as a clustered index key)
@@ -393,16 +463,27 @@ Heaps with ROW or PAGE compression are rebuilt with the same compression level. 
 
 During execution, the proc checks for conditions that may affect rebuild performance or safety and emits RAISERROR warnings (severity 10, non-fatal):
 
+- **SQL 2017 version check** - clear error at startup if `ProductMajorVersion < 14` (STRING_AGG dependency)
 - **TDE-encrypted databases** - warns about 30-50% throughput reduction from encryption overhead
 - **AG synchronous replicas** - warns when large rebuilds (> 100K pages) will generate log traffic to sync-commit secondaries
+- **AG failover detection** - per-rebuild `DATABASEPROPERTYEX` check; SKIPs remaining targets in a failed-over database
 - **RCSI version store pressure** - warns when large online rebuilds may generate significant version store activity
 - **FULL recovery model** - warns when estimated log generation exceeds 1 GB (rebuilds generate full logging)
+- **Log space pre-flight** - per-rebuild check; SKIPs when `est_log_mb` exceeds available log free space
+- **Tempdb pre-flight** - post-discovery advisory when tempdb free space is low relative to the largest CI_SWAP target sort space estimate
 - **Active backups** - warns when a BACKUP is running on the target database (concurrent Sch-M may conflict)
 - **Replication/CDC** - warns about log reader traffic for published tables and capture instance issues for CDC + CI swap
-- **Lock escalation = TABLE** - warns that online rebuilds may escalate to a full table lock
+- **FK references** - informational advisory when a CI_SWAP target has FK references (lookup paths change during the swap window)
+- **INSTEAD OF triggers** - informational NOTE for CI swap targets (DDL doesn't fire DML triggers)
+- **Lock escalation = TABLE** - warns that online rebuilds may escalate to a full table lock.  Enhanced for CI_SWAP: warns that Sch-M blocks ALL readers including NOLOCK
 - **Write-heavy heaps** - warns that forwarded records will recur quickly after rebuild
+- **Churn detection** - warns when a heap has >= 5 rebuilds in 90 days (suggests a clustered index is needed, not more rebuilds)
+- **Resume staleness** - warns when resuming from a plan-only scan > 7 days old
 - **Statistics invalidation** - notes that auto-update statistics will fire on next query after rebuild
-- **Re-entrancy guard** - if another sp_HeapDoctor session is already running, the proc exits immediately with a warning rather than running concurrently.  Uses `sp_getapplock` with session scope
+- **LOB TOCTOU re-check** - at execution time, re-verifies LOB columns before CI swap to guard against schema changes between plan and execution
+- **Deprecation advisory** - `sp_trace_generateevent` wrapped in TRY/CATCH on SQL 2022+ (deprecated but still functional)
+- **CommandLog schema validation** - auto-disables logging when the CommandLog table schema is incompatible (prevents cryptic INSERT errors on old Ola Hallengren schema versions)
+- **Re-entrancy guard** - if another sp_HeapDoctor session is already running, the proc exits immediately with a warning rather than running concurrently.  Uses `sp_getapplock` with session scope.  `@Force = 1` bypasses an orphaned applock from a KILLed session
 
 ## CI Swap Technique
 
@@ -417,6 +498,13 @@ This eliminates forwarded records by physically reordering the data.  The temp C
 - Table contains LOB columns (`text`, `ntext`, `image`, `xml`, MAX types)
 - `@AllowCiSwap = 0` (default)
 - Not on Enterprise/Developer edition
+- Forced Query Store plans exist on the table
+- CDC-tracked table (protects capture instances from silent breakage)
+- Multi-partition heap (`partition_count > 1`)
+- Schema-bound views depend on the table
+- Indexed views reference the table
+- Temporal history table (`is_temporal_history = 1`)
+- Computed columns excluded from CI swap key candidates
 
 **Trade-off:** Every nonclustered index on the table gets rebuilt when the clustered index is created, *and again* when it's dropped.  Check the `nci_count` column in the output before committing to this.  A table with 2 NCIs?  Sure.  A table with 15 NCIs?  Maybe just do the heap rebuild.
 
@@ -508,7 +596,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>1.0.2026.0224</Version>
+  <Version>1.0.2026.0302i</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>

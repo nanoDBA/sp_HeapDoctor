@@ -8,7 +8,7 @@ Tests:
   23C - Wait stats columns present in HEAP_SCAN_SUMMARY XML
   23D - Wait stats columns survive resume mode
 
-  -- Issue #58: @BaselineRebuildMBPerMin cold-start ETA --
+  -- Issue #88: @BaselineRebuildMBPerMin cold-start ETA --
   23E - @BaselineRebuildMBPerMin parameter accepted
   23F - @BaselineRebuildMBPerMin=0 rejected (validation)
   23G - @BaselineRebuildMBPerMin=-1 rejected (validation)
@@ -89,7 +89,7 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 23: v1.0.2026.0302i (#22, #58) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 23: v1.0.2026.0302i (#22, #88) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 23A: #22 - page_io_latch_wait_count column exists in result set
@@ -170,9 +170,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 23E: #58 - @BaselineRebuildMBPerMin parameter accepted
+-- 23E: #88 - @BaselineRebuildMBPerMin parameter accepted
 ------------------------------------------------------------------------
-RAISERROR(N'Test 23E: @BaselineRebuildMBPerMin parameter accepted (#58)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 23E: @BaselineRebuildMBPerMin parameter accepted (#88)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -191,9 +191,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 23F: #58 - @BaselineRebuildMBPerMin=0 rejected
+-- 23F: #88 - @BaselineRebuildMBPerMin=0 rejected
 ------------------------------------------------------------------------
-RAISERROR(N'Test 23F: @BaselineRebuildMBPerMin=0 rejected (#58)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 23F: @BaselineRebuildMBPerMin=0 rejected (#88)...', 10, 1) WITH NOWAIT;
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor
@@ -215,9 +215,9 @@ END CATCH
 GO
 
 ------------------------------------------------------------------------
--- 23G: #58 - @BaselineRebuildMBPerMin=-1 rejected
+-- 23G: #88 - @BaselineRebuildMBPerMin=-1 rejected
 ------------------------------------------------------------------------
-RAISERROR(N'Test 23G: @BaselineRebuildMBPerMin=-1 rejected (#58)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 23G: @BaselineRebuildMBPerMin=-1 rejected (#88)...', 10, 1) WITH NOWAIT;
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor
@@ -239,9 +239,9 @@ END CATCH
 GO
 
 ------------------------------------------------------------------------
--- 23H: #58 - @BaselineRebuildMBPerMin in invocation_command
+-- 23H: #88 - @BaselineRebuildMBPerMin in invocation_command
 ------------------------------------------------------------------------
-RAISERROR(N'Test 23H: @BaselineRebuildMBPerMin in invocation_command (#58)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 23H: @BaselineRebuildMBPerMin in invocation_command (#88)...', 10, 1) WITH NOWAIT;
 
 DECLARE @pre_id23h int;
 SELECT @pre_id23h = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
@@ -272,9 +272,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 23I: #58 - Baseline populates est_pages_per_sec on targets
+-- 23I: #88 - Baseline populates est_pages_per_sec on targets
 ------------------------------------------------------------------------
-RAISERROR(N'Test 23I: Baseline populates est_pages_per_sec (#58)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 23I: Baseline populates est_pages_per_sec (#88)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results

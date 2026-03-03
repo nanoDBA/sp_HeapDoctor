@@ -5,13 +5,13 @@ Tests:
   -- Issue #24: Hardware context in debug banner --
   20A - @Debug=1 shows hardware context (schedulers, memory, NUMA)
 
-  -- Issue #47: @FillFactor for CI swap --
+  -- Issue #77: @FillFactor for CI swap --
   20B - @FillFactor=0 accepted (server default)
   20C - @FillFactor=80 included in CI swap CREATE INDEX
   20D - @FillFactor=101 rejected with error
   20E - @FillFactor in invocation_command when non-zero
 
-  -- Issue #39: Memory-optimized table detection --
+  -- Issue #70: Memory-optimized table detection --
   20F - Memory-optimized count message absent (no In-Memory OLTP tables in test DB)
 
   -- Issue #21: Idempotency guard --
@@ -94,7 +94,7 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 20: v1.0.2026.0302i (#24, #47, #39, #21) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 20: v1.0.2026.0302i (#24, #77, #70, #21) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 20A: #24 - @Debug=1 shows hardware context
@@ -117,9 +117,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 20B: #47 - @FillFactor=0 accepted (server default)
+-- 20B: #77 - @FillFactor=0 accepted (server default)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 20B: @FillFactor=0 accepted (#47)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 20B: @FillFactor=0 accepted (#77)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -136,9 +136,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 20C: #47 - @FillFactor=80 included in CI swap CREATE INDEX
+-- 20C: #77 - @FillFactor=80 included in CI swap CREATE INDEX
 ------------------------------------------------------------------------
-RAISERROR(N'Test 20C: @FillFactor=80 in CI swap command (#47)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 20C: @FillFactor=80 in CI swap command (#77)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -162,9 +162,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 20D: #47 - @FillFactor=101 rejected with error
+-- 20D: #77 - @FillFactor=101 rejected with error
 ------------------------------------------------------------------------
-RAISERROR(N'Test 20D: @FillFactor=101 rejected (#47)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 20D: @FillFactor=101 rejected (#77)...', 10, 1) WITH NOWAIT;
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor
@@ -186,9 +186,9 @@ END CATCH
 GO
 
 ------------------------------------------------------------------------
--- 20E: #47 - @FillFactor in invocation_command
+-- 20E: #77 - @FillFactor in invocation_command
 ------------------------------------------------------------------------
-RAISERROR(N'Test 20E: @FillFactor in invocation_command (#47)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 20E: @FillFactor in invocation_command (#77)...', 10, 1) WITH NOWAIT;
 
 DECLARE @pre_id20e int;
 SELECT @pre_id20e = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
@@ -218,9 +218,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 20F: #39 - Memory-optimized count (no In-Memory OLTP tables in test DB)
+-- 20F: #70 - Memory-optimized count (no In-Memory OLTP tables in test DB)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 20F: Memory-optimized table exclusion message (#39)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 20F: Memory-optimized table exclusion message (#70)...', 10, 1) WITH NOWAIT;
 
 -- HeapDoctorTest has no memory-optimized tables, so message should NOT appear
 -- We verify the code exists in the proc definition

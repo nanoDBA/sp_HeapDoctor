@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v1.0.2026.0302i: #25 @Force, #33 LOB TOCTOU, #40 CommandLog schema
+sp_HeapDoctor Test Harness - v1.0.2026.0302i: #25 @Force, #33 LOB TOCTOU, #71 CommandLog schema
 
 Tests:
   -- Issue #25: @Force parameter --
@@ -11,7 +11,7 @@ Tests:
   17D - CI swap falls back to heap rebuild when LOB column added post-discovery
   17E - Normal CI swap still works when no LOB columns added (fresh heap)
 
-  -- Issue #40: CommandLog schema validation --
+  -- Issue #71: CommandLog schema validation --
   17F - CommandLog with correct schema passes validation
   17G - CommandLog with missing column disables logging gracefully
   17H - CommandLog with non-xml ExtendedInfo disables logging gracefully
@@ -93,7 +93,7 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 17: v1.0.2026.0302i (#25 @Force, #33 LOB TOCTOU, #40 CommandLog schema) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 17: v1.0.2026.0302i (#25 @Force, #33 LOB TOCTOU, #71 CommandLog schema) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 17A: @Force=0 (default) does not interfere with normal execution

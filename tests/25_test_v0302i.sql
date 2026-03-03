@@ -2,14 +2,14 @@
 sp_HeapDoctor Test Harness - v1.0.2026.0302i: Batch I resumable + temporal
 
 Tests:
-  -- Issue #55: Resumable index for CI swap --
+  -- Issue #85: Resumable index for CI swap --
   25A - @UseResumable parameter accepted (default=1)
   25B - @UseResumable=0 accepted (opt out)
   25C - RESUMABLE = ON in CI swap DDL (code check)
   25D - Resume detection code exists (sys.index_resumable_operations)
   25E - @UseResumable in invocation_command when 0
 
-  -- Issue #54: Temporal history table support --
+  -- Issue #84: Temporal history table support --
   25F - @IncludeTemporalHistory=0 excludes history heaps (default)
   25G - @IncludeTemporalHistory=1 includes history heaps
   25H - Temporal history tables block CI swap (code check)
@@ -90,12 +90,12 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 25: v1.0.2026.0302i (#55, #54) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 25: v1.0.2026.0302i (#85, #84) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
--- 25A: #55 - @UseResumable=1 accepted (default)
+-- 25A: #85 - @UseResumable=1 accepted (default)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25A: @UseResumable=1 accepted (#55)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25A: @UseResumable=1 accepted (#85)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -113,9 +113,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25B: #55 - @UseResumable=0 accepted (opt out)
+-- 25B: #85 - @UseResumable=0 accepted (opt out)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25B: @UseResumable=0 accepted (#55)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25B: @UseResumable=0 accepted (#85)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -133,9 +133,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25C: #55 - RESUMABLE = ON in CI swap DDL (code check)
+-- 25C: #85 - RESUMABLE = ON in CI swap DDL (code check)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25C: RESUMABLE = ON in CI swap DDL (#55)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25C: RESUMABLE = ON in CI swap DDL (#85)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_resumable bit = 0;
 EXEC master.sys.sp_executesql
@@ -154,9 +154,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25D: #55 - Resume detection code exists (sys.index_resumable_operations)
+-- 25D: #85 - Resume detection code exists (sys.index_resumable_operations)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25D: Resume detection code exists (#55)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25D: Resume detection code exists (#85)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_resume_detect bit = 0;
 EXEC master.sys.sp_executesql
@@ -176,9 +176,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25E: #55 - @UseResumable=0 in invocation_command
+-- 25E: #85 - @UseResumable=0 in invocation_command
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25E: @UseResumable=0 in invocation_command (#55)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25E: @UseResumable=0 in invocation_command (#85)...', 10, 1) WITH NOWAIT;
 
 DECLARE @pre_id25e int;
 SELECT @pre_id25e = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;
@@ -208,7 +208,7 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- Setup: Create temporal history table heap for #54 tests
+-- Setup: Create temporal history table heap for #84 tests
 ------------------------------------------------------------------------
 RAISERROR(N'  Setup: Creating temporal table with history heap...', 10, 1) WITH NOWAIT;
 
@@ -263,9 +263,9 @@ ALTER TABLE dbo.TemporalTest SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = dbo.Te
 GO
 
 ------------------------------------------------------------------------
--- 25F: #54 - @IncludeTemporalHistory=0 excludes history heaps
+-- 25F: #84 - @IncludeTemporalHistory=0 excludes history heaps
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25F: @IncludeTemporalHistory=0 excludes history heaps (#54)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25F: @IncludeTemporalHistory=0 excludes history heaps (#84)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -282,9 +282,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25G: #54 - @IncludeTemporalHistory=1 includes history heaps
+-- 25G: #84 - @IncludeTemporalHistory=1 includes history heaps
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25G: @IncludeTemporalHistory=1 includes history heaps (#54)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25G: @IncludeTemporalHistory=1 includes history heaps (#84)...', 10, 1) WITH NOWAIT;
 
 DELETE FROM #Results;
 INSERT INTO #Results
@@ -308,9 +308,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25H: #54 - Temporal history tables block CI swap (code check)
+-- 25H: #84 - Temporal history tables block CI swap (code check)
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25H: Temporal history blocks CI swap (#54)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25H: Temporal history blocks CI swap (#84)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_temporal_ci_block bit = 0;
 EXEC master.sys.sp_executesql
@@ -329,9 +329,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25I: #54 - SYSTEM_VERSIONING disable/enable code exists
+-- 25I: #84 - SYSTEM_VERSIONING disable/enable code exists
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25I: SYSTEM_VERSIONING disable/enable code exists (#54)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25I: SYSTEM_VERSIONING disable/enable code exists (#84)...', 10, 1) WITH NOWAIT;
 
 DECLARE @has_versioning bit = 0;
 EXEC master.sys.sp_executesql
@@ -351,9 +351,9 @@ ELSE
 GO
 
 ------------------------------------------------------------------------
--- 25J: #54 - @IncludeTemporalHistory in invocation_command
+-- 25J: #84 - @IncludeTemporalHistory in invocation_command
 ------------------------------------------------------------------------
-RAISERROR(N'Test 25J: @IncludeTemporalHistory in invocation_command (#54)...', 10, 1) WITH NOWAIT;
+RAISERROR(N'Test 25J: @IncludeTemporalHistory in invocation_command (#84)...', 10, 1) WITH NOWAIT;
 
 DECLARE @pre_id25j int;
 SELECT @pre_id25j = ISNULL(MAX(ID), 0) FROM dbo.CommandLog;

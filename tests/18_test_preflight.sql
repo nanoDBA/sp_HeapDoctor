@@ -1,15 +1,15 @@
 /*
-sp_HeapDoctor Test Harness - Pre-flight Safety Checks (#44, #49, #20)
+sp_HeapDoctor Test Harness - Pre-flight Safety Checks (#74, #79, #20)
 
 Tests:
-  -- Issue #44: FK references TO heap detection --
+  -- Issue #74: FK references TO heap detection --
   18A - has_fk_references=1 when FK references the heap
   18B - fk_ref_count matches actual FK count
   18C - has_fk_references=0 when no FKs reference the heap
   18D - FK info warning message emitted for CI_SWAP targets with FK references
   18E - FK columns in HEAP_SCAN_SUMMARY XML
 
-  -- Issue #49: Log space pre-flight --
+  -- Issue #79: Log space pre-flight --
   18F - est_log_mb populated for FULL recovery heaps
 
   -- Issue #20: Tempdb pre-flight --
@@ -91,7 +91,7 @@ GO
 -- Capture result set
 ------------------------------------------------------------------------
 RAISERROR(N'', 10, 1) WITH NOWAIT;
-RAISERROR(N'=== Batch 18: Pre-flight Safety Checks (#44 FK, #49 Log Space, #20 Tempdb) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 18: Pre-flight Safety Checks (#74 FK, #79 Log Space, #20 Tempdb) ===', 10, 1) WITH NOWAIT;
 RAISERROR(N'', 10, 1) WITH NOWAIT;
 
 IF OBJECT_ID(N'tempdb..#Results') IS NOT NULL DROP TABLE #Results;
