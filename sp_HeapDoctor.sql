@@ -483,6 +483,9 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     -- Pre-flight
     @CheckPermissionsOnly    bit            = 0,                -- #18: check required permissions and return (no DDL/DML)
 
+    -- CI swap options
+    @FillFactor              tinyint        = 0,                -- #47: fill factor for CI swap CREATE INDEX (0 = server default)
+
     -- Safety
     @AllowReplicationRebuild bit            = 0,                -- #59: opt-in for published heaps (default: skip)
     @Force                   bit            = 0                 -- bypass re-entrancy guard (use when prior run was KILLed and applock is orphaned)
@@ -495,7 +498,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302c';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302d';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -547,6 +550,7 @@ COMMON PARAMETERS:
   @OnlinePreference  varchar = AUTO     AUTO | ON (require) | OFF (force offline)
   @AllowCiSwap       bit     = 0       Allow CI swap rebuild path.
   @PreferCiSwap      bit     = 0       Prefer CI swap when safe key exists + online allowed.
+  @FillFactor        tinyint = 0       Fill factor for CI swap CREATE INDEX (0=server default, 1-100).
   @Maxdop            int     = NULL    MAXDOP on index ops (NULL=omit, 0=unlimited).
   @LockTimeoutMs     int     = NULL    Per-rebuild lock timeout in ms (NULL=don''t set).
   @MaxRunSeconds     int     = NULL    Stop after N seconds (NULL=no limit).
@@ -832,6 +836,13 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     IF @Maxdop IS NOT NULL AND @Maxdop < 0
     BEGIN
         RAISERROR(N'@Maxdop cannot be negative.', 16, 1);
+        RETURN;
+    END
+
+    -- #47: @FillFactor validation
+    IF @FillFactor < 0 OR @FillFactor > 100
+    BEGIN
+        RAISERROR(N'@FillFactor must be between 0 and 100. Use 0 for server default.', 16, 1);
         RETURN;
     END
 
@@ -1122,6 +1133,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @ObfuscateSeed = N''' + REPLACE(@ObfuscateSeed, N'''', N'''''') + N'''';
     IF @ResumeRunID IS NOT NULL
         SET @invocation_command += N', @ResumeRunID = ''' + CAST(@ResumeRunID AS nvarchar(36)) + N'''';
+    IF @FillFactor > 0
+        SET @invocation_command += N', @FillFactor = ' + CAST(@FillFactor AS nvarchar(3));
     IF @AllowReplicationRebuild = 1
         SET @invocation_command += N', @AllowReplicationRebuild = 1';
     IF @CheckPermissionsOnly = 1
@@ -1361,6 +1374,24 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         DECLARE @dbg_CanOnline int = CAST(@CanOnline AS int), @dbg_Online int = CAST(@Online AS int);
         RAISERROR(N'[DEBUG] EngineEdition = %d, CanOnline = %d, Online = %d', 10, 1, @EngineEdition, @dbg_CanOnline, @dbg_Online) WITH NOWAIT;
+
+        -- #24: Hardware context for troubleshooting
+        BEGIN TRY
+            DECLARE @dbg_schedulers int, @dbg_memory_gb int, @dbg_numa int;
+            DECLARE @dbg_uptime_hrs decimal(10,1);
+            SELECT @dbg_schedulers = cpu_count,
+                   @dbg_memory_gb = CAST(physical_memory_kb / 1048576.0 AS int),
+                   @dbg_numa = ISNULL(numa_node_count, 1),
+                   @dbg_uptime_hrs = CAST(DATEDIFF(MINUTE, sqlserver_start_time, GETUTCDATE()) / 60.0 AS decimal(10,1))
+            FROM sys.dm_os_sys_info;
+            RAISERROR(N'[DEBUG] Schedulers = %d, Physical Memory = %d GB, NUMA nodes = %d', 10, 1, @dbg_schedulers, @dbg_memory_gb, @dbg_numa) WITH NOWAIT;
+            SET @Msg = N'[DEBUG] SQL uptime = ' + CAST(@dbg_uptime_hrs AS nvarchar(20)) + N' hours';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END TRY
+        BEGIN CATCH
+            RAISERROR(N'[DEBUG] Hardware info unavailable.', 10, 1) WITH NOWAIT;
+        END CATCH
+
         RAISERROR(N'[DEBUG] Selected databases:', 10, 1) WITH NOWAIT;
 
         DECLARE @dbg_cursor sysname;
@@ -1999,8 +2030,12 @@ WHERE o.is_memory_optimized = 0
 
         SET @discovery_sql += N';
 
+-- #39: Count memory-optimized tables excluded from discovery
+DECLARE @MemOptCount int = (SELECT COUNT(*) FROM sys.tables WHERE is_memory_optimized = 1);
 DECLARE @HeapTableCount int = (SELECT COUNT(*) FROM #HeapObjects);
 SET @Msg_inner = N''  '' + CAST(@HeapTableCount AS nvarchar(10)) + N'' heap table(s) to scan (non-heap objects skipped).'';
+IF @MemOptCount > 0
+    SET @Msg_inner = @Msg_inner + N'' ('' + CAST(@MemOptCount AS nvarchar(10)) + N'' memory-optimized table(s) excluded)'';
 RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
 SET ANSI_WARNINGS OFF;  -- suppress "Null value is eliminated by an aggregate" from DMV aggregation
@@ -2398,6 +2433,7 @@ SELECT TOP (@TopN_param)
             CASE WHEN r.heap_compression = 1 THEN N'', DATA_COMPRESSION = ROW''
                  WHEN r.heap_compression = 2 THEN N'', DATA_COMPRESSION = PAGE''
                  ELSE N'''' END +
+            CASE WHEN @FillFactor_param > 0 THEN N'', FILLFACTOR = '' + CAST(@FillFactor_param AS nvarchar(3)) ELSE N'''' END +
             COALESCE(N'', MAXDOP = '' + CAST(@Maxdop_param AS nvarchar(10)), N'''') + N'')'' +
             -- #26: CI swap must land on same filegroup as the heap
             CASE WHEN r.data_space_name IS NOT NULL AND r.data_space_name <> N''PRIMARY''
@@ -2764,7 +2800,7 @@ END
                 N'@MinPages_param bigint, @MaxPages_param bigint, @MinForwardedPct_param decimal(6,2),
                   @LookbackDays_param int, @TopN_param int,
                   @AllowCiSwap_param bit, @PreferCiSwap_param bit, @Online_param bit,
-                  @Maxdop_param int, @CpuSource_param varchar(20), @UptimeHours_param float',
+                  @Maxdop_param int, @FillFactor_param tinyint, @CpuSource_param varchar(20), @UptimeHours_param float',
                 @MinPages_param = @MinPages,
                 @MaxPages_param = @MaxPages,
                 @MinForwardedPct_param = @MinForwardedPct,
@@ -2774,6 +2810,7 @@ END
                 @PreferCiSwap_param = @PreferCiSwap,
                 @Online_param = @Online,
                 @Maxdop_param = @Maxdop,
+                @FillFactor_param = @FillFactor,
                 @CpuSource_param = @CpuSourceUpper,
                 @UptimeHours_param = @UptimeHours;
         END TRY
