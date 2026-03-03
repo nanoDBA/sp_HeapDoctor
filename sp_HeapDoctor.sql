@@ -492,7 +492,11 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 
     -- Safety
     @AllowReplicationRebuild bit            = 0,                -- #59: opt-in for published heaps (default: skip)
-    @Force                   bit            = 0                 -- bypass re-entrancy guard (use when prior run was KILLed and applock is orphaned)
+    @Force                   bit            = 0,                -- bypass re-entrancy guard (use when prior run was KILLed and applock is orphaned)
+
+    -- Output
+    @OutputTable             nvarchar(256)  = NULL,             -- #16: persist results to a table (e.g. 'dbo.HeapDoctorHistory')
+    @GenerateScript          bit            = 0                 -- #23: output executable T-SQL script per target
 )
 /*#endregion 00-HEADER */
 
@@ -502,7 +506,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302g';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302h';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -568,6 +572,9 @@ COMMON PARAMETERS:
   @CheckPermissionsOnly bit  = 0       Check required permissions per database and return.
   @AllowReplicationRebuild bit = 0    Published heaps skipped unless 1 (replication log flood risk).
   @Force             bit     = 0       Bypass re-entrancy guard (orphaned applock from KILLed run).
+  @OutputTable       nvarchar(256) = NULL  Persist results to a table (auto-created if missing).
+                                        e.g. dbo.HeapDoctorHistory. Includes RunID + CapturedAt.
+  @GenerateScript    bit     = 0       Output executable T-SQL script (implies @PlanOnly=1).
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'
@@ -889,6 +896,21 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RETURN;
     END
 
+    -- #16: @OutputTable validation
+    IF @OutputTable IS NOT NULL
+    BEGIN
+        -- Validate table name format (schema.table or table)
+        IF CHARINDEX(N' ', @OutputTable) > 0
+        BEGIN
+            RAISERROR(N'@OutputTable must not contain spaces. Use schema.table format (e.g. dbo.HeapDoctorHistory).', 16, 1);
+            RETURN;
+        END
+    END
+
+    -- #23: @GenerateScript is mutually exclusive with @PlanOnly=0 when @Execute='Y'
+    IF @GenerateScript = 1
+        SET @PlanOnly = 1;  -- GenerateScript implies plan-only (no DDL executed)
+
     IF @ObfuscateSeed IS NOT NULL AND @ObfuscateKey IS NULL
         RAISERROR(N'WARNING: @ObfuscateSeed is ignored without @ObfuscateKey.', 10, 1) WITH NOWAIT;
 
@@ -1164,6 +1186,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @BaselineRebuildMBPerMin = ' + CAST(@BaselineRebuildMBPerMin AS nvarchar(10));
     IF @Force = 1
         SET @invocation_command += N', @Force = 1';
+    IF @OutputTable IS NOT NULL
+        SET @invocation_command += N', @OutputTable = N''' + REPLACE(@OutputTable, N'''', N'''''') + N'''';
+    IF @GenerateScript = 1
+        SET @invocation_command += N', @GenerateScript = 1';
     SET @invocation_command += N';';
 
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
@@ -3959,6 +3985,191 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         page_io_latch_wait_ms
     FROM #Targets
     ORDER BY sort_order;
+
+    -- #16: @OutputTable - persist results to a user-specified table
+    IF @OutputTable IS NOT NULL
+    BEGIN
+        DECLARE @output_sql nvarchar(max);
+        DECLARE @output_table_exists bit = 0;
+
+        -- Check if table exists
+        SET @output_sql = N'IF OBJECT_ID(' + QUOTENAME(@OutputTable, N'''') + N') IS NOT NULL SET @exists = 1;';
+        EXEC sp_executesql @output_sql, N'@exists bit OUTPUT', @exists = @output_table_exists OUTPUT;
+
+        -- Create table if it doesn't exist
+        IF @output_table_exists = 0
+        BEGIN
+            SET @output_sql = N'CREATE TABLE ' + @OutputTable + N' (
+                run_id               uniqueidentifier NOT NULL,
+                captured_at          datetime2(3)     NOT NULL DEFAULT SYSUTCDATETIME(),
+                version              nvarchar(20)     NULL,
+                target_id            int              NOT NULL,
+                sort_order           int              NOT NULL,
+                database_name        sysname          NOT NULL,
+                schema_name          sysname          NOT NULL,
+                table_name           sysname          NOT NULL,
+                page_count           bigint           NOT NULL,
+                record_count         bigint           NULL,
+                forwarded_record_count bigint         NOT NULL,
+                forwarded_pct        decimal(6,2)     NOT NULL,
+                forwarded_fetch_count bigint          NULL,
+                avg_page_space_pct   decimal(5,2)     NULL,
+                avg_frag_pct         decimal(5,2)     NULL,
+                ghost_record_count   bigint           NULL,
+                total_cpu_ms         bigint           NULL,
+                ranking_basis        varchar(20)      NOT NULL,
+                nci_count            int              NOT NULL,
+                key_source_index     sysname          NULL,
+                action_chosen        varchar(32)      NOT NULL,
+                est_pages_per_sec    float            NULL,
+                est_seconds          int              NULL,
+                est_duration         nvarchar(20)     NULL,
+                usage_hint           varchar(30)      NULL,
+                ranking_score        decimal(8,4)     NULL,
+                ranking_algo_version nvarchar(10)     NULL,
+                heap_compression     varchar(4)       NULL,
+                replication_hint     varchar(20)      NULL,
+                lock_escalation      varchar(10)      NULL,
+                partition_count      int              NULL,
+                has_fk_references    int              NULL,
+                fk_ref_count         int              NULL,
+                filegroup_name       sysname          NULL,
+                command_text         nvarchar(max)    NULL,
+                size_mb              decimal(18,2)    NULL,
+                est_log_mb           decimal(18,2)    NULL,
+                days_since_last_rebuild int           NULL,
+                page_io_latch_wait_count bigint       NULL,
+                page_io_latch_wait_ms bigint          NULL
+            );';
+            BEGIN TRY
+                EXEC sp_executesql @output_sql;
+                SET @Msg = N'Created output table ' + @OutputTable + N'.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END TRY
+            BEGIN CATCH
+                SET @Msg = N'WARNING: Could not create output table ' + @OutputTable + N': ' + LEFT(ERROR_MESSAGE(), 500);
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END CATCH
+        END
+
+        -- Insert results into output table
+        BEGIN TRY
+            SET @output_sql = N'INSERT INTO ' + @OutputTable + N' (
+                run_id, version, target_id, sort_order,
+                database_name, schema_name, table_name,
+                page_count, record_count, forwarded_record_count, forwarded_pct,
+                forwarded_fetch_count, avg_page_space_pct, avg_frag_pct,
+                ghost_record_count, total_cpu_ms, ranking_basis, nci_count,
+                key_source_index, action_chosen, est_pages_per_sec, est_seconds, est_duration,
+                usage_hint, ranking_score, ranking_algo_version, heap_compression,
+                replication_hint, lock_escalation, partition_count,
+                has_fk_references, fk_ref_count, filegroup_name,
+                command_text, size_mb, est_log_mb, days_since_last_rebuild,
+                page_io_latch_wait_count, page_io_latch_wait_ms
+            )
+            SELECT
+                @RunID, @Version, target_id, sort_order,
+                CASE WHEN @obfuscate = 1 THEN pseudo_database_name ELSE database_name END,
+                CASE WHEN @obfuscate = 1 THEN pseudo_schema_name   ELSE schema_name   END,
+                CASE WHEN @obfuscate = 1 THEN pseudo_table_name    ELSE table_name    END,
+                page_count, record_count, forwarded_record_count, forwarded_pct,
+                forwarded_fetch_count, avg_page_space_pct, avg_frag_pct,
+                ghost_record_count, total_cpu_ms, ranking_basis, nci_count,
+                CASE WHEN @obfuscate = 1 THEN pseudo_key_index ELSE key_source_index END,
+                action_chosen, est_pages_per_sec, est_seconds, est_duration,
+                usage_hint, ranking_score, @RankingAlgoVersion,
+                CASE heap_compression WHEN 1 THEN ''ROW'' WHEN 2 THEN ''PAGE'' ELSE ''NONE'' END,
+                replication_hint,
+                CASE lock_escalation WHEN 0 THEN ''TABLE'' WHEN 1 THEN ''DISABLE'' WHEN 2 THEN ''AUTO'' ELSE ''UNKNOWN'' END,
+                partition_count,
+                CAST(has_fk_references AS int), fk_ref_count, data_space_name,
+                CASE WHEN @obfuscate = 1 THEN pseudo_command_text ELSE command_text END,
+                size_mb, est_log_mb, days_since_last_rebuild,
+                page_io_latch_wait_count, page_io_latch_wait_ms
+            FROM #Targets
+            ORDER BY sort_order;';
+            EXEC sp_executesql @output_sql,
+                N'@RunID uniqueidentifier, @Version nvarchar(20), @RankingAlgoVersion nvarchar(10), @obfuscate bit',
+                @RunID = @RunID, @Version = @Version, @RankingAlgoVersion = @RankingAlgoVersion, @obfuscate = @obfuscate;
+
+            DECLARE @output_row_count int = @@ROWCOUNT;
+            SET @Msg = N'Inserted ' + CAST(@output_row_count AS nvarchar(10)) + N' row(s) into ' + @OutputTable
+                     + N'. RunID=' + CAST(@RunID AS nvarchar(36));
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END TRY
+        BEGIN CATCH
+            SET @Msg = N'WARNING: Could not insert into output table ' + @OutputTable + N': ' + LEFT(ERROR_MESSAGE(), 500);
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END CATCH
+    END
+
+    -- #23: @GenerateScript - output executable T-SQL script per target
+    IF @GenerateScript = 1 AND EXISTS (SELECT 1 FROM #Targets)
+    BEGIN
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'-- Generated rebuild script (paste into SSMS to execute):', 10, 1) WITH NOWAIT;
+        RAISERROR(N'-- ================================================================', 10, 1) WITH NOWAIT;
+
+        DECLARE @script_target_id int;
+        DECLARE @script_db sysname;
+        DECLARE @script_schema sysname;
+        DECLARE @script_table sysname;
+        DECLARE @script_action varchar(32);
+        DECLARE @script_cmd nvarchar(max);
+        DECLARE @script_ci_drop nvarchar(max);
+        DECLARE @script_verify nvarchar(max);
+        DECLARE @script_est nvarchar(20);
+        DECLARE @script_size decimal(18,2);
+        DECLARE @script_sort int;
+        DECLARE @script_line nvarchar(4000);
+
+        DECLARE script_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT sort_order, target_id,
+                   CASE WHEN @obfuscate = 1 THEN pseudo_database_name ELSE database_name END,
+                   CASE WHEN @obfuscate = 1 THEN pseudo_schema_name   ELSE schema_name   END,
+                   CASE WHEN @obfuscate = 1 THEN pseudo_table_name    ELSE table_name    END,
+                   action_chosen,
+                   CASE WHEN @obfuscate = 1 THEN pseudo_command_text  ELSE command_text  END,
+                   CASE WHEN @obfuscate = 1 THEN pseudo_ci_drop       ELSE ci_drop_command END,
+                   CASE WHEN @obfuscate = 1 THEN pseudo_verify_cmd    ELSE verify_command  END,
+                   est_duration, size_mb
+            FROM #Targets
+            ORDER BY sort_order;
+        OPEN script_cursor;
+        FETCH NEXT FROM script_cursor INTO @script_sort, @script_target_id, @script_db, @script_schema, @script_table,
+              @script_action, @script_cmd, @script_ci_drop, @script_verify, @script_est, @script_size;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @script_line = N'-- [' + CAST(@script_sort AS nvarchar(10)) + N'] '
+                             + REPLACE(REPLACE(@script_db + N'.' + @script_schema + N'.' + @script_table, N'%', N'%%'), N'''', N'''''')
+                             + N'  (' + @script_action
+                             + CASE WHEN @script_size IS NOT NULL THEN N', ' + CAST(@script_size AS nvarchar(20)) + N' MB' ELSE N'' END
+                             + CASE WHEN @script_est IS NOT NULL THEN N', est ' + @script_est ELSE N'' END
+                             + N')';
+            RAISERROR(@script_line, 10, 1) WITH NOWAIT;
+            RAISERROR(@script_cmd, 10, 1) WITH NOWAIT;
+
+            IF @script_ci_drop IS NOT NULL
+                RAISERROR(@script_ci_drop, 10, 1) WITH NOWAIT;
+
+            IF @script_verify IS NOT NULL
+            BEGIN
+                SET @script_line = N'-- Verify: ' + @script_verify;
+                RAISERROR(@script_line, 10, 1) WITH NOWAIT;
+            END
+
+            RAISERROR(N'GO', 10, 1) WITH NOWAIT;
+
+            FETCH NEXT FROM script_cursor INTO @script_sort, @script_target_id, @script_db, @script_schema, @script_table,
+                  @script_action, @script_cmd, @script_ci_drop, @script_verify, @script_est, @script_size;
+        END
+        CLOSE script_cursor;
+        DEALLOCATE script_cursor;
+
+        RAISERROR(N'-- ================================================================', 10, 1) WITH NOWAIT;
+        RAISERROR(N'-- End of generated script.', 10, 1) WITH NOWAIT;
+    END
 
 /*#endregion 19-OUTPUT */
 

@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v1.0.2026.0302g: Batch E statistics
+sp_HeapDoctor Test Harness - v1.0.2026.0302h: Batch E statistics
 
 Tests:
   -- Issue #19: @UpdateStatsAfterRebuild --
@@ -12,7 +12,7 @@ Tests:
   21E - @UpdateStatsAfterRebuild parameter exists in proc definition
 
   -- Version --
-  21V - Version is 1.0.2026.0302g
+  21V - Version is 1.0.2026.0302h
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 21_test_v0302e.sql
@@ -84,7 +84,7 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 21: v1.0.2026.0302g (#19, #61) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 21: v1.0.2026.0302h (#19, #61) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- Setup: create inline test heap with NCI for stats tests
@@ -249,10 +249,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver21 nvarchar(20);
 SELECT TOP 1 @ver21 = version FROM #Results;
 
-IF @ver21 = N'1.0.2026.0302g'
-    RAISERROR(N'  PASS 21V: Version is 1.0.2026.0302g.', 10, 1) WITH NOWAIT;
+IF @ver21 = N'1.0.2026.0302h'
+    RAISERROR(N'  PASS 21V: Version is 1.0.2026.0302h.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 21V: Version is %s (expected 1.0.2026.0302g).', 10, 1, @ver21) WITH NOWAIT;
+    RAISERROR(N'  FAIL 21V: Version is %s (expected 1.0.2026.0302h).', 10, 1, @ver21) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

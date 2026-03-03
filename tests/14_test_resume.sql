@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - Step 14: @ResumeRunID Parameter Tests
+sp_HeapDoctor Test Harness - Step 14: @ResumeRunID Parameter Tests (v0302h)
 
 Tests the plan-then-execute resume workflow: run @PlanOnly=1 first,
 then use @ResumeRunID to execute the same targets without re-discovery.
@@ -314,7 +314,7 @@ VALUES
     N'HEAP_SCAN_SUMMARY',
     SYSDATETIME(), SYSDATETIME(), 0, NULL,
     CAST(N'<ScanSummary>
-        <Version>1.0.2026.0302g</Version>
+        <Version>1.0.2026.0302h</Version>
         <RunID>' + CAST(@ObfuRunID AS nvarchar(36)) + N'</RunID>
         <TargetCount>1</TargetCount>
         <ObfuscatedMappingHex>DEADBEEF0123456789</ObfuscatedMappingHex>
