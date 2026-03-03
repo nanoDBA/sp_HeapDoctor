@@ -24,7 +24,7 @@ sp_HeapDoctor is built around three ideas:
 
 - **CPU-prioritized rebuilds** - ranks heaps by Query Store CPU cost, not just forwarded record count.  Rebuilds the heaps that actually hurt, not the ones that are just large.
 - **Query Store showplan XML mapping** - parses showplan `//RelOp[@PhysicalOp="Table Scan"]` nodes to attribute CPU to heap objects.  Only counts Table Scan operators; index seeks on your NCIs don't count.
-- **sp_QuickieStore integration** - alternative CPU source via Erik Darling's [sp_QuickieStore](https://github.com/erikdarlingdata/DarlingData), because some of us prefer Erik's opinions about query performance.
+- **sp_QuickieStore integration** - alternative CPU source via Erik Darling's [sp_QuickieStore](https://github.com/erikdarlingdata/DarlingData), useful when Query Store isn't available or you want a second opinion on query performance.
 - **CI swap technique** - creates a temp clustered index using a safe unique NC key, then drops it.  Auto-detects keys, guards against LOB columns, and shows the NCI rebuild cost before you commit to it.
 - **Online rebuild support** - auto-detects Enterprise/Developer/Azure SQL DB.  Falls back to offline on Standard, because Microsoft would like you to upgrade.
 - **Multi-database targeting** - Ola Hallengren `@Databases` parameter (`USER_DATABASES`, wildcards, exclusions, comma-separated).  If you already know how Ola's tools work, you already know how this works.
