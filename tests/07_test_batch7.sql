@@ -77,7 +77,9 @@ CREATE TABLE #Results
     est_log_mb             decimal(18,2) NULL,
     days_since_last_rebuild int           NULL,
     sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL
+    uptime_hours           decimal(10,1) NULL,
+    page_io_latch_wait_count bigint      NULL,
+    page_io_latch_wait_ms  bigint        NULL
 );
 GO
 

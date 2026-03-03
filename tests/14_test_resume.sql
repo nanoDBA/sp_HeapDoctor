@@ -71,7 +71,9 @@ CREATE TABLE #Results
     est_log_mb             decimal(18,2) NULL,
     days_since_last_rebuild int           NULL,
     sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL
+    uptime_hours           decimal(10,1) NULL,
+    page_io_latch_wait_count bigint      NULL,
+    page_io_latch_wait_ms  bigint        NULL
 );
 GO
 
@@ -312,7 +314,7 @@ VALUES
     N'HEAP_SCAN_SUMMARY',
     SYSDATETIME(), SYSDATETIME(), 0, NULL,
     CAST(N'<ScanSummary>
-        <Version>1.0.2026.0302f</Version>
+        <Version>1.0.2026.0302g</Version>
         <RunID>' + CAST(@ObfuRunID AS nvarchar(36)) + N'</RunID>
         <TargetCount>1</TargetCount>
         <ObfuscatedMappingHex>DEADBEEF0123456789</ObfuscatedMappingHex>

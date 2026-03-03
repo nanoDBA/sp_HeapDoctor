@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v1.0.2026.0302f: #25 @Force, #33 LOB TOCTOU, #40 CommandLog schema
+sp_HeapDoctor Test Harness - v1.0.2026.0302g: #25 @Force, #33 LOB TOCTOU, #40 CommandLog schema
 
 Tests:
   -- Issue #25: @Force parameter --
@@ -17,7 +17,7 @@ Tests:
   17H - CommandLog with non-xml ExtendedInfo disables logging gracefully
 
   -- Version --
-  17V - Version is 1.0.2026.0302f
+  17V - Version is 1.0.2026.0302g
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 17_test_v0302.sql
@@ -86,11 +86,13 @@ CREATE TABLE #Results
     est_log_mb             decimal(18,2) NULL,
     days_since_last_rebuild int           NULL,
     sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL
+    uptime_hours           decimal(10,1) NULL,
+    page_io_latch_wait_count bigint      NULL,
+    page_io_latch_wait_ms  bigint        NULL
 );
 GO
 
-RAISERROR(N'=== Batch 17: v1.0.2026.0302f (#25 @Force, #33 LOB TOCTOU, #40 CommandLog schema) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 17: v1.0.2026.0302g (#25 @Force, #33 LOB TOCTOU, #40 CommandLog schema) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 17A: @Force=0 (default) does not interfere with normal execution
@@ -391,10 +393,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver17 nvarchar(20);
 SELECT TOP 1 @ver17 = version FROM #Results;
 
-IF @ver17 = N'1.0.2026.0302f'
-    RAISERROR(N'  PASS 17V: Version is 1.0.2026.0302f.', 10, 1) WITH NOWAIT;
+IF @ver17 = N'1.0.2026.0302g'
+    RAISERROR(N'  PASS 17V: Version is 1.0.2026.0302g.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 17V: Version is %s (expected 1.0.2026.0302f).', 10, 1, @ver17) WITH NOWAIT;
+    RAISERROR(N'  FAIL 17V: Version is %s (expected 1.0.2026.0302g).', 10, 1, @ver17) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

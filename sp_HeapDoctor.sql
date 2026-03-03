@@ -464,6 +464,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     -- Throughput estimation
     @EstimateTime            bit            = 0,               -- 1 = show estimated rebuild time per target
     @EstimateLookbackDays    int            = 90,              -- CommandLog history window for throughput rates
+    @BaselineRebuildMBPerMin int            = NULL,            -- cold-start: MB/min rate when no CommandLog history exists
 
     -- Output parameters (for automation; only populated when provided)
     @TargetsFound            int            = NULL OUTPUT,
@@ -501,7 +502,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302f';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302g';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -561,6 +562,8 @@ COMMON PARAMETERS:
   @Debug             bit     = 0       Extra diagnostic output.
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays int  = 90      CommandLog history window for throughput rates.
+  @BaselineRebuildMBPerMin int = NULL  Cold-start: assumed MB/min when no CommandLog history
+                                        exists. Typical range 100-2000 (SSD vs HDD).
   @UpdateStatsAfterRebuild bit = 0    Run UPDATE STATISTICS WITH FULLSCAN after each rebuild.
   @CheckPermissionsOnly bit  = 0       Check required permissions per database and return.
   @AllowReplicationRebuild bit = 0    Published heaps skipped unless 1 (replication log flood risk).
@@ -880,6 +883,12 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RETURN;
     END
 
+    IF @BaselineRebuildMBPerMin IS NOT NULL AND @BaselineRebuildMBPerMin <= 0
+    BEGIN
+        RAISERROR(N'@BaselineRebuildMBPerMin must be a positive integer (typical range: 100-2000 MB/min).', 16, 1);
+        RETURN;
+    END
+
     IF @ObfuscateSeed IS NOT NULL AND @ObfuscateKey IS NULL
         RAISERROR(N'WARNING: @ObfuscateSeed is ignored without @ObfuscateKey.', 10, 1) WITH NOWAIT;
 
@@ -1151,6 +1160,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @AllowReplicationRebuild = 1';
     IF @CheckPermissionsOnly = 1
         SET @invocation_command += N', @CheckPermissionsOnly = 1';
+    IF @BaselineRebuildMBPerMin IS NOT NULL
+        SET @invocation_command += N', @BaselineRebuildMBPerMin = ' + CAST(@BaselineRebuildMBPerMin AS nvarchar(10));
     IF @Force = 1
         SET @invocation_command += N', @Force = 1';
     SET @invocation_command += N';';
@@ -1594,6 +1605,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         data_space_name          sysname        NULL,
         has_fk_references        bit            NOT NULL DEFAULT 0,
         fk_ref_count             int            NOT NULL DEFAULT 0,
+        page_io_latch_wait_count bigint         NULL,
+        page_io_latch_wait_ms    bigint         NULL,
         verify_command           nvarchar(max)  NULL,
         prev_forwarded_pct       decimal(6,2)   NULL,
         rebuilds_in_90d          int            NULL,
@@ -1724,6 +1737,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             heap_compression, replication_hint, lock_escalation,
             partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
             has_fk_references, fk_ref_count,
+            page_io_latch_wait_count, page_io_latch_wait_ms,
             sort_order,
             prev_forwarded_pct, rebuilds_in_90d,
             size_mb, est_space_savings_mb, est_ci_swap_overhead_mb, est_log_mb,
@@ -1768,6 +1782,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             t.c.value(N'@DataSpaceName',        N'sysname'),
             ISNULL(t.c.value(N'@HasFkReferences',      N'bit'), 0),
             ISNULL(t.c.value(N'@FkRefCount',           N'int'), 0),
+            t.c.value(N'@PageIoLatchWaitCount',  N'bigint'),
+            t.c.value(N'@PageIoLatchWaitMs',     N'bigint'),
             t.c.value(N'@SortOrder',             N'int'),
             t.c.value(N'@PrevForwardedPct',      N'decimal(6,2)'),
             t.c.value(N'@RebuildsIn90d',         N'int'),
@@ -1977,7 +1993,9 @@ CREATE TABLE #Heaps
     has_indexed_views      bit           NOT NULL DEFAULT 0,           -- #50: indexed views block CI swap
     data_space_name        sysname       NULL,                         -- #26: filegroup for CI swap ON clause
     has_fk_references      bit           NOT NULL DEFAULT 0,           -- #44: FKs referencing this heap
-    fk_ref_count           int           NOT NULL DEFAULT 0            -- #44: count of FK references TO this heap
+    fk_ref_count           int           NOT NULL DEFAULT 0,           -- #44: count of FK references TO this heap
+    page_io_latch_wait_count bigint      NULL,                         -- #22: IO latch waits from operational stats
+    page_io_latch_wait_ms  bigint        NULL                          -- #22: IO latch wait time ms
 );
 
 CREATE TABLE #CpuByPlan
@@ -2056,7 +2074,7 @@ RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
 
 SET ANSI_WARNINGS OFF;  -- suppress "Null value is eliminated by an aggregate" from DMV aggregation
 
-INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation, partition_count, has_schema_bound_views, has_indexed_views, data_space_name, has_fk_references, fk_ref_count)
+INSERT #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation, partition_count, has_schema_bound_views, has_indexed_views, data_space_name, has_fk_references, fk_ref_count, page_io_latch_wait_count, page_io_latch_wait_ms)
 SELECT
     ho.object_id,
     ho.schema_name,
@@ -2094,7 +2112,10 @@ SELECT
     fg.filegroup_name,
     -- #44: Foreign key references TO this heap
     ISNULL(fkr.has_fk_references, 0),
-    ISNULL(fkr.fk_ref_count, 0)
+    ISNULL(fkr.fk_ref_count, 0),
+    -- #22: IO latch wait stats from operational stats
+    os.page_io_latch_wait_count,
+    os.page_io_latch_wait_in_ms
 FROM #HeapObjects ho
 CROSS APPLY (
     -- Aggregate per-partition rows for partitioned heaps.
@@ -2109,7 +2130,9 @@ CROSS APPLY (
     FROM sys.dm_db_index_physical_stats(DB_ID(), ho.object_id, 0, NULL, ''SAMPLED'')
 ) ips
 OUTER APPLY (
-    SELECT SUM(forwarded_fetch_count) AS forwarded_fetch_count
+    SELECT SUM(forwarded_fetch_count) AS forwarded_fetch_count,
+           SUM(page_io_latch_wait_count) AS page_io_latch_wait_count,
+           SUM(page_io_latch_wait_in_ms) AS page_io_latch_wait_in_ms
     FROM sys.dm_db_index_operational_stats(DB_ID(), ho.object_id, 0, NULL)
 ) os
 OUTER APPLY (
@@ -2322,6 +2345,8 @@ Ranked AS
         h.data_space_name,
         h.has_fk_references,
         h.fk_ref_count,
+        h.page_io_latch_wait_count,
+        h.page_io_latch_wait_ms,
         -- Leftover temp CI from failed previous run
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = h.object_id
              AND name = N''CX__Temp__'' + LEFT(h.table_name, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
@@ -2398,6 +2423,7 @@ INSERT #Targets
     replication_hint, lock_escalation,
     partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
     has_fk_references, fk_ref_count,
+    page_io_latch_wait_count, page_io_latch_wait_ms,
     action_chosen, command_text, ci_drop_command,
     qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
     qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count, qs_query_hashes,
@@ -2414,6 +2440,7 @@ SELECT TOP (@TopN_param)
     r.replication_hint, r.lock_escalation,
     r.partition_count, r.has_schema_bound_views, r.has_indexed_views, r.data_space_name,
     r.has_fk_references, r.fk_ref_count,
+    r.page_io_latch_wait_count, r.page_io_latch_wait_ms,
     -- action_chosen (8I: forced plans prevent CI swap; #53: CDC blocks CI swap; #27: partitioned heaps skip CI swap)
     CASE
         WHEN @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
@@ -3497,7 +3524,21 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     BEGIN
         IF @hist_source = 'NONE'
         BEGIN
-            RAISERROR(N'EstimateTime: No historical rebuild data found in CommandLog. Estimates unavailable until first execution with @LogToTable=''Y''.', 10, 1) WITH NOWAIT;
+            -- #58: Cold-start baseline when no CommandLog history
+            IF @BaselineRebuildMBPerMin IS NOT NULL
+            BEGIN
+                -- Convert MB/min to pages/sec: (MB/min * 128 pages/MB) / 60 sec/min
+                SET @hist_any_pps = @BaselineRebuildMBPerMin * 128.0 / 60.0;
+                SET @hist_source = 'BASELINE';
+
+                SET @Msg = N'EstimateTime: Using baseline rate ' + CAST(@BaselineRebuildMBPerMin AS nvarchar(10)) + N' MB/min ('
+                         + CAST(CAST(@hist_any_pps AS int) AS nvarchar(20)) + N' pages/sec). Calibrate with prior rebuild observations.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+            ELSE
+            BEGIN
+                RAISERROR(N'EstimateTime: No historical rebuild data found in CommandLog. Use @BaselineRebuildMBPerMin for cold-start estimates or run with @LogToTable=''Y''.', 10, 1) WITH NOWAIT;
+            END
         END
         ELSE
         BEGIN
@@ -3512,8 +3553,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             BEGIN
                 RAISERROR(N'EstimateTime: WARNING - estimate based on fewer than 3 samples. Run a few more rebuilds to improve accuracy.', 10, 1) WITH NOWAIT;
             END
+        END
 
-            -- Populate estimate columns on #Targets
+        -- Populate estimate columns on #Targets (runs for both HISTORY and BASELINE)
+        IF @hist_any_pps IS NOT NULL
+        BEGIN
             UPDATE #Targets
             SET est_pages_per_sec = CASE action_chosen
                     WHEN 'HEAP_REBUILD_ONLINE'  THEN COALESCE(@hist_online_pps,  @hist_any_pps)
@@ -3549,7 +3593,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          + RIGHT('00' + CAST((@total_est_sec % 3600) / 60 AS varchar(2)), 2) + ':'
                          + RIGHT('00' + CAST(@total_est_sec % 60 AS varchar(2)), 2)
                          + N' (' + CAST(@total_est_sec AS nvarchar(20)) + N's) based on '
-                         + CAST(@EstimateLookbackDays AS nvarchar(10)) + N'-day history';
+                         + CASE @hist_source WHEN 'BASELINE' THEN N'baseline rate' ELSE CAST(@EstimateLookbackDays AS nvarchar(10)) + N'-day history' END;
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
         END
@@ -3910,7 +3954,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         est_log_mb,
         days_since_last_rebuild,
         @SqlServerStartTime AS sqlserver_start_time,
-        CAST(@UptimeHours AS decimal(10,1)) AS uptime_hours
+        CAST(@UptimeHours AS decimal(10,1)) AS uptime_hours,
+        page_io_latch_wait_count,
+        page_io_latch_wait_ms
     FROM #Targets
     ORDER BY sort_order;
 
@@ -4040,6 +4086,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             data_space_name AS DataSpaceName,
                             CAST(has_fk_references AS int) AS HasFkReferences,
                             fk_ref_count AS FkRefCount,
+                            page_io_latch_wait_count AS PageIoLatchWaitCount,
+                            page_io_latch_wait_ms AS PageIoLatchWaitMs,
                             sort_order AS SortOrder,
                             est_pages_per_sec AS EstPagesPerSec,
                             est_seconds AS EstSeconds,
