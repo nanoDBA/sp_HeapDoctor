@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v1.0.2026.0302h: Batch D quick wins
+sp_HeapDoctor Test Harness - v1.0.2026.0302i: Batch D quick wins
 
 Tests:
   -- Issue #24: Hardware context in debug banner --
@@ -18,7 +18,7 @@ Tests:
   20G - @MinDaysSinceRebuild already exists (closes #21)
 
   -- Version --
-  20V - Version is 1.0.2026.0302h
+  20V - Version is 1.0.2026.0302i
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 20_test_v0302d.sql
@@ -89,11 +89,12 @@ CREATE TABLE #Results
     sqlserver_start_time   datetime      NULL,
     uptime_hours           decimal(10,1) NULL,
     page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL
+    page_io_latch_wait_ms  bigint        NULL,
+    is_temporal_history    bit           NULL
 );
 GO
 
-RAISERROR(N'=== Batch 20: v1.0.2026.0302h (#24, #47, #39, #21) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 20: v1.0.2026.0302i (#24, #47, #39, #21) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 20A: #24 - @Debug=1 shows hardware context
@@ -275,10 +276,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver20 nvarchar(20);
 SELECT TOP 1 @ver20 = version FROM #Results;
 
-IF @ver20 = N'1.0.2026.0302h'
-    RAISERROR(N'  PASS 20V: Version is 1.0.2026.0302h.', 10, 1) WITH NOWAIT;
+IF @ver20 = N'1.0.2026.0302i'
+    RAISERROR(N'  PASS 20V: Version is 1.0.2026.0302i.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 20V: Version is %s (expected 1.0.2026.0302h).', 10, 1, @ver20) WITH NOWAIT;
+    RAISERROR(N'  FAIL 20V: Version is %s (expected 1.0.2026.0302i).', 10, 1, @ver20) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

@@ -78,7 +78,8 @@ CREATE TABLE #Results
     sqlserver_start_time   datetime      NULL,
     uptime_hours           decimal(10,1) NULL,
     page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL
+    page_io_latch_wait_ms  bigint        NULL,
+    is_temporal_history    bit           NULL
 );
 GO
 
@@ -440,7 +441,8 @@ CREATE TABLE #VerCheck
     sqlserver_start_time   datetime      NULL,
     uptime_hours           decimal(10,1) NULL,
     page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL
+    page_io_latch_wait_ms  bigint        NULL,
+    is_temporal_history    bit           NULL
 );
 
 INSERT #VerCheck

@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - Step 14: @ResumeRunID Parameter Tests (v0302h)
+sp_HeapDoctor Test Harness - Step 14: @ResumeRunID Parameter Tests (v0302i)
 
 Tests the plan-then-execute resume workflow: run @PlanOnly=1 first,
 then use @ResumeRunID to execute the same targets without re-discovery.
@@ -73,7 +73,8 @@ CREATE TABLE #Results
     sqlserver_start_time   datetime      NULL,
     uptime_hours           decimal(10,1) NULL,
     page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL
+    page_io_latch_wait_ms  bigint        NULL,
+    is_temporal_history    bit           NULL
 );
 GO
 
@@ -314,7 +315,7 @@ VALUES
     N'HEAP_SCAN_SUMMARY',
     SYSDATETIME(), SYSDATETIME(), 0, NULL,
     CAST(N'<ScanSummary>
-        <Version>1.0.2026.0302h</Version>
+        <Version>1.0.2026.0302i</Version>
         <RunID>' + CAST(@ObfuRunID AS nvarchar(36)) + N'</RunID>
         <TargetCount>1</TargetCount>
         <ObfuscatedMappingHex>DEADBEEF0123456789</ObfuscatedMappingHex>

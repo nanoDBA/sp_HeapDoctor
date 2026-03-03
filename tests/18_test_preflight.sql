@@ -16,7 +16,7 @@ Tests:
   18G - Tempdb check does not error on normal CI swap targets
 
   -- Version --
-  18V - Version is 1.0.2026.0302h
+  18V - Version is 1.0.2026.0302i
 
 Requires: 01_setup_test_data.sql (HeapDoctorTest database)
 Must run BEFORE execution tests (03+).
@@ -152,7 +152,8 @@ CREATE TABLE #Results
     sqlserver_start_time   datetime      NULL,
     uptime_hours           decimal(10,1) NULL,
     page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL
+    page_io_latch_wait_ms  bigint        NULL,
+    is_temporal_history    bit           NULL
 );
 
 INSERT #Results
@@ -285,10 +286,10 @@ GO
 DECLARE @ver18 nvarchar(20);
 SELECT TOP (1) @ver18 = version FROM #Results;
 
-IF @ver18 = N'1.0.2026.0302h'
-    RAISERROR(N'  PASS 18V: Version is 1.0.2026.0302h.', 10, 1) WITH NOWAIT;
+IF @ver18 = N'1.0.2026.0302i'
+    RAISERROR(N'  PASS 18V: Version is 1.0.2026.0302i.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 18V: Version is %s (expected 1.0.2026.0302h).', 10, 1, @ver18) WITH NOWAIT;
+    RAISERROR(N'  FAIL 18V: Version is %s (expected 1.0.2026.0302i).', 10, 1, @ver18) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

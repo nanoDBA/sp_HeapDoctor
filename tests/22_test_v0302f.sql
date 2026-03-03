@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v1.0.2026.0302h: Batch F observability
+sp_HeapDoctor Test Harness - v1.0.2026.0302i: Batch F observability
 
 Tests:
   -- Issue #31: Deprecation advisory for sp_trace on SQL 2022+ --
@@ -82,7 +82,8 @@ CREATE TABLE #Results
     sqlserver_start_time   datetime      NULL,
     uptime_hours           decimal(10,1) NULL,
     page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL
+    page_io_latch_wait_ms  bigint        NULL,
+    is_temporal_history    bit           NULL
 );
 GO
 
@@ -224,10 +225,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver22 nvarchar(20);
 SELECT TOP 1 @ver22 = version FROM #Results;
 
-IF @ver22 = N'1.0.2026.0302h'
-    RAISERROR(N'  PASS 22V: Version is 1.0.2026.0302h.', 10, 1) WITH NOWAIT;
+IF @ver22 = N'1.0.2026.0302i'
+    RAISERROR(N'  PASS 22V: Version is 1.0.2026.0302i.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 22V: Version is %s (expected 1.0.2026.0302h).', 10, 1, @ver22) WITH NOWAIT;
+    RAISERROR(N'  FAIL 22V: Version is %s (expected 1.0.2026.0302i).', 10, 1, @ver22) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

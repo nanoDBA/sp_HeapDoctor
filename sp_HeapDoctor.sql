@@ -496,7 +496,13 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 
     -- Output
     @OutputTable             nvarchar(256)  = NULL,             -- #16: persist results to a table (e.g. 'dbo.HeapDoctorHistory')
-    @GenerateScript          bit            = 0                 -- #23: output executable T-SQL script per target
+    @GenerateScript          bit            = 0,                -- #23: output executable T-SQL script per target
+
+    -- Temporal
+    @IncludeTemporalHistory  bit            = 0,                -- #54: include temporal history heaps in discovery
+
+    -- Resumable
+    @UseResumable            bit            = 1                 -- #55: use RESUMABLE = ON for CI swap (SQL 2017+, default ON)
 )
 /*#endregion 00-HEADER */
 
@@ -506,7 +512,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302h';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302i';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -575,6 +581,12 @@ COMMON PARAMETERS:
   @OutputTable       nvarchar(256) = NULL  Persist results to a table (auto-created if missing).
                                         e.g. dbo.HeapDoctorHistory. Includes RunID + CapturedAt.
   @GenerateScript    bit     = 0       Output executable T-SQL script (implies @PlanOnly=1).
+  @IncludeTemporalHistory bit = 0      Include temporal history table heaps in discovery.
+                                        Rebuild requires SYSTEM_VERSIONING disable/enable on parent.
+                                        CI swap is blocked for history tables (REBUILD only).
+  @UseResumable      bit     = 1       RESUMABLE = ON for CI swap CREATE INDEX (SQL 2017+).
+                                        On interrupt, index build is paused (not rolled back).
+                                        Resume detection: paused ops auto-resumed on next run.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'
@@ -1190,6 +1202,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @OutputTable = N''' + REPLACE(@OutputTable, N'''', N'''''') + N'''';
     IF @GenerateScript = 1
         SET @invocation_command += N', @GenerateScript = 1';
+    IF @IncludeTemporalHistory = 1
+        SET @invocation_command += N', @IncludeTemporalHistory = 1';
+    IF @UseResumable = 0
+        SET @invocation_command += N', @UseResumable = 0';
     SET @invocation_command += N';';
 
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
@@ -1633,6 +1649,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         fk_ref_count             int            NOT NULL DEFAULT 0,
         page_io_latch_wait_count bigint         NULL,
         page_io_latch_wait_ms    bigint         NULL,
+        is_temporal_history      bit            NOT NULL DEFAULT 0,  -- #54: temporal history table
+        temporal_parent_schema   sysname        NULL,                -- #54: parent versioned table schema
+        temporal_parent_table    sysname        NULL,                -- #54: parent versioned table name
         verify_command           nvarchar(max)  NULL,
         prev_forwarded_pct       decimal(6,2)   NULL,
         rebuilds_in_90d          int            NULL,
@@ -1764,6 +1783,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
             has_fk_references, fk_ref_count,
             page_io_latch_wait_count, page_io_latch_wait_ms,
+            is_temporal_history, temporal_parent_schema, temporal_parent_table,
             sort_order,
             prev_forwarded_pct, rebuilds_in_90d,
             size_mb, est_space_savings_mb, est_ci_swap_overhead_mb, est_log_mb,
@@ -1810,6 +1830,9 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             ISNULL(t.c.value(N'@FkRefCount',           N'int'), 0),
             t.c.value(N'@PageIoLatchWaitCount',  N'bigint'),
             t.c.value(N'@PageIoLatchWaitMs',     N'bigint'),
+            ISNULL(t.c.value(N'@IsTemporalHistory',    N'bit'), 0),
+            t.c.value(N'@TemporalParentSchema',  N'sysname'),
+            t.c.value(N'@TemporalParentTable',   N'sysname'),
             t.c.value(N'@SortOrder',             N'int'),
             t.c.value(N'@PrevForwardedPct',      N'decimal(6,2)'),
             t.c.value(N'@RebuildsIn90d',         N'int'),
@@ -2021,7 +2044,10 @@ CREATE TABLE #Heaps
     has_fk_references      bit           NOT NULL DEFAULT 0,           -- #44: FKs referencing this heap
     fk_ref_count           int           NOT NULL DEFAULT 0,           -- #44: count of FK references TO this heap
     page_io_latch_wait_count bigint      NULL,                         -- #22: IO latch waits from operational stats
-    page_io_latch_wait_ms  bigint        NULL                          -- #22: IO latch wait time ms
+    page_io_latch_wait_ms  bigint        NULL,                         -- #22: IO latch wait time ms
+    is_temporal_history    bit           NOT NULL DEFAULT 0,            -- #54: temporal history table flag
+    temporal_parent_schema sysname       NULL,                          -- #54: parent versioned table schema
+    temporal_parent_table  sysname       NULL                           -- #54: parent versioned table name
 );
 
 CREATE TABLE #CpuByPlan
@@ -2065,7 +2091,7 @@ FROM sys.tables o
 JOIN sys.schemas s ON o.schema_id = s.schema_id
 JOIN sys.indexes ix ON ix.object_id = o.object_id AND ix.type = 0
 WHERE o.is_memory_optimized = 0
-  AND o.temporal_type = 0
+  AND (o.temporal_type = 0 OR (o.temporal_type = 1 AND @IncludeTemporalHistory_param = 1))
   AND o.is_node = 0 AND o.is_edge = 0
   AND NOT EXISTS (SELECT 1 FROM sys.indexes ci WHERE ci.object_id = o.object_id AND ci.type IN (5,6))
 ';
@@ -2226,6 +2252,19 @@ WHERE ips.forwarded_record_count > 0
 
 SET ANSI_WARNINGS ON;
 
+-- #54: Populate temporal parent info for history table heaps
+IF @IncludeTemporalHistory_param = 1
+BEGIN
+    UPDATE h SET
+        h.is_temporal_history = 1,
+        h.temporal_parent_schema = ps.name,
+        h.temporal_parent_table = pt.name
+    FROM #Heaps h
+    JOIN sys.tables ht ON ht.object_id = h.object_id AND ht.temporal_type = 1
+    JOIN sys.tables pt ON pt.history_table_id = h.object_id AND pt.temporal_type = 2
+    JOIN sys.schemas ps ON pt.schema_id = ps.schema_id;
+END
+
 DROP TABLE #HeapObjects;
 
 DECLARE @HeapCount_inner int = (SELECT COUNT(*) FROM #Heaps);
@@ -2373,6 +2412,9 @@ Ranked AS
         h.fk_ref_count,
         h.page_io_latch_wait_count,
         h.page_io_latch_wait_ms,
+        h.is_temporal_history,
+        h.temporal_parent_schema,
+        h.temporal_parent_table,
         -- Leftover temp CI from failed previous run
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = h.object_id
              AND name = N''CX__Temp__'' + LEFT(h.table_name, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
@@ -2450,6 +2492,7 @@ INSERT #Targets
     partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
     has_fk_references, fk_ref_count,
     page_io_latch_wait_count, page_io_latch_wait_ms,
+    is_temporal_history, temporal_parent_schema, temporal_parent_table,
     action_chosen, command_text, ci_drop_command,
     qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
     qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count, qs_query_hashes,
@@ -2467,7 +2510,8 @@ SELECT TOP (@TopN_param)
     r.partition_count, r.has_schema_bound_views, r.has_indexed_views, r.data_space_name,
     r.has_fk_references, r.fk_ref_count,
     r.page_io_latch_wait_count, r.page_io_latch_wait_ms,
-    -- action_chosen (8I: forced plans prevent CI swap; #53: CDC blocks CI swap; #27: partitioned heaps skip CI swap)
+    r.is_temporal_history, r.temporal_parent_schema, r.temporal_parent_table,
+    -- action_chosen (8I: forced plans prevent CI swap; #53: CDC blocks CI swap; #27: partitioned heaps skip CI swap; #54: temporal history blocks CI swap)
     CASE
         WHEN @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
              AND r.temp_key_cols IS NOT NULL AND r.has_lob_columns = 0
@@ -2476,6 +2520,7 @@ SELECT TOP (@TopN_param)
              AND r.partition_count <= 1                                                    -- #27: partitioned heaps cannot CI swap
              AND r.has_schema_bound_views = 0                                              -- #42: schema-bound views block CI swap
              AND r.has_indexed_views = 0                                                   -- #50: indexed views block CI swap
+             AND r.is_temporal_history = 0                                                  -- #54: temporal history blocks CI swap
             THEN ''CI_SWAP_ONLINE''
         WHEN @Online_param = 1 THEN ''HEAP_REBUILD_ONLINE''
         ELSE ''HEAP_REBUILD_OFFLINE''
@@ -2489,6 +2534,7 @@ SELECT TOP (@TopN_param)
              AND r.partition_count <= 1
              AND r.has_schema_bound_views = 0
              AND r.has_indexed_views = 0
+             AND r.is_temporal_history = 0
         THEN
             -- Leftover temp CI cleanup: prepend DROP if a previous run left a temp CI
             CASE WHEN r.has_leftover_ci = 1
@@ -2503,7 +2549,8 @@ SELECT TOP (@TopN_param)
                  WHEN r.heap_compression = 2 THEN N'', DATA_COMPRESSION = PAGE''
                  ELSE N'''' END +
             CASE WHEN @FillFactor_param > 0 THEN N'', FILLFACTOR = '' + CAST(@FillFactor_param AS nvarchar(3)) ELSE N'''' END +
-            COALESCE(N'', MAXDOP = '' + CAST(@Maxdop_param AS nvarchar(10)), N'''') + N'')'' +
+            COALESCE(N'', MAXDOP = '' + CAST(@Maxdop_param AS nvarchar(10)), N'''') +
+            CASE WHEN @UseResumable_param = 1 THEN N'', RESUMABLE = ON'' ELSE N'''' END + N'')'' +
             -- #26: CI swap must land on same filegroup as the heap
             CASE WHEN r.data_space_name IS NOT NULL AND r.data_space_name <> N''PRIMARY''
                  THEN N'' ON '' + QUOTENAME(r.data_space_name) ELSE N'''' END + N'';''
@@ -2538,6 +2585,7 @@ SELECT TOP (@TopN_param)
              AND r.partition_count <= 1
              AND r.has_schema_bound_views = 0
              AND r.has_indexed_views = 0
+             AND r.is_temporal_history = 0
         THEN
             N''DROP INDEX '' +
             QUOTENAME(N''CX__Temp__'' + LEFT(r.table_name, 108)) +
@@ -2869,7 +2917,8 @@ END
                 N'@MinPages_param bigint, @MaxPages_param bigint, @MinForwardedPct_param decimal(6,2),
                   @LookbackDays_param int, @TopN_param int,
                   @AllowCiSwap_param bit, @PreferCiSwap_param bit, @Online_param bit,
-                  @Maxdop_param int, @FillFactor_param tinyint, @CpuSource_param varchar(20), @UptimeHours_param float',
+                  @Maxdop_param int, @FillFactor_param tinyint, @CpuSource_param varchar(20), @UptimeHours_param float,
+                  @UseResumable_param bit, @IncludeTemporalHistory_param bit',
                 @MinPages_param = @MinPages,
                 @MaxPages_param = @MaxPages,
                 @MinForwardedPct_param = @MinForwardedPct,
@@ -2881,7 +2930,9 @@ END
                 @Maxdop_param = @Maxdop,
                 @FillFactor_param = @FillFactor,
                 @CpuSource_param = @CpuSourceUpper,
-                @UptimeHours_param = @UptimeHours;
+                @UptimeHours_param = @UptimeHours,
+                @UseResumable_param = @UseResumable,
+                @IncludeTemporalHistory_param = @IncludeTemporalHistory;
         END TRY
         BEGIN CATCH
             SET @discovery_errors += 1;
@@ -3982,7 +4033,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         @SqlServerStartTime AS sqlserver_start_time,
         CAST(@UptimeHours AS decimal(10,1)) AS uptime_hours,
         page_io_latch_wait_count,
-        page_io_latch_wait_ms
+        page_io_latch_wait_ms,
+        is_temporal_history
     FROM #Targets
     ORDER BY sort_order;
 
@@ -4039,7 +4091,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 est_log_mb           decimal(18,2)    NULL,
                 days_since_last_rebuild int           NULL,
                 page_io_latch_wait_count bigint       NULL,
-                page_io_latch_wait_ms bigint          NULL
+                page_io_latch_wait_ms bigint          NULL,
+                is_temporal_history   bit             NULL
             );';
             BEGIN TRY
                 EXEC sp_executesql @output_sql;
@@ -4065,7 +4118,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 replication_hint, lock_escalation, partition_count,
                 has_fk_references, fk_ref_count, filegroup_name,
                 command_text, size_mb, est_log_mb, days_since_last_rebuild,
-                page_io_latch_wait_count, page_io_latch_wait_ms
+                page_io_latch_wait_count, page_io_latch_wait_ms,
+                is_temporal_history
             )
             SELECT
                 @RunID, @Version, target_id, sort_order,
@@ -4085,7 +4139,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 CAST(has_fk_references AS int), fk_ref_count, data_space_name,
                 CASE WHEN @obfuscate = 1 THEN pseudo_command_text ELSE command_text END,
                 size_mb, est_log_mb, days_since_last_rebuild,
-                page_io_latch_wait_count, page_io_latch_wait_ms
+                page_io_latch_wait_count, page_io_latch_wait_ms,
+                is_temporal_history
             FROM #Targets
             ORDER BY sort_order;';
             EXEC sp_executesql @output_sql,
@@ -4299,6 +4354,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             fk_ref_count AS FkRefCount,
                             page_io_latch_wait_count AS PageIoLatchWaitCount,
                             page_io_latch_wait_ms AS PageIoLatchWaitMs,
+                            CAST(is_temporal_history AS int) AS IsTemporalHistory,
+                            temporal_parent_schema AS TemporalParentSchema,
+                            temporal_parent_table AS TemporalParentTable,
                             sort_order AS SortOrder,
                             est_pages_per_sec AS EstPagesPerSec,
                             est_seconds AS EstSeconds,
@@ -4392,6 +4450,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_nci_count          int,
             @cur_est_seconds        int,
             @cur_days_since_rebuild int,
+            @cur_is_temporal_history bit,
+            @cur_temporal_parent_schema sysname,
+            @cur_temporal_parent_table  sysname,
+            @versioning_sql         nvarchar(max),
+            @has_paused_op          bit,
             @preflight_sessions     int,
             @preflight_bu_sessions  int,
             @trace_msg              nvarchar(128),
@@ -4528,6 +4591,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @cur_days_since_rebuild = days_since_last_rebuild,
                 @cur_heap_compression  = heap_compression,
                 @cur_est_log_mb        = est_log_mb,
+                @cur_is_temporal_history      = is_temporal_history,
+                @cur_temporal_parent_schema   = temporal_parent_schema,
+                @cur_temporal_parent_table    = temporal_parent_table,
                 -- Obfuscation: pseudo values (NULL when not obfuscating)
                 @pseudo_db             = pseudo_database_name,
                 @pseudo_schema         = pseudo_schema_name,
@@ -4989,6 +5055,71 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /*
+            #55: Resumable index resume detection.
+            If @UseResumable=1 and this is a CI_SWAP_ONLINE, check sys.index_resumable_operations
+            for a PAUSED operation on this temp index. If found, RESUME instead of re-creating.
+            */
+            IF @UseResumable = 1 AND @action = 'CI_SWAP_ONLINE' AND @cur_index_name IS NOT NULL
+            BEGIN
+                SET @has_paused_op = 0;
+                BEGIN TRY
+                    SET @verify_sql = N'SELECT @has_paused = CASE WHEN EXISTS (
+                        SELECT 1 FROM ' + QUOTENAME(@db) + N'.sys.index_resumable_operations iro
+                        WHERE iro.object_id = OBJECT_ID(@full_param)
+                          AND iro.state = 1  -- PAUSED
+                    ) THEN 1 ELSE 0 END;';
+                    EXEC sys.sp_executesql @verify_sql,
+                        N'@full_param nvarchar(512), @has_paused bit OUTPUT',
+                        @full_param = @full, @has_paused = @has_paused_op OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @has_paused_op = 0; -- don't block on metadata errors (e.g., DMV unavailable)
+                END CATCH
+
+                IF @has_paused_op = 1
+                BEGIN
+                    SET @Msg = N'  Resuming paused resumable index operation on ' + @full + N'...';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    -- Replace the CREATE command with ALTER INDEX ... RESUME
+                    SET @cmd = N'ALTER INDEX ' + QUOTENAME(@cur_index_name)
+                             + N' ON ' + @full + N' RESUME'
+                             + COALESCE(N' WITH (MAXDOP = ' + CAST(@Maxdop AS nvarchar(10)) + N')', N'') + N';';
+                END
+            END
+
+            /*
+            #54: Temporal history table - disable SYSTEM_VERSIONING on parent before rebuild.
+            */
+            IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
+            BEGIN
+                SET @Msg = N'  Disabling SYSTEM_VERSIONING on ' + QUOTENAME(@db) + N'.'
+                         + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) + N'...';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+                SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
+                    + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                    + N' SET (SYSTEM_VERSIONING = OFF);';
+                BEGIN TRY
+                    EXEC sys.sp_executesql @versioning_sql;
+                END TRY
+                BEGIN CATCH
+                    SET @Msg = N'  ERROR disabling SYSTEM_VERSIONING: ' + LEFT(ERROR_MESSAGE(), 500)
+                             + N'. Skipping temporal history rebuild.';
+                    RAISERROR(@Msg, 16, 1) WITH NOWAIT;
+                    SET @skipped_cnt += 1;
+                    INSERT #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
+                    VALUES (@tid,
+                        CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
+                        CASE WHEN @obfuscate = 1
+                             THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                             ELSE @full END,
+                        @action, SYSDATETIME(), SYSDATETIME(), NULL,
+                        N'SKIPPED: SYSTEM_VERSIONING_DISABLE_FAILED');
+                    CONTINUE;
+                END CATCH
+            END
+
+            /*
             Execute the main command (with lock timeout prefix/suffix)
             */
             SET @exec_cmd = @LockPrefix + @cmd + @LockSuffix;
@@ -5312,6 +5443,28 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          CASE WHEN @obfuscate = 1 THEN @pseudo_cmd ELSE @cmd END, @action,
                          @start, @end, 0, NULL, @extended_info);
                 END
+
+                -- #54: Re-enable SYSTEM_VERSIONING after successful temporal history rebuild
+                IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
+                BEGIN
+                    SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
+                        + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                        + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
+                        + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
+                    BEGIN TRY
+                        EXEC sys.sp_executesql @versioning_sql;
+                        SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
+                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) + N'.';
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
+                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                                 + N': ' + LEFT(ERROR_MESSAGE(), 500)
+                                 + N'. MANUAL RE-ENABLE REQUIRED.';
+                        RAISERROR(@Msg, 16, 1) WITH NOWAIT;
+                    END CATCH
+                END
             END TRY
             BEGIN CATCH
                 SET @end = SYSDATETIME();
@@ -5400,6 +5553,29 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          0,
                          CASE WHEN @obfuscate = 1 THEN @pseudo_cmd ELSE @cmd END, @action,
                          @start, @end, @err_number, @err_message, @extended_info);
+                END
+
+                -- #54: Re-enable SYSTEM_VERSIONING after failed temporal history rebuild
+                IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
+                BEGIN
+                    SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
+                        + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                        + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
+                        + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
+                    BEGIN TRY
+                        EXEC sys.sp_executesql @versioning_sql;
+                        SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
+                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                                 + N' (rebuild failed, but versioning restored).';
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
+                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                                 + N': ' + LEFT(ERROR_MESSAGE(), 500)
+                                 + N'. MANUAL RE-ENABLE REQUIRED.';
+                        RAISERROR(@Msg, 16, 1) WITH NOWAIT;
+                    END CATCH
                 END
             END CATCH;
         END

@@ -3,7 +3,7 @@ sp_HeapDoctor Test Harness - Batch 12: Throughput/ETA Improvements
 
 Tests:
   -- Smoke Tests --
-  12A - Version is 1.0.2026.0302h
+  12A - Version is 1.0.2026.0302i
   12B - DurationMs populated in per-rebuild success ExtendedInfo
   12C - ActualPagesPerSec populated in per-rebuild success ExtendedInfo
 
@@ -99,11 +99,11 @@ WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_S
   AND ISNULL(ErrorNumber, 0) = 0
 ORDER BY ID;
 
-IF @12a_version = N'1.0.2026.0302h'
-    RAISERROR(N'  PASS 12A: Version is 1.0.2026.0302h.', 10, 1) WITH NOWAIT;
+IF @12a_version = N'1.0.2026.0302i'
+    RAISERROR(N'  PASS 12A: Version is 1.0.2026.0302i.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @12a_msg nvarchar(200) = N'  *** FAIL 12A: Expected version 1.0.2026.0302h, got ' + ISNULL(@12a_version, N'NULL');
+    DECLARE @12a_msg nvarchar(200) = N'  *** FAIL 12A: Expected version 1.0.2026.0302i, got ' + ISNULL(@12a_version, N'NULL');
     RAISERROR(@12a_msg, 16, 1) WITH NOWAIT;
 END
 GO
@@ -318,7 +318,8 @@ CREATE TABLE #EstResults (
     sqlserver_start_time   datetime      NULL,
     uptime_hours           decimal(10,1) NULL,
     page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL
+    page_io_latch_wait_ms  bigint        NULL,
+    is_temporal_history    bit           NULL
 );
 
 INSERT #EstResults
