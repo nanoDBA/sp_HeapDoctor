@@ -480,7 +480,11 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     -- Resume from prior plan-only scan
     @ResumeRunID             uniqueidentifier = NULL,           -- load targets from a prior @PlanOnly=1 HEAP_SCAN_SUMMARY; skips discovery
 
+    -- Pre-flight
+    @CheckPermissionsOnly    bit            = 0,                -- #18: check required permissions and return (no DDL/DML)
+
     -- Safety
+    @AllowReplicationRebuild bit            = 0,                -- #59: opt-in for published heaps (default: skip)
     @Force                   bit            = 0                 -- bypass re-entrancy guard (use when prior run was KILLed and applock is orphaned)
 )
 /*#endregion 00-HEADER */
@@ -491,7 +495,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#32)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302b';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302c';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -550,6 +554,8 @@ COMMON PARAMETERS:
   @Debug             bit     = 0       Extra diagnostic output.
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays int  = 90      CommandLog history window for throughput rates.
+  @CheckPermissionsOnly bit  = 0       Check required permissions per database and return.
+  @AllowReplicationRebuild bit = 0    Published heaps skipped unless 1 (replication log flood risk).
   @Force             bit     = 0       Bypass re-entrancy guard (orphaned applock from KILLed run).
 ', 10, 1) WITH NOWAIT;
 
@@ -798,6 +804,13 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     DECLARE @CpuSourceUpper varchar(20) = UPPER(@CpuSource);
     SET @OnlinePreference = UPPER(@OnlinePreference);
 
+    -- #36: SQL Server 2017+ version check (STRING_AGG requires v14+)
+    IF CAST(SERVERPROPERTY(N'ProductMajorVersion') AS int) < 14
+    BEGIN
+        RAISERROR(N'sp_HeapDoctor requires SQL Server 2017 or later. STRING_AGG (used in QS snapshot aggregation) is not available in SQL Server 2016 and earlier.', 16, 1);
+        RETURN;
+    END
+
     IF @CpuSourceUpper NOT IN ('QUERY_STORE', 'QUICKIESTORE', 'NONE')
     BEGIN
         RAISERROR(N'Invalid @CpuSource. Use QUERY_STORE, QUICKIESTORE, or NONE.', 16, 1);
@@ -848,6 +861,88 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
     IF @ObfuscateSeed IS NOT NULL AND @ObfuscateKey IS NULL
         RAISERROR(N'WARNING: @ObfuscateSeed is ignored without @ObfuscateKey.', 10, 1) WITH NOWAIT;
+
+    ----------------------------------------------------------------------------
+    -- #18: @CheckPermissionsOnly: enumerate required permissions and return
+    ----------------------------------------------------------------------------
+    IF @CheckPermissionsOnly = 1
+    BEGIN
+        CREATE TABLE #PermCheck
+        (
+            database_name sysname NOT NULL,
+            permission_name nvarchar(128) NOT NULL,
+            granted nvarchar(1) NOT NULL
+        );
+
+        -- Check instance-level permissions
+        INSERT #PermCheck(database_name, permission_name, granted)
+        VALUES (N'(server)', N'ALTER TRACE', CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, N'ALTER TRACE') = 1 THEN N'Y' ELSE N'N' END);
+
+        -- Check per-database permissions (use @Databases if set, otherwise current DB)
+        DECLARE @perm_db sysname;
+        DECLARE @perm_sql nvarchar(max);
+
+        IF @Databases IS NULL
+        BEGIN
+            SET @perm_db = DB_NAME();
+            INSERT #PermCheck(database_name, permission_name, granted)
+            VALUES (@perm_db, N'VIEW DATABASE STATE',
+                    CASE WHEN HAS_PERMS_BY_NAME(@perm_db, N'DATABASE', N'VIEW DATABASE STATE') = 1 THEN N'Y' ELSE N'N' END);
+            INSERT #PermCheck(database_name, permission_name, granted)
+            VALUES (@perm_db, N'ALTER (any table)',
+                    CASE WHEN HAS_PERMS_BY_NAME(@perm_db, N'DATABASE', N'ALTER') = 1 THEN N'Y' ELSE N'N' END);
+
+            -- CommandLog check
+            IF @LogToTable = N'Y' AND OBJECT_ID(N'dbo.CommandLog') IS NOT NULL
+                INSERT #PermCheck(database_name, permission_name, granted)
+                VALUES (@perm_db, N'INSERT on dbo.CommandLog',
+                        CASE WHEN HAS_PERMS_BY_NAME(N'dbo.CommandLog', N'OBJECT', N'INSERT') = 1 THEN N'Y' ELSE N'N' END);
+        END
+        ELSE
+        BEGIN
+            DECLARE perm_cursor CURSOR LOCAL FAST_FORWARD FOR
+                SELECT name FROM sys.databases
+                WHERE state_desc = N'ONLINE'
+                  AND HAS_DBACCESS(name) = 1
+                  AND (@Databases = N'USER_DATABASES' AND database_id > 4
+                    OR @Databases = N'ALL_DATABASES'
+                    OR @Databases = N'SYSTEM_DATABASES' AND database_id <= 4
+                    OR name LIKE REPLACE(@Databases, N'*', N'%'));
+            OPEN perm_cursor;
+            FETCH NEXT FROM perm_cursor INTO @perm_db;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                INSERT #PermCheck(database_name, permission_name, granted)
+                VALUES (@perm_db, N'VIEW DATABASE STATE',
+                        CASE WHEN HAS_PERMS_BY_NAME(@perm_db, N'DATABASE', N'VIEW DATABASE STATE') = 1 THEN N'Y' ELSE N'N' END);
+                INSERT #PermCheck(database_name, permission_name, granted)
+                VALUES (@perm_db, N'ALTER (any table)',
+                        CASE WHEN HAS_PERMS_BY_NAME(@perm_db, N'DATABASE', N'ALTER') = 1 THEN N'Y' ELSE N'N' END);
+                FETCH NEXT FROM perm_cursor INTO @perm_db;
+            END
+            CLOSE perm_cursor;
+            DEALLOCATE perm_cursor;
+        END
+
+        -- Return result set
+        SELECT database_name, permission_name, granted
+        FROM #PermCheck
+        ORDER BY CASE WHEN granted = N'N' THEN 0 ELSE 1 END, database_name, permission_name;
+
+        -- Summary
+        DECLARE @missing_count int;
+        SELECT @missing_count = COUNT(*) FROM #PermCheck WHERE granted = N'N';
+        IF @missing_count > 0
+        BEGIN
+            SET @Msg = CAST(@missing_count AS nvarchar(10)) + N' missing permission(s) found. See result set above.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+        ELSE
+            RAISERROR(N'All required permissions granted.', 10, 1) WITH NOWAIT;
+
+        DROP TABLE #PermCheck;
+        RETURN;
+    END
 
 /*#endregion 04-VALIDATION */
 
@@ -1027,6 +1122,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @ObfuscateSeed = N''' + REPLACE(@ObfuscateSeed, N'''', N'''''') + N'''';
     IF @ResumeRunID IS NOT NULL
         SET @invocation_command += N', @ResumeRunID = ''' + CAST(@ResumeRunID AS nvarchar(36)) + N'''';
+    IF @AllowReplicationRebuild = 1
+        SET @invocation_command += N', @AllowReplicationRebuild = 1';
+    IF @CheckPermissionsOnly = 1
+        SET @invocation_command += N', @CheckPermissionsOnly = 1';
     IF @Force = 1
         SET @invocation_command += N', @Force = 1';
     SET @invocation_command += N';';
@@ -4158,6 +4257,30 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /*
+            #28: AG failover safety - check database is still writable before each rebuild.
+            If a failover occurred mid-run, the database becomes read-only on the new secondary.
+            DATABASEPROPERTYEX is fast (no DMV scan) and catches failover + other read-only states.
+            */
+            IF DATABASEPROPERTYEX(@db, N'Updateability') <> N'READ_WRITE'
+            BEGIN
+                SET @Msg = N'  SKIPPED: Database [' + @db + N'] is no longer READ_WRITE'
+                         + N' (possible AG failover). Skipping remaining targets in this database.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                -- Skip all remaining targets for this database
+                UPDATE #Targets SET sort_order = -1
+                WHERE database_name = @db AND sort_order > @i;
+                SET @skipped_cnt += 1;
+                INSERT #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
+                VALUES (@tid,
+                    CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
+                    CASE WHEN @obfuscate = 1
+                         THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                         ELSE @full END,
+                    @action, SYSDATETIME(), SYSDATETIME(), NULL, N'SKIPPED: DATABASE_READONLY (AG failover suspected)');
+                CONTINUE;
+            END
+
+            /*
             #33: LOB column re-check for CI swap targets (TOCTOU defense).
             Schema may have changed since discovery (especially with @ResumeRunID).
             If LOB columns were added after discovery, fall back to heap rebuild.
@@ -4474,19 +4597,75 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
 
-            -- Lock escalation warning for online rebuilds
+            -- Lock escalation warning for online rebuilds (#48: compound CI swap risk)
             IF @cur_lock_escalation = 0 AND @action IN ('HEAP_REBUILD_ONLINE', 'CI_SWAP_ONLINE')
             BEGIN
-                SET @Msg = N'  NOTE: lock_escalation=TABLE on ' + @full
-                         + N'. Online rebuild may escalate to table lock.';
+                IF @action = 'CI_SWAP_ONLINE'
+                    SET @Msg = N'  WARNING: lock_escalation=TABLE on ' + @full
+                             + N'. CI swap acquires Sch-M which blocks ALL readers (including NOLOCK).'
+                             + N' Combined with TABLE escalation, blocking may persist for the full CI build duration.'
+                             + N' Consider scheduling in off-peak window or using @LockTimeoutMs.';
+                ELSE
+                    SET @Msg = N'  NOTE: lock_escalation=TABLE on ' + @full
+                             + N'. Online rebuild may escalate to table lock.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
 
-            -- Replication warning during execution
+            -- #45: INSTEAD OF trigger awareness for CI swap targets
+            IF @action = 'CI_SWAP_ONLINE'
+            BEGIN
+                DECLARE @trigger_names nvarchar(1000) = NULL;
+                BEGIN TRY
+                    SET @verify_sql = N'SELECT @names = STRING_AGG(t.name, N'', '')
+                        FROM ' + QUOTENAME(@db) + N'.sys.triggers t
+                        WHERE t.parent_id = OBJECT_ID(@full_param)
+                          AND t.is_instead_of_trigger = 1;';
+                    EXEC sys.sp_executesql @verify_sql,
+                        N'@full_param nvarchar(512), @names nvarchar(1000) OUTPUT',
+                        @full_param = @full, @names = @trigger_names OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @trigger_names = NULL; -- don't block on lookup errors
+                END CATCH
+
+                IF @trigger_names IS NOT NULL
+                BEGIN
+                    SET @Msg = N'  NOTE: ' + @full + N' has INSTEAD OF trigger(s): ' + @trigger_names
+                             + N'. DDL operations (CREATE INDEX, ALTER TABLE REBUILD) do not fire DML triggers.';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                END
+            END
+
+            -- #59: Replication guard - skip published heaps unless opt-in
+            IF @cur_replication_hint IS NOT NULL AND @cur_replication_hint <> N'CDC'
+               AND @AllowReplicationRebuild = 0
+            BEGIN
+                SET @Msg = N'  SKIPPED: ' + @full + N' is ' + @cur_replication_hint
+                         + N'. Rebuild generates ~' + CAST(ISNULL(@cur_record_count, 0) * 2 AS nvarchar(20))
+                         + N' replication events (DELETE+INSERT per row).'
+                         + N' Use @AllowReplicationRebuild=1 to rebuild published heaps.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                SET @skipped_cnt += 1;
+                INSERT #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
+                VALUES (@tid,
+                    CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
+                    CASE WHEN @obfuscate = 1
+                         THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                         ELSE @full END,
+                    @action, SYSDATETIME(), SYSDATETIME(), NULL,
+                    N'SKIPPED: REPLICATION_PUBLISHED (use @AllowReplicationRebuild=1)');
+                CONTINUE;
+            END
+
+            -- Replication warning during execution (opt-in confirmed or CDC-only)
             IF @cur_replication_hint IS NOT NULL
             BEGIN
                 SET @Msg = N'  NOTE: ' + @full + N' is ' + @cur_replication_hint
-                         + N'. Rebuild generates replication log traffic.';
+                         + N'. Rebuild generates replication log traffic'
+                         + CASE WHEN @cur_replication_hint <> N'CDC'
+                                THEN N' (~' + CAST(ISNULL(@cur_record_count, 0) * 2 AS nvarchar(20)) + N' distributor events)'
+                                ELSE N'' END
+                         + N'.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                 -- CDC + CI swap specific warning
