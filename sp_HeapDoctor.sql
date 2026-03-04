@@ -54,7 +54,7 @@ License:    MIT License
 Version:    1.0.2026.0302i
 
 History:    1.0.2026.0302i - Resumable CI swap + temporal history (#85, #84)
-                          - @UseResumable: RESUMABLE = ON for CI swap CREATE INDEX (SQL 2017+, default ON)
+                          - @UseResumable: RESUMABLE = ON for CI swap CREATE INDEX (SQL 2019+, default ON)
                           - Paused operations auto-detected via sys.index_resumable_operations and resumed
                           - @IncludeTemporalHistory: includes temporal history table heaps in discovery
                           - SYSTEM_VERSIONING disable/enable lifecycle wraps rebuild for history tables
@@ -520,7 +520,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @IncludeTemporalHistory  bit            = 0,                -- #84: include temporal history heaps in discovery
 
     -- Resumable
-    @UseResumable            bit            = 1                 -- #85: use RESUMABLE = ON for CI swap (SQL 2017+, default ON)
+    @UseResumable            bit            = 1                 -- #85: use RESUMABLE = ON for CI swap (SQL 2019+, default ON)
 )
 /*#endregion 00-HEADER */
 
@@ -602,7 +602,7 @@ COMMON PARAMETERS:
   @IncludeTemporalHistory bit = 0      Include temporal history table heaps in discovery.
                                         Rebuild requires SYSTEM_VERSIONING disable/enable on parent.
                                         CI swap is blocked for history tables (REBUILD only).
-  @UseResumable      bit     = 1       RESUMABLE = ON for CI swap CREATE INDEX (SQL 2017+).
+  @UseResumable      bit     = 1       RESUMABLE = ON for CI swap CREATE INDEX (SQL 2019+).
                                         On interrupt, index build is paused (not rolled back).
                                         Resume detection: paused ops auto-resumed on next run.
 ', 10, 1) WITH NOWAIT;
@@ -940,6 +940,11 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     -- #23: @GenerateScript is mutually exclusive with @PlanOnly=0 when @Execute='Y'
     IF @GenerateScript = 1
         SET @PlanOnly = 1;  -- GenerateScript implies plan-only (no DDL executed)
+
+    -- #85: RESUMABLE = ON for CREATE INDEX requires SQL Server 2019+ (v15).
+    -- Silently downgrade to @UseResumable = 0 on SQL Server 2017 (v14) to avoid error 155.
+    IF @UseResumable = 1 AND CAST(SERVERPROPERTY(N'ProductMajorVersion') AS int) < 15
+        SET @UseResumable = 0;
 
     IF @ObfuscateSeed IS NOT NULL AND @ObfuscateKey IS NULL
         RAISERROR(N'WARNING: @ObfuscateSeed is ignored without @ObfuscateKey.', 10, 1) WITH NOWAIT;
