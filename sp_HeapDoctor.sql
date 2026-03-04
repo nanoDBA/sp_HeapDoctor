@@ -59,6 +59,13 @@ History:    1.0.2026.0302j - Security + correctness fixes (#93, #105, #122, #131
                           - @GenerateScript: RAISERROR uses %s format to handle % in object names (#122)
                           - Stale stats note: factually accurate message about modification counter (#93)
                           - CI swap guard: add XML index (type 3) and spatial (type 4) to exclusion (#105)
+                          - Docs: @Help CI SWAP RESTRICTIONS block — partitioned heap and temporal history
+                            table CI swap blocks now explicitly documented with rationale (#137, #140)
+                          - Docs: @GenerateScript @Help note — SYSTEM_VERSIONING wrappers for temporal
+                            tables require manual addition when using @GenerateScript (#119)
+                          - Docs: CommandLog START ExtendedInfo comment — clarifies included vs. omitted
+                            params for future maintainers (#107)
+                          - 19 BY_DESIGN GitHub issues closed with explanations
             1.0.2026.0302i - Resumable CI swap + temporal history (#85, #84)
                           - @UseResumable: RESUMABLE = ON for CI swap CREATE INDEX (SQL 2019+, default ON)
                           - Paused operations auto-detected via sys.index_resumable_operations and resumed
@@ -605,6 +612,10 @@ COMMON PARAMETERS:
   @OutputTable       nvarchar(256) = NULL  Persist results to a table (auto-created if missing).
                                         e.g. dbo.HeapDoctorHistory. Includes RunID + CapturedAt.
   @GenerateScript    bit     = 0       Output executable T-SQL script (implies @PlanOnly=1).
+                                        Note: For temporal tables, generated CI swap commands
+                                        require manual SYSTEM_VERSIONING disable/enable wrappers.
+                                        sp_HeapDoctor executes these automatically in @Execute mode
+                                        but cannot include them in the generated script.
   @IncludeTemporalHistory bit = 0      Include temporal history table heaps in discovery.
                                         Rebuild requires SYSTEM_VERSIONING disable/enable on parent.
                                         CI swap is blocked for history tables (REBUILD only).
@@ -682,6 +693,17 @@ WRITE-HEAVY HEAPS:
   Sch-M locks acquired during CI swap block ALL readers, including NOLOCK/READ UNCOMMITTED.
   Applications that rely on NOLOCK for non-blocking reads will queue during CI swap.
   Tables with lock_escalation=TABLE compound this risk. Use @LockTimeoutMs to limit wait.
+
+CI SWAP RESTRICTIONS:
+  The following table types are blocked from CI swap and fall back to HEAP_REBUILD:
+  - Partitioned heaps (partition_count > 1): creating a CI on a partitioned heap requires
+    a matching partition scheme and function. sp_HeapDoctor cannot resolve this dependency
+    automatically. Use ALTER TABLE ... REBUILD instead and manage partitioning separately.
+  - Temporal history tables (is_temporal_history = 1): SYSTEM_VERSIONING prevents DDL on
+    the history table while versioning is active. sp_HeapDoctor disables SYSTEM_VERSIONING,
+    performs HEAP_REBUILD, then re-enables it. CI swap is not used for history tables.
+  - Tables with LOB columns, schema-bound views, indexed views, CDC tracking, or forced plans.
+  The result set columns partition_count and is_temporal_history indicate these conditions.
 
 DISCOVERY FILTERS:
   @MinPages, @MinForwardedPct, and @TopN are discovery-time filters. Heaps that do not
@@ -4549,6 +4571,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         */
         IF @commandlog_exists = 1
         BEGIN
+            -- CommandLog START ExtendedInfo: includes invocation params (@Database, @MinPages, @MinForwardedPct,
+            -- @PlanOnly, @Execute, @CpuSource, @LogToTable, @TopN, @Tables, @MaxPages, @LookbackDays,
+            -- @AllowCiSwap, @PreferCiSwap, @EstimateTime, @Maxdop, @LockTimeoutMs, @MaxRunSeconds).
+            -- @BaselineRebuildMBPerMin, @UpdateStatsAfterRebuild, @Force intentionally omitted from START
+            -- entry (available in per-rebuild entries and invocation_command). RunID included for correlation.
             INSERT INTO dbo.CommandLog
                 (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime, ExtendedInfo)
             VALUES
