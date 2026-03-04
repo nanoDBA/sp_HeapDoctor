@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0302i
+**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0302j
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -964,6 +964,42 @@ ALTER EVENT SESSION HeapDoctorMonitor ON SERVER STATE = START;
 ### Platform support
 
 The proc is pure T-SQL and works on Windows, Linux, and container deployments of SQL Server.  Test scripts use `sqlcmd` with flags for both Windows auth (`-E`) and SQL auth (`-U`/`-P`).  On Linux or container deployments, use SQL auth or Azure AD (`-G`), and add `-C` to trust self-signed certificates if needed.
+
+## Version History
+
+### v1.0.2026.0302j *(current)*
+
+**Security and correctness fixes** (6 issues from sp-heapdoctor-issues agent + 5 additional):
+
+- **Security:** `@OutputTable` PARSENAME+QUOTENAME validation prevents SQL injection (#131, #132)
+- **Fix:** `@UpdateStatsAfterRebuild` now uses `USE [db]` + 2-part name, fixing UPDATE STATISTICS cross-database (#143)
+- **Fix:** `@GenerateScript` RAISERROR uses `%s` format to handle `%` in object names (#122)
+- **Fix:** Stale stats note corrected — factually accurate message about modification counter (#93)
+- **Fix:** CI swap guard: XML indexes (type 3) and spatial indexes (type 4) added to exclusion list (#105)
+- **Docs:** `@Help` CI SWAP RESTRICTIONS block — partitioned heap and temporal history table CI swap blocks now explicitly documented with rationale (#137, #140)
+- **Docs:** `@GenerateScript` `@Help` note — SYSTEM_VERSIONING wrappers for temporal tables require manual addition (#119)
+- **Docs:** CommandLog START ExtendedInfo comment — clarifies included vs. omitted params for maintainers (#107)
+- **Triage:** 19 BY_DESIGN GitHub issues closed with factual explanations; 19 NEEDS_INVESTIGATION issues labeled
+
+**New parameters added in v1.0.2026.0302i–j:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@UseResumable` | `1` | `RESUMABLE = ON` for CI swap CREATE INDEX. Detects and resumes paused operations |
+| `@IncludeTemporalHistory` | `0` | Include temporal history table heaps. Auto-manages SYSTEM_VERSIONING lifecycle |
+| `@OutputTable` | `NULL` | Persist result set to a user-specified table (auto-created if missing) |
+| `@GenerateScript` | `0` | Output executable T-SQL rebuild script instead of running rebuilds |
+
+### v1.0.2026.0302i
+
+- Resumable CI swap (`@UseResumable`) + temporal history support (`@IncludeTemporalHistory`)
+- Paused CI swap operations auto-detected via `sys.index_resumable_operations` and resumed on next run
+- New result set column: `is_temporal_history`
+
+### v1.0.2026.0302h
+
+- `@OutputTable` — persist results for automation and trending
+- `@GenerateScript` — output copy-paste T-SQL rebuild scripts
 
 ## Credits
 
