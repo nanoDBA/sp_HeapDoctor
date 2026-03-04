@@ -6,8 +6,5 @@
 !README.md
 !LICENSE
 !sp_HeapDoctor.sql
-!tests/
-!tests/*.sql
-!tests/*.ps1
 !tools/
 !tools/*.sql
