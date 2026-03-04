@@ -51,9 +51,10 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0302j
+Version:    2026.03.04 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    1.0.2026.0302j - Security + correctness fixes (#93, #105, #122, #131, #132, #143)
+History:    2026.03.04 - Adopt CalVer versioning (YYYY.MM.DD); prior: 1.0.2026.0302j
+            2026.03.04 - Security + correctness fixes (#93, #105, #122, #131, #132, #143)
                           - @OutputTable: PARSENAME+QUOTENAME validation prevents SQL injection (#131, #132)
                           - @UpdateStatsAfterRebuild: USE [db] + 2-part name fixes UPDATE STATISTICS (#143)
                           - @GenerateScript: RAISERROR uses %s format to handle % in object names (#122)
@@ -543,7 +544,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302j';
+    DECLARE @Version nvarchar(20) = N'2026.03.04';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
