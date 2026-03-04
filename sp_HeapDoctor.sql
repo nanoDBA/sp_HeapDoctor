@@ -51,9 +51,15 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.0.2026.0302i
+Version:    1.0.2026.0302j
 
-History:    1.0.2026.0302i - Resumable CI swap + temporal history (#85, #84)
+History:    1.0.2026.0302j - Security + correctness fixes (#93, #105, #122, #131, #132, #143)
+                          - @OutputTable: PARSENAME+QUOTENAME validation prevents SQL injection (#131, #132)
+                          - @UpdateStatsAfterRebuild: USE [db] + 2-part name fixes UPDATE STATISTICS (#143)
+                          - @GenerateScript: RAISERROR uses %s format to handle % in object names (#122)
+                          - Stale stats note: factually accurate message about modification counter (#93)
+                          - CI swap guard: add XML index (type 3) and spatial (type 4) to exclusion (#105)
+            1.0.2026.0302i - Resumable CI swap + temporal history (#85, #84)
                           - @UseResumable: RESUMABLE = ON for CI swap CREATE INDEX (SQL 2019+, default ON)
                           - Paused operations auto-detected via sys.index_resumable_operations and resumed
                           - @IncludeTemporalHistory: includes temporal history table heaps in discovery
@@ -530,7 +536,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; -- Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66)
 
-    DECLARE @Version nvarchar(20) = N'1.0.2026.0302i';
+    DECLARE @Version nvarchar(20) = N'1.0.2026.0302j';
     -- Ranking algorithm version: increment only when the ranking formula changes, not on every proc release.
     -- v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218.
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -926,13 +932,20 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RETURN;
     END
 
-    -- #16: @OutputTable validation
+    -- #16: @OutputTable validation (#131/#132: PARSENAME+QUOTENAME to prevent SQL injection)
     IF @OutputTable IS NOT NULL
     BEGIN
-        -- Validate table name format (schema.table or table)
+        -- Reject spaces (quick guard before PARSENAME)
         IF CHARINDEX(N' ', @OutputTable) > 0
         BEGIN
             RAISERROR(N'@OutputTable must not contain spaces. Use schema.table format (e.g. dbo.HeapDoctorHistory).', 16, 1);
+            RETURN;
+        END
+        -- #131/#132: Validate via PARSENAME. Only 1-part (table) or 2-part (schema.table) allowed.
+        -- 3-part or 4-part names are rejected. PARSENAME returns NULL for invalid identifiers.
+        IF PARSENAME(@OutputTable, 1) IS NULL OR PARSENAME(@OutputTable, 3) IS NOT NULL
+        BEGIN
+            RAISERROR(N'@OutputTable must use 1-part (table) or 2-part (schema.table) format with valid identifiers (e.g. dbo.HeapDoctorHistory).', 16, 1);
             RETURN;
         END
     END
@@ -2116,7 +2129,7 @@ JOIN sys.indexes ix ON ix.object_id = o.object_id AND ix.type = 0
 WHERE o.is_memory_optimized = 0
   AND (o.temporal_type = 0 OR (o.temporal_type = 1 AND @IncludeTemporalHistory_param = 1))
   AND o.is_node = 0 AND o.is_edge = 0
-  AND NOT EXISTS (SELECT 1 FROM sys.indexes ci WHERE ci.object_id = o.object_id AND ci.type IN (5,6))
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes ci WHERE ci.object_id = o.object_id AND ci.type IN (3,4,5,6))  -- #105: block XML (3), spatial (4), columnstore (5,6)
 ';
         -- 9I: Ledger table exclusion (SQL 2022+ only; column doesn't exist on older versions)
         IF CAST(SERVERPROPERTY('ProductMajorVersion') AS int) >= 16
@@ -4066,15 +4079,19 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     BEGIN
         DECLARE @output_sql nvarchar(max);
         DECLARE @output_table_exists bit = 0;
+        -- #131/#132: Construct safe (injection-proof) table name using PARSENAME+QUOTENAME.
+        DECLARE @ot_schema sysname = ISNULL(PARSENAME(@OutputTable, 2), N'dbo');
+        DECLARE @ot_table  sysname = PARSENAME(@OutputTable, 1);
+        DECLARE @safe_OutputTable nvarchar(512) = QUOTENAME(@ot_schema) + N'.' + QUOTENAME(@ot_table);
 
         -- Check if table exists
-        SET @output_sql = N'IF OBJECT_ID(' + QUOTENAME(@OutputTable, N'''') + N') IS NOT NULL SET @exists = 1;';
+        SET @output_sql = N'IF OBJECT_ID(' + QUOTENAME(@safe_OutputTable, N'''') + N') IS NOT NULL SET @exists = 1;';
         EXEC sp_executesql @output_sql, N'@exists bit OUTPUT', @exists = @output_table_exists OUTPUT;
 
         -- Create table if it doesn't exist
         IF @output_table_exists = 0
         BEGIN
-            SET @output_sql = N'CREATE TABLE ' + @OutputTable + N' (
+            SET @output_sql = N'CREATE TABLE ' + @safe_OutputTable + N' (
                 run_id               uniqueidentifier NOT NULL,
                 captured_at          datetime2(3)     NOT NULL DEFAULT SYSUTCDATETIME(),
                 version              nvarchar(20)     NULL,
@@ -4130,7 +4147,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
         -- Insert results into output table
         BEGIN TRY
-            SET @output_sql = N'INSERT INTO ' + @OutputTable + N' (
+            SET @output_sql = N'INSERT INTO ' + @safe_OutputTable + N' (
                 run_id, version, target_id, sort_order,
                 database_name, schema_name, table_name,
                 page_count, record_count, forwarded_record_count, forwarded_pct,
@@ -4225,16 +4242,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                              + CASE WHEN @script_size IS NOT NULL THEN N', ' + CAST(@script_size AS nvarchar(20)) + N' MB' ELSE N'' END
                              + CASE WHEN @script_est IS NOT NULL THEN N', est ' + @script_est ELSE N'' END
                              + N')';
-            RAISERROR(@script_line, 10, 1) WITH NOWAIT;
-            RAISERROR(@script_cmd, 10, 1) WITH NOWAIT;
+            -- #122: Use %s format to safely emit commands that may contain % in object names.
+            RAISERROR(N'%s', 10, 1, @script_line) WITH NOWAIT;
+            RAISERROR(N'%s', 10, 1, @script_cmd) WITH NOWAIT;
 
             IF @script_ci_drop IS NOT NULL
-                RAISERROR(@script_ci_drop, 10, 1) WITH NOWAIT;
+                RAISERROR(N'%s', 10, 1, @script_ci_drop) WITH NOWAIT;
 
             IF @script_verify IS NOT NULL
             BEGIN
                 SET @script_line = N'-- Verify: ' + @script_verify;
-                RAISERROR(@script_line, 10, 1) WITH NOWAIT;
+                RAISERROR(N'%s', 10, 1, @script_line) WITH NOWAIT;
             END
 
             RAISERROR(N'GO', 10, 1) WITH NOWAIT;
@@ -5273,7 +5291,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 IF @UpdateStatsAfterRebuild = 1
                 BEGIN
                     BEGIN TRY
-                        DECLARE @stats_sql nvarchar(max) = N'UPDATE STATISTICS ' + @full + N' WITH FULLSCAN;';
+                        -- #143: UPDATE STATISTICS does not support 3-part names; use USE [db] + 2-part name.
+                        DECLARE @stats_sql nvarchar(max) = N'USE ' + QUOTENAME(@db) + N'; UPDATE STATISTICS '
+                            + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N' WITH FULLSCAN;';
                         DECLARE @stats_start datetime2(3) = SYSDATETIME();
                         EXEC sys.sp_executesql @stats_sql;
                         DECLARE @stats_ms int = DATEDIFF(MILLISECOND, @stats_start, SYSDATETIME());
@@ -5289,8 +5309,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 END
                 ELSE
                 BEGIN
-                    SET @Msg = N'  Note: Statistics on ' + @full + N' are now stale (heap + '
-                             + CAST(@cur_nci_count AS nvarchar(10)) + N' NCI(s)). Auto-update will trigger on next query.';
+                    -- #93: Heap rebuild holds Sch-M lock; no DML occurs, so modification_counter is unchanged.
+                    -- Statistics are no more stale after rebuild than before. Auto-update threshold is
+                    -- modification-based and will NOT trigger from the rebuild itself.
+                    SET @Msg = N'  Note: Statistics on ' + @full + N' (heap + '
+                             + CAST(@cur_nci_count AS nvarchar(10)) + N' NCI(s)) are unchanged by rebuild.'
+                             + N' Use @UpdateStatsAfterRebuild=1 to update statistics explicitly.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
 
