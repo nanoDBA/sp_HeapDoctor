@@ -6,5 +6,6 @@
 !README.md
 !LICENSE
 !sp_HeapDoctor.sql
+!STYLE_GUIDE.md
 !tools/
 !tools/*.sql
