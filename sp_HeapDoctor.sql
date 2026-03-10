@@ -493,6 +493,9 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     /* Output verbosity */
     @Debug                   bit            = 0,
 
+    /* Discovery scan */
+    @ScanMode                nvarchar(20)   = N'SAMPLED', /* #135: dm_db_index_physical_stats mode (SAMPLED/DETAILED/LIMITED) */
+
     /* Throughput estimation */
     @EstimateTime            bit            = 0, /* 1 = show estimated rebuild time per target */
     @EstimateLookbackDays    integer            = 90, /* CommandLog history window for throughput rates */
@@ -544,7 +547,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.03.04';
+    DECLARE @Version nvarchar(20) = N'2026.03.09';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -602,6 +605,10 @@ COMMON PARAMETERS:
   @MaxRunSeconds     integer     = NULL    Stop after N seconds (NULL=no limit).
   @ScanThrottleMs    integer     = NULL    Wait ms between database scans (0-60000, NULL=off).
   @Debug             bit     = 0       Extra diagnostic output.
+  @ScanMode          nvarchar(20) = N''SAMPLED'' Discovery scan mode for dm_db_index_physical_stats.
+                                        SAMPLED: ~1%% of pages (fast, may miss recent fragmentation).
+                                        DETAILED: all pages (accurate, slower on large databases).
+                                        LIMITED: allocation pages only (fastest, coarse fragmentation).
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays integer  = 90      CommandLog history window for throughput rates.
   @BaselineRebuildMBPerMin integer = NULL  Cold-start: assumed MB/min when no CommandLog history
@@ -705,6 +712,9 @@ CI SWAP RESTRICTIONS:
     performs HEAP_REBUILD, then re-enables it. CI swap is not used for history tables.
   - Tables with LOB columns, schema-bound views, indexed views, CDC tracking, or forced plans.
   The result set columns partition_count and is_temporal_history indicate these conditions.
+  FK REFERENCES: CI swap changes row locators in FK child tables from RID to CI key (and back).
+  Only same-database FK constraints (sys.foreign_keys) are detected. Cross-database FKs enforced
+  via triggers, synonyms, or application logic are invisible to sp_HeapDoctor. (#110)
 
 DISCOVERY FILTERS:
   @MinPages, @MinForwardedPct, and @TopN are discovery-time filters. Heaps that do not
@@ -713,6 +723,10 @@ DISCOVERY FILTERS:
   forwarded_pct formula: forwarded_record_count / record_count * 100. The denominator
   is total rows (record_count), not pages. forwarded_record_count counts pointer stubs
   on original pages (one per forwarded row). Example: 1M rows, 50K forwarded = 5.0%%.
+  @TopN + CI SWAP: @TopN selects top-N targets by ranking score before action assignment.
+  A lower-ranked CI swap candidate (more efficient fix) may be excluded while a higher-ranked
+  heap rebuild is included. To ensure CI swap targets are evaluated, use @TopN=NULL or a
+  larger value when @AllowCiSwap=1. (#142)
 
 SCOPE:
   Operates within the current SQL Server instance. Linked server tables are out of scope.
@@ -940,6 +954,14 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     IF @ScanThrottleMs IS NOT NULL AND (@ScanThrottleMs < 0 OR @ScanThrottleMs > 60000)
     BEGIN
         RAISERROR(N'@ScanThrottleMs must be between 0 and 60000 (60 seconds). Use NULL for no throttle.', 16, 1);
+        RETURN;
+    END
+
+    /* #135: @ScanMode validation */
+    SET @ScanMode = UPPER(LTRIM(RTRIM(@ScanMode)));
+    IF @ScanMode NOT IN (N'SAMPLED', N'DETAILED', N'LIMITED')
+    BEGIN
+        RAISERROR(N'@ScanMode must be SAMPLED, DETAILED, or LIMITED.', 16, 1);
         RETURN;
     END
 
@@ -1198,21 +1220,43 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         END
     END
 
+    /*
+    #141: Check for orphaned SYSTEM_VERSIONING breadcrumbs from prior KILLed temporal rebuilds.
+    These indicate SYSTEM_VERSIONING was disabled but never re-enabled.
+    */
+    IF @commandlog_exists = 1
+    BEGIN
+        DECLARE @orphan_versioning nvarchar(max) = NULL;
+        SELECT @orphan_versioning = STRING_AGG(
+            N'  ' + DatabaseName + N'.' + SchemaName + N'.' + ObjectName
+            + N' -- ' + Command, NCHAR(10))
+        FROM dbo.CommandLog
+        WHERE CommandType = N'HEAP_TEMPORAL_VERSIONING_DISABLED'
+          AND EndTime IS NULL
+          AND StartTime >= DATEADD(DAY, -7, SYSDATETIME());
+
+        IF @orphan_versioning IS NOT NULL
+        BEGIN
+            SET @Msg = N'WARNING: Orphaned SYSTEM_VERSIONING disable detected (prior run may have been KILLed).'
+                     + N' The following parent tables may need SYSTEM_VERSIONING re-enabled:';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            RAISERROR(@orphan_versioning, 10, 1) WITH NOWAIT;
+            RAISERROR(N'Execute the DDL above to restore temporal versioning.', 10, 1) WITH NOWAIT;
+        END
+    END
+
     /* Build reproducible invocation command for CommandLog (all non-default parameters) */
     SET @invocation_command = N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N'''';
     IF @Tables IS NOT NULL
         SET @invocation_command += N', @Tables = N''' + REPLACE(@Tables, N'''', N'''''') + N'''';
     SET @invocation_command += N', @PlanOnly = ' + CONVERT(nvarchar(1), @PlanOnly);
-    IF @LookbackDays <> 7
-        SET @invocation_command += N', @LookbackDays = ' + CONVERT(nvarchar(10), @LookbackDays);
-    IF @TopN <> 25
-        SET @invocation_command += N', @TopN = ' + CONVERT(nvarchar(10), @TopN);
-    IF @MinPages <> 1000
-        SET @invocation_command += N', @MinPages = ' + CONVERT(nvarchar(20), @MinPages);
+    /* #107: Always include key filter params for historical audit (even at default values) */
+    SET @invocation_command += N', @LookbackDays = ' + CONVERT(nvarchar(10), @LookbackDays);
+    SET @invocation_command += N', @TopN = ' + CONVERT(nvarchar(10), @TopN);
+    SET @invocation_command += N', @MinPages = ' + CONVERT(nvarchar(20), @MinPages);
     IF @MaxPages IS NOT NULL
         SET @invocation_command += N', @MaxPages = ' + CONVERT(nvarchar(20), @MaxPages);
-    IF @MinForwardedPct <> 2.00
-        SET @invocation_command += N', @MinForwardedPct = ' + CONVERT(nvarchar(10), @MinForwardedPct);
+    SET @invocation_command += N', @MinForwardedPct = ' + CONVERT(nvarchar(10), @MinForwardedPct);
     IF @SkipWriteHeavy = 1
         SET @invocation_command += N', @SkipWriteHeavy = 1';
     IF @MinDaysSinceRebuild IS NOT NULL
@@ -1265,6 +1309,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @IncludeTemporalHistory = 1';
     IF @UseResumable = 0
         SET @invocation_command += N', @UseResumable = 0';
+    IF @ScanMode <> N'SAMPLED'
+        SET @invocation_command += N', @ScanMode = N''' + @ScanMode + N'''';
     SET @invocation_command += N';';
 
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
@@ -1282,7 +1328,13 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     SET @Msg = N'Mode:        ' + CASE WHEN @PlanOnly = 1 THEN N'PLAN ONLY' ELSE N'EXECUTE' END;
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-    RAISERROR(N'Scan mode:   SAMPLED (forwarded record counts are estimates)', 10, 1) WITH NOWAIT;
+    SET @Msg = N'Scan mode:   ' + @ScanMode
+             + CASE @ScanMode
+                   WHEN N'SAMPLED' THEN N' (forwarded record counts are estimates)'
+                   WHEN N'DETAILED' THEN N' (accurate counts, slower scan)'
+                   WHEN N'LIMITED' THEN N' (allocation pages only, coarse fragmentation)'
+                   ELSE N'' END;
+    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
     /* #65: Deprecation advisory for sp_trace_generateevent on SQL 2022+ */
     IF CONVERT(integer, SERVERPROPERTY(N'ProductMajorVersion')) >= 16
@@ -1708,6 +1760,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         fk_ref_count             integer            NOT NULL DEFAULT 0,
         page_io_latch_wait_count bigint         NULL,
         page_io_latch_wait_ms    bigint         NULL,
+        filtered_nci_count       integer            NOT NULL DEFAULT 0, /* #99: filtered NCIs on this heap */
         is_temporal_history      bit            NOT NULL DEFAULT 0, /* #84: temporal history table */
         temporal_parent_schema   sysname        NULL, /* #84: parent versioned table schema */
         temporal_parent_table    sysname        NULL, /* #84: parent versioned table name */
@@ -2104,6 +2157,7 @@ CREATE TABLE #Heaps
     fk_ref_count           integer           NOT NULL DEFAULT 0, /* #74: count of FK references TO this heap */
     page_io_latch_wait_count bigint      NULL, /* #22: IO latch waits from operational stats */
     page_io_latch_wait_ms  bigint        NULL, /* #22: IO latch wait time ms */
+    filtered_nci_count     integer           NOT NULL DEFAULT 0, /* #99: filtered NCIs on this heap */
     is_temporal_history    bit           NOT NULL DEFAULT 0, /* #84: temporal history table flag */
     temporal_parent_schema sysname       NULL, /* #84: parent versioned table schema */
     temporal_parent_table  sysname       NULL /* #84: parent versioned table name */
@@ -2238,7 +2292,7 @@ CROSS APPLY (
         AVG(avg_page_space_used_in_percent) AS avg_page_space_used_in_percent,
         AVG(avg_fragmentation_in_percent) AS avg_fragmentation_in_percent,
         SUM(ghost_record_count) AS ghost_record_count
-    FROM sys.dm_db_index_physical_stats(DB_ID(), ho.object_id, 0, NULL, ''SAMPLED'')
+    FROM sys.dm_db_index_physical_stats(DB_ID(), ho.object_id, 0, NULL, @ScanMode_param)
 ) ips
 OUTER APPLY (
     SELECT SUM(forwarded_fetch_count) AS forwarded_fetch_count,
@@ -2443,6 +2497,15 @@ NciCounts AS
     WHERE type = 2
     GROUP BY object_id
 ),
+FilteredNciCounts AS
+(
+    /* #99: Count filtered NCIs per object for stale-stats warning */
+    SELECT object_id, CONVERT(integer, COUNT_BIG(*)) AS filtered_nci_count
+    FROM sys.indexes
+    WHERE type = 2
+      AND has_filter = 1
+    GROUP BY object_id
+),
 Ranked AS
 (
     SELECT
@@ -2471,6 +2534,7 @@ Ranked AS
         h.fk_ref_count,
         h.page_io_latch_wait_count,
         h.page_io_latch_wait_ms,
+        ISNULL(fnc.filtered_nci_count, 0) AS filtered_nci_count,
         h.is_temporal_history,
         h.temporal_parent_schema,
         h.temporal_parent_table,
@@ -2539,6 +2603,7 @@ Ranked AS
     LEFT JOIN BestKey bk ON h.object_id = bk.object_id AND bk.rn = 1
     LEFT JOIN LobTables lt ON h.object_id = lt.object_id
     LEFT JOIN NciCounts nc ON h.object_id = nc.object_id
+    LEFT JOIN FilteredNciCounts fnc ON h.object_id = fnc.object_id
 )
 INSERT INTO #Targets
 (
@@ -2551,6 +2616,7 @@ INSERT INTO #Targets
     partition_count, has_schema_bound_views, has_indexed_views, data_space_name,
     has_fk_references, fk_ref_count,
     page_io_latch_wait_count, page_io_latch_wait_ms,
+    filtered_nci_count,
     is_temporal_history, temporal_parent_schema, temporal_parent_table,
     action_chosen, command_text, ci_drop_command,
     qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
@@ -2569,6 +2635,7 @@ SELECT TOP (@TopN_param)
     r.partition_count, r.has_schema_bound_views, r.has_indexed_views, r.data_space_name,
     r.has_fk_references, r.fk_ref_count,
     r.page_io_latch_wait_count, r.page_io_latch_wait_ms,
+    r.filtered_nci_count,
     r.is_temporal_history, r.temporal_parent_schema, r.temporal_parent_table,
     /* action_chosen (8I: forced plans prevent CI swap; #83: CDC blocks CI swap; #62: partitioned heaps skip CI swap; #84: temporal history blocks CI swap) */
     CASE
@@ -2977,7 +3044,8 @@ END
                   @LookbackDays_param integer, @TopN_param integer,
                   @AllowCiSwap_param bit, @PreferCiSwap_param bit, @Online_param bit,
                   @Maxdop_param integer, @FillFactor_param tinyint, @CpuSource_param varchar(20), @UptimeHours_param float,
-                  @UseResumable_param bit, @IncludeTemporalHistory_param bit',
+                  @UseResumable_param bit, @IncludeTemporalHistory_param bit,
+                  @ScanMode_param nvarchar(20)',
                 @MinPages_param = @MinPages,
                 @MaxPages_param = @MaxPages,
                 @MinForwardedPct_param = @MinForwardedPct,
@@ -2991,7 +3059,8 @@ END
                 @CpuSource_param = @CpuSourceUpper,
                 @UptimeHours_param = @UptimeHours,
                 @UseResumable_param = @UseResumable,
-                @IncludeTemporalHistory_param = @IncludeTemporalHistory;
+                @IncludeTemporalHistory_param = @IncludeTemporalHistory,
+                @ScanMode_param = @ScanMode;
         END TRY
         BEGIN CATCH
             SET @discovery_errors += 1;
@@ -3487,6 +3556,57 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         END
     END
 
+    /*
+    #145: VLF count advisory for FULL recovery databases with large targets.
+    High VLF counts increase log operation overhead. DBCC LOGINFO row count = VLF count.
+    Warn when VLF count > 1000 for databases containing rebuild targets.
+    */
+    BEGIN
+        DECLARE @vlf_db sysname, @vlf_count integer, @vlf_sql nvarchar(max);
+        DECLARE @vlf_warnings nvarchar(max) = N'';
+        DECLARE vlf_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT t.database_name
+            FROM #Targets t
+            JOIN sys.databases d ON d.name = t.database_name COLLATE DATABASE_DEFAULT
+            WHERE d.recovery_model_desc = N'FULL'
+              AND t.page_count > 10000; /* only check for non-trivial targets */
+        OPEN vlf_cursor;
+        FETCH NEXT FROM vlf_cursor INTO @vlf_db;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            BEGIN TRY
+                CREATE TABLE #VlfInfo (
+                    RecoveryUnitId integer NULL, FileId integer NULL, FileSize bigint NULL,
+                    StartOffset bigint NULL, FSeqNo integer NULL, Status integer NULL,
+                    Parity tinyint NULL, CreateLSN numeric(25,0) NULL
+                );
+                SET @vlf_sql = N'USE ' + QUOTENAME(@vlf_db) + N'; DBCC LOGINFO WITH NO_INFOMSGS;';
+                INSERT INTO #VlfInfo EXEC sys.sp_executesql @vlf_sql;
+                SET @vlf_count = ROWCOUNT_BIG();
+                DROP TABLE #VlfInfo;
+
+                IF @vlf_count > 1000
+                BEGIN
+                    SET @vlf_warnings += CASE WHEN @vlf_warnings = N'' THEN N'' ELSE N', ' END
+                                       + @vlf_db + N' (' + CONVERT(nvarchar(10), @vlf_count) + N' VLFs)';
+                END
+            END TRY
+            BEGIN CATCH
+                IF OBJECT_ID(N'tempdb..#VlfInfo') IS NOT NULL DROP TABLE #VlfInfo;
+            END CATCH
+            FETCH NEXT FROM vlf_cursor INTO @vlf_db;
+        END
+        CLOSE vlf_cursor;
+        DEALLOCATE vlf_cursor;
+
+        IF @vlf_warnings <> N''
+        BEGIN
+            SET @Msg = N'WARNING: High VLF count on [' + @vlf_warnings
+                     + N']. Log-intensive rebuilds may be slower. Consider shrinking and re-growing the log file.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+    END
+
     /* #20: Tempdb free space pre-flight check for CI swap targets */
     IF EXISTS (SELECT 1 FROM #Targets WHERE action_chosen = 'CI_SWAP_ONLINE')
     BEGIN
@@ -3519,6 +3639,79 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                      + N' MB for sort space. Consider reducing concurrent maintenance jobs or increasing tempdb.';
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         END
+    END
+
+    /* #115: Post-discovery summary of CI swap targets with FK references */
+    IF EXISTS (SELECT 1 FROM #Targets WHERE has_fk_references = 1 AND action_chosen = 'CI_SWAP_ONLINE')
+    BEGIN
+        DECLARE @fk_summary_list nvarchar(max);
+        SELECT @fk_summary_list = STRING_AGG(
+            N'  ' + QUOTENAME(database_name) + N'.' + QUOTENAME(schema_name) + N'.' + QUOTENAME(table_name)
+            + N' (' + CONVERT(nvarchar(10), fk_ref_count) + N' FK ref(s))',
+            NCHAR(10))
+        FROM #Targets
+        WHERE has_fk_references = 1 AND action_chosen = 'CI_SWAP_ONLINE';
+
+        SET @Msg = N'WARNING: The following CI swap targets have foreign key references. '
+                 + N'After CI swap, FK child table NCI row locators change from RID to CI key. '
+                 + N'Query plans referencing FK child NCIs may need recompilation.';
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        RAISERROR(@fk_summary_list, 10, 1) WITH NOWAIT;
+    END
+
+    /*
+    #97: Per-database orphaned CI detection.
+    Scan for CX__Temp__ clustered indexes left behind by prior failed CI swap DROP operations.
+    These tables are invisible to discovery (index_id = 1, not 0) and require manual cleanup.
+    Only scan databases in scope (not all databases on the server).
+    */
+    IF @resume_loaded = 0
+    BEGIN
+        DECLARE @orphan_db sysname, @orphan_sql nvarchar(max), @orphan_results nvarchar(max);
+        DECLARE orphan_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DatabaseName FROM @tmpDatabases WHERE Selected = 1 AND Completed = 1;
+        OPEN orphan_cursor;
+        FETCH NEXT FROM orphan_cursor INTO @orphan_db;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @orphan_results = NULL;
+            BEGIN TRY
+                SET @orphan_sql = N'SELECT @out = STRING_AGG(
+                    N''  '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name)
+                    + N'' -- '' + N''DROP INDEX '' + QUOTENAME(i.name)
+                    + N'' ON '' + QUOTENAME(@db_param) + N''.'' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';'',
+                    NCHAR(10))
+                FROM ' + QUOTENAME(@orphan_db) + N'.sys.indexes i
+                JOIN ' + QUOTENAME(@orphan_db) + N'.sys.tables t ON t.object_id = i.object_id
+                JOIN ' + QUOTENAME(@orphan_db) + N'.sys.schemas s ON s.schema_id = t.schema_id
+                WHERE i.name LIKE N''CX!_!_Temp!_!_%'' ESCAPE N''!''
+                  AND i.type = 1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM #Targets tgt
+                    WHERE tgt.database_name = @db_param COLLATE DATABASE_DEFAULT
+                      AND tgt.schema_name = s.name COLLATE DATABASE_DEFAULT
+                      AND tgt.table_name = t.name COLLATE DATABASE_DEFAULT
+                  );';
+                EXEC sys.sp_executesql @orphan_sql,
+                    N'@db_param sysname, @out nvarchar(max) OUTPUT',
+                    @db_param = @orphan_db, @out = @orphan_results OUTPUT;
+            END TRY
+            BEGIN CATCH
+                SET @orphan_results = NULL; /* don't block on metadata errors */
+            END CATCH
+
+            IF @orphan_results IS NOT NULL
+            BEGIN
+                SET @Msg = N'WARNING: Orphaned temp clustered index(es) found in [' + @orphan_db
+                         + N'] from a prior failed CI swap DROP. These tables are no longer heaps and need manual cleanup:';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                RAISERROR(@orphan_results, 10, 1) WITH NOWAIT;
+            END
+
+            FETCH NEXT FROM orphan_cursor INTO @orphan_db;
+        END
+        CLOSE orphan_cursor;
+        DEALLOCATE orphan_cursor;
     END
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
@@ -4093,7 +4286,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         CONVERT(decimal(10,1), @UptimeHours) AS uptime_hours,
         page_io_latch_wait_count,
         page_io_latch_wait_ms,
-        is_temporal_history
+        is_temporal_history,
+        /* #94: Machine-readable recommended action */
+        CASE
+            WHEN action_chosen = 'CI_SWAP_ONLINE' THEN 'CI_SWAP'
+            WHEN action_chosen LIKE 'HEAP_REBUILD%' THEN 'REBUILD'
+            ELSE 'MONITOR'
+        END AS recommended_action
     FROM #Targets
     ORDER BY sort_order;
 
@@ -4155,7 +4354,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 days_since_last_rebuild integer           NULL,
                 page_io_latch_wait_count bigint       NULL,
                 page_io_latch_wait_ms bigint          NULL,
-                is_temporal_history   bit             NULL
+                is_temporal_history   bit             NULL,
+                recommended_action    varchar(50)     NULL
             );';
             BEGIN TRY
                 EXEC sp_executesql @output_sql;
@@ -4166,6 +4366,102 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 SET @Msg = N'WARNING: Could not create output table ' + @OutputTable + N': ' + LEFT(ERROR_MESSAGE(), 500);
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END CATCH
+        END
+        ELSE
+        BEGIN
+            /*
+            #134: Schema drift detection for existing @OutputTable.
+            When the table already exists from a prior version, new columns may be missing.
+            Auto-ADD missing columns with NULL defaults to prevent INSERT failures.
+            */
+            DECLARE @drift_sql nvarchar(max);
+            DECLARE @drift_cols nvarchar(max) = N'';
+            DECLARE @drift_count integer = 0;
+
+            /* Check each expected column; ALTER TABLE ADD if missing */
+            DECLARE @expected_cols TABLE (col_name sysname NOT NULL, col_def nvarchar(100) NOT NULL);
+            INSERT INTO @expected_cols (col_name, col_def) VALUES
+                (N'run_id', N'uniqueidentifier NULL'),
+                (N'captured_at', N'datetime2(3) NULL'),
+                (N'version', N'nvarchar(20) NULL'),
+                (N'target_id', N'integer NULL'),
+                (N'sort_order', N'integer NULL'),
+                (N'database_name', N'sysname NULL'),
+                (N'schema_name', N'sysname NULL'),
+                (N'table_name', N'sysname NULL'),
+                (N'page_count', N'bigint NULL'),
+                (N'record_count', N'bigint NULL'),
+                (N'forwarded_record_count', N'bigint NULL'),
+                (N'forwarded_pct', N'decimal(6,2) NULL'),
+                (N'forwarded_fetch_count', N'bigint NULL'),
+                (N'avg_page_space_pct', N'decimal(5,2) NULL'),
+                (N'avg_frag_pct', N'decimal(5,2) NULL'),
+                (N'ghost_record_count', N'bigint NULL'),
+                (N'total_cpu_ms', N'bigint NULL'),
+                (N'ranking_basis', N'varchar(20) NULL'),
+                (N'nci_count', N'integer NULL'),
+                (N'key_source_index', N'sysname NULL'),
+                (N'action_chosen', N'varchar(32) NULL'),
+                (N'est_pages_per_sec', N'float NULL'),
+                (N'est_seconds', N'integer NULL'),
+                (N'est_duration', N'nvarchar(20) NULL'),
+                (N'usage_hint', N'varchar(30) NULL'),
+                (N'ranking_score', N'decimal(8,4) NULL'),
+                (N'ranking_algo_version', N'nvarchar(10) NULL'),
+                (N'heap_compression', N'varchar(4) NULL'),
+                (N'replication_hint', N'varchar(20) NULL'),
+                (N'lock_escalation', N'varchar(10) NULL'),
+                (N'partition_count', N'integer NULL'),
+                (N'has_fk_references', N'integer NULL'),
+                (N'fk_ref_count', N'integer NULL'),
+                (N'filegroup_name', N'sysname NULL'),
+                (N'command_text', N'nvarchar(max) NULL'),
+                (N'size_mb', N'decimal(18,2) NULL'),
+                (N'est_log_mb', N'decimal(18,2) NULL'),
+                (N'days_since_last_rebuild', N'integer NULL'),
+                (N'page_io_latch_wait_count', N'bigint NULL'),
+                (N'page_io_latch_wait_ms', N'bigint NULL'),
+                (N'is_temporal_history', N'bit NULL'),
+                (N'recommended_action', N'varchar(50) NULL');
+
+            DECLARE @ec_name sysname, @ec_def nvarchar(100);
+            DECLARE drift_cursor CURSOR LOCAL FAST_FORWARD FOR
+                SELECT ec.col_name, ec.col_def
+                FROM @expected_cols ec
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM sys.columns c
+                    JOIN sys.objects o ON o.object_id = c.object_id
+                    JOIN sys.schemas s ON s.schema_id = o.schema_id
+                    WHERE s.name = @ot_schema
+                      AND o.name = @ot_table
+                      AND c.name = ec.col_name COLLATE DATABASE_DEFAULT
+                );
+            OPEN drift_cursor;
+            FETCH NEXT FROM drift_cursor INTO @ec_name, @ec_def;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                BEGIN TRY
+                    SET @drift_sql = N'ALTER TABLE ' + @safe_OutputTable
+                                   + N' ADD ' + QUOTENAME(@ec_name) + N' ' + @ec_def + N';';
+                    EXEC sp_executesql @drift_sql;
+                    SET @drift_count += 1;
+                    SET @drift_cols += CASE WHEN @drift_cols = N'' THEN N'' ELSE N', ' END + @ec_name;
+                END TRY
+                BEGIN CATCH
+                    /* Silently skip columns that can't be added (type conflict, etc.) */
+                END CATCH
+                FETCH NEXT FROM drift_cursor INTO @ec_name, @ec_def;
+            END
+            CLOSE drift_cursor;
+            DEALLOCATE drift_cursor;
+
+            IF @drift_count > 0
+            BEGIN
+                SET @Msg = N'NOTE: Added ' + CONVERT(nvarchar(10), @drift_count)
+                         + N' missing column(s) to ' + @OutputTable + N': ' + @drift_cols;
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
         END
 
         /* Insert results into output table */
@@ -4182,7 +4478,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 has_fk_references, fk_ref_count, filegroup_name,
                 command_text, size_mb, est_log_mb, days_since_last_rebuild,
                 page_io_latch_wait_count, page_io_latch_wait_ms,
-                is_temporal_history
+                is_temporal_history,
+                recommended_action
             )
             SELECT
                 @RunID, @Version, target_id, sort_order,
@@ -4203,7 +4500,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 CASE WHEN @obfuscate = 1 THEN pseudo_command_text ELSE command_text END,
                 size_mb, est_log_mb, days_since_last_rebuild,
                 page_io_latch_wait_count, page_io_latch_wait_ms,
-                is_temporal_history
+                is_temporal_history,
+                CASE
+                    WHEN action_chosen = ''CI_SWAP_ONLINE'' THEN ''CI_SWAP''
+                    WHEN action_chosen LIKE ''HEAP_REBUILD%%'' THEN ''REBUILD''
+                    ELSE ''MONITOR''
+                END
             FROM #Targets
             ORDER BY sort_order;';
             EXEC sp_executesql @output_sql,
@@ -4240,6 +4542,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         DECLARE @script_size decimal(18,2);
         DECLARE @script_sort integer;
         DECLARE @script_line nvarchar(4000);
+        /* #119/#146: Temporal history fields for SYSTEM_VERSIONING wrappers */
+        DECLARE @script_is_temporal bit;
+        DECLARE @script_parent_schema sysname;
+        DECLARE @script_parent_table sysname;
+        DECLARE @script_versioning_off nvarchar(max);
+        DECLARE @script_versioning_on nvarchar(max);
 
         DECLARE script_cursor CURSOR LOCAL FAST_FORWARD FOR
             SELECT sort_order, target_id,
@@ -4250,12 +4558,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                    CASE WHEN @obfuscate = 1 THEN pseudo_command_text  ELSE command_text  END,
                    CASE WHEN @obfuscate = 1 THEN pseudo_ci_drop       ELSE ci_drop_command END,
                    CASE WHEN @obfuscate = 1 THEN pseudo_verify_cmd    ELSE verify_command  END,
-                   est_duration, size_mb
+                   est_duration, size_mb,
+                   ISNULL(is_temporal_history, 0),
+                   temporal_parent_schema,
+                   temporal_parent_table
             FROM #Targets
             ORDER BY sort_order;
         OPEN script_cursor;
         FETCH NEXT FROM script_cursor INTO @script_sort, @script_target_id, @script_db, @script_schema, @script_table,
-              @script_action, @script_cmd, @script_ci_drop, @script_verify, @script_est, @script_size;
+              @script_action, @script_cmd, @script_ci_drop, @script_verify, @script_est, @script_size,
+              @script_is_temporal, @script_parent_schema, @script_parent_table;
 
         WHILE @@FETCH_STATUS = 0
         BEGIN
@@ -4267,10 +4579,36 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                              + N')';
             -- #122: Use %s format to safely emit commands that may contain % in object names.
             RAISERROR(N'%s', 10, 1, @script_line) WITH NOWAIT;
+
+            /* #119/#146: Wrap temporal history targets with SYSTEM_VERSIONING OFF/ON */
+            IF @script_is_temporal = 1 AND @script_parent_schema IS NOT NULL
+            BEGIN
+                SET @script_versioning_off = N'ALTER TABLE ' + QUOTENAME(@script_db) + N'.'
+                    + QUOTENAME(@script_parent_schema) + N'.' + QUOTENAME(@script_parent_table)
+                    + N' SET (SYSTEM_VERSIONING = OFF);';
+                SET @script_versioning_on = N'ALTER TABLE ' + QUOTENAME(@script_db) + N'.'
+                    + QUOTENAME(@script_parent_schema) + N'.' + QUOTENAME(@script_parent_table)
+                    + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
+                    + QUOTENAME(@script_db) + N'.' + QUOTENAME(@script_schema) + N'.' + QUOTENAME(@script_table)
+                    + N', DATA_CONSISTENCY_CHECK = OFF));';
+
+                RAISERROR(N'-- Step 1: Disable SYSTEM_VERSIONING on parent table', 10, 1) WITH NOWAIT;
+                RAISERROR(N'%s', 10, 1, @script_versioning_off) WITH NOWAIT;
+                RAISERROR(N'GO', 10, 1) WITH NOWAIT;
+                RAISERROR(N'-- Step 2: Rebuild history table', 10, 1) WITH NOWAIT;
+            END
+
             RAISERROR(N'%s', 10, 1, @script_cmd) WITH NOWAIT;
 
             IF @script_ci_drop IS NOT NULL
                 RAISERROR(N'%s', 10, 1, @script_ci_drop) WITH NOWAIT;
+
+            IF @script_is_temporal = 1 AND @script_parent_schema IS NOT NULL
+            BEGIN
+                RAISERROR(N'GO', 10, 1) WITH NOWAIT;
+                RAISERROR(N'-- Step 3: Re-enable SYSTEM_VERSIONING', 10, 1) WITH NOWAIT;
+                RAISERROR(N'%s', 10, 1, @script_versioning_on) WITH NOWAIT;
+            END
 
             IF @script_verify IS NOT NULL
             BEGIN
@@ -4281,7 +4619,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             RAISERROR(N'GO', 10, 1) WITH NOWAIT;
 
             FETCH NEXT FROM script_cursor INTO @script_sort, @script_target_id, @script_db, @script_schema, @script_table,
-                  @script_action, @script_cmd, @script_ci_drop, @script_verify, @script_est, @script_size;
+                  @script_action, @script_cmd, @script_ci_drop, @script_verify, @script_est, @script_size,
+                  @script_is_temporal, @script_parent_schema, @script_parent_table;
         END
         CLOSE script_cursor;
         DEALLOCATE script_cursor;
@@ -4438,7 +4777,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             qs_total_executions AS QsTotalExecutions,
                             qs_plan_count AS QsPlanCount,
                             qs_query_count AS QsQueryCount,
-                            qs_query_hashes AS QsQueryHashes
+                            qs_query_hashes AS QsQueryHashes,
+                            CASE
+                                WHEN action_chosen = 'CI_SWAP_ONLINE' THEN 'CI_SWAP'
+                                WHEN action_chosen LIKE 'HEAP_REBUILD%' THEN 'REBUILD'
+                                ELSE 'MONITOR'
+                            END AS RecommendedAction
                         FROM #Targets
                         ORDER BY sort_order
                         FOR XML RAW(N'Target'), TYPE
@@ -4517,7 +4861,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_is_temporal_history bit,
             @cur_temporal_parent_schema sysname,
             @cur_temporal_parent_table  sysname,
+            @cur_key_source_index sysname, /* #129: NCI disabled TOCTOU check */
+            @cur_nci_disabled     bit,     /* #129: NCI disabled TOCTOU check */
+            @cur_has_fk_references bit,    /* #130: FK child stats after CI swap */
+            @cur_fk_ref_count     integer,         /* #130: FK ref count for stats update */
+            @cur_filtered_nci_count integer,        /* #99: filtered NCI count */
             @versioning_sql         nvarchar(max),
+            @versioning_log_id      integer,       /* #141: CommandLog breadcrumb for temporal versioning */
             @has_paused_op          bit,
             @preflight_sessions     integer,
             @preflight_bu_sessions  integer,
@@ -4663,6 +5013,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @cur_is_temporal_history      = is_temporal_history,
                 @cur_temporal_parent_schema   = temporal_parent_schema,
                 @cur_temporal_parent_table    = temporal_parent_table,
+                @cur_key_source_index         = key_source_index,
+                @cur_has_fk_references        = has_fk_references,
+                @cur_fk_ref_count             = fk_ref_count,
+                @cur_filtered_nci_count       = filtered_nci_count,
                 /* Obfuscation: pseudo values (NULL when not obfuscating) */
                 @pseudo_db             = pseudo_database_name,
                 @pseudo_schema         = pseudo_schema_name,
@@ -4780,6 +5134,60 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         command_text = @cmd,
                         ci_drop_command = NULL,
                         has_lob_columns = 1
+                    WHERE target_id = @tid;
+                END
+            END
+
+            /*
+            #129: NCI disabled TOCTOU check for CI swap targets.
+            The candidate NCI could be disabled between discovery and execution.
+            If the key source NCI is now disabled, fall back to heap rebuild.
+            */
+            IF @action = 'CI_SWAP_ONLINE' AND @cur_key_source_index IS NOT NULL
+            BEGIN
+                SET @cur_nci_disabled = 0;
+                BEGIN TRY
+                    SET @verify_sql = N'SELECT @is_disabled = is_disabled
+                        FROM ' + QUOTENAME(@db) + N'.sys.indexes
+                        WHERE object_id = OBJECT_ID(@full_param)
+                          AND name = @idx_name;';
+                    EXEC sys.sp_executesql @verify_sql,
+                        N'@full_param nvarchar(512), @idx_name sysname, @is_disabled bit OUTPUT',
+                        @full_param = @full, @idx_name = @cur_key_source_index, @is_disabled = @cur_nci_disabled OUTPUT;
+                END TRY
+                BEGIN CATCH
+                    SET @cur_nci_disabled = 0; /* don't block on metadata errors */
+                END CATCH
+
+                IF @cur_nci_disabled = 1
+                BEGIN
+                    SET @Msg = N'  WARNING: CI swap key source index [' + @cur_key_source_index
+                             + N'] on ' + @full + N' has been disabled since discovery. Falling back to heap rebuild.';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+                    /* Generate fallback ALTER TABLE REBUILD command (same pattern as LOB fallback) */
+                    SET @action = CASE WHEN @Online = 1 THEN 'HEAP_REBUILD_ONLINE' ELSE 'HEAP_REBUILD_OFFLINE' END;
+                    SET @cmd = N'ALTER TABLE ' + @full + N' REBUILD'
+                        + CASE WHEN @Online = 1 OR @cur_heap_compression > 0 OR @Maxdop IS NOT NULL
+                            THEN N' WITH ('
+                                + CASE WHEN @Online = 1 THEN N'ONLINE = ON' ELSE N'' END
+                                + CASE WHEN @Online = 1 AND (@cur_heap_compression > 0 OR @Maxdop IS NOT NULL) THEN N', ' ELSE N'' END
+                                + CASE WHEN @cur_heap_compression = 1 THEN N'DATA_COMPRESSION = ROW'
+                                       WHEN @cur_heap_compression = 2 THEN N'DATA_COMPRESSION = PAGE'
+                                       ELSE N'' END
+                                + CASE WHEN @cur_heap_compression > 0 AND @Maxdop IS NOT NULL THEN N', ' ELSE N'' END
+                                + ISNULL(N'MAXDOP = ' + CONVERT(nvarchar(10), @Maxdop), N'')
+                                + N')'
+                            ELSE N'' END
+                        + N';';
+                    SET @ci_drop = NULL;
+                    SET @cur_index_name = NULL;
+                    SET @pseudo_cur_index_name = NULL;
+
+                    UPDATE #Targets
+                    SET action_chosen = @action,
+                        command_text = @cmd,
+                        ci_drop_command = NULL
                     WHERE target_id = @tid;
                 END
             END
@@ -4976,7 +5384,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
             END TRY
             BEGIN CATCH
-                /* ALTER TRACE permission may not be available; silently continue */
+                /* #113: Surface XE trace errors at debug level */
+                IF @Debug = 1
+                BEGIN
+                    SET @Msg = N'  [DEBUG] sp_trace_generateevent failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                END
             END CATCH
 
             SET @start = SYSDATETIME();
@@ -5132,14 +5545,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             BEGIN
                 SET @has_paused_op = 0;
                 BEGIN TRY
+                    /* #103: Filter by exact temp index name to avoid resuming unrelated paused operations */
                     SET @verify_sql = N'SELECT @has_paused = CASE WHEN EXISTS (
                         SELECT 1 FROM ' + QUOTENAME(@db) + N'.sys.index_resumable_operations iro
                         WHERE iro.object_id = OBJECT_ID(@full_param)
                           AND iro.state = 1 /* PAUSED */
+                          AND iro.name = @idx_name
                     ) THEN 1 ELSE 0 END;';
                     EXEC sys.sp_executesql @verify_sql,
-                        N'@full_param nvarchar(512), @has_paused bit OUTPUT',
-                        @full_param = @full, @has_paused = @has_paused_op OUTPUT;
+                        N'@full_param nvarchar(512), @idx_name sysname, @has_paused bit OUTPUT',
+                        @full_param = @full, @idx_name = @cur_index_name, @has_paused = @has_paused_op OUTPUT;
                 END TRY
                 BEGIN CATCH
                     SET @has_paused_op = 0; /* don't block on metadata errors (e.g., DMV unavailable) */
@@ -5158,7 +5573,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
             /*
             #84: Temporal history table - disable SYSTEM_VERSIONING on parent before rebuild.
+            #141: Write CommandLog breadcrumb before disabling (recovery aid if session is KILLed).
             */
+            SET @versioning_log_id = NULL;
             IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
             BEGIN
                 SET @Msg = N'  Disabling SYSTEM_VERSIONING on ' + QUOTENAME(@db) + N'.'
@@ -5168,6 +5585,29 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
                     + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
                     + N' SET (SYSTEM_VERSIONING = OFF);';
+
+                /* #141: Breadcrumb with re-enable DDL in Command column (recovery if KILLed) */
+                IF @commandlog_exists = 1
+                BEGIN
+                    DECLARE @versioning_reenable_ddl nvarchar(max) = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
+                        + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                        + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
+                        + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
+                    INSERT INTO dbo.CommandLog
+                        (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime)
+                    VALUES
+                    (
+                        @db,
+                        @cur_temporal_parent_schema,
+                        @cur_temporal_parent_table,
+                        N'U',
+                        @versioning_reenable_ddl,
+                        N'HEAP_TEMPORAL_VERSIONING_DISABLED',
+                        SYSDATETIME()
+                    );
+                    SET @versioning_log_id = SCOPE_IDENTITY();
+                END
+
                 BEGIN TRY
                     EXEC sys.sp_executesql @versioning_sql;
                 END TRY
@@ -5196,6 +5636,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             BEGIN TRY
                 EXEC sys.sp_executesql @exec_cmd;
 
+                /*
+                #138: @end is captured here, BEFORE post-rebuild stats update.
+                This ensures CommandLog EndTime, #ExecLog, elapsed_ms, and live
+                calibration all reflect pure rebuild duration, not stats overhead.
+                */
                 SET @end = SYSDATETIME();
                 SET @elapsed_ms = DATEDIFF(MILLISECOND, @start, @end);
                 SET @elapsed_fmt = CASE WHEN @elapsed_ms < 1000
@@ -5232,12 +5677,47 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     BEGIN CATCH
                         SET @ci_drop_failed = 1;
 
+                        /* #102: Include exact remediation DROP DDL in warning */
+                        DECLARE @ci_drop_ddl nvarchar(max) = N'DROP INDEX ' + QUOTENAME(@cur_index_name)
+                            + N' ON ' + @full + N';';
                         SET @Msg = N'  WARNING: CI swap CREATE succeeded but DROP FAILED on ' + @full
                                  + N'. Error ' + CONVERT(nvarchar(10), ERROR_NUMBER())
                                  + N': ' + LEFT(ERROR_MESSAGE(), 1000)
                                  + N'. The table is now a clustered table, NOT a heap.'
-                                 + N' Forwarded records are eliminated, but you must manually drop the temp index.';
+                                 + N' Forwarded records are eliminated.'
+                                 + N' To restore heap: ' + @ci_drop_ddl;
                         RAISERROR(@Msg, 16, 1) WITH NOWAIT;
+
+                        /* #102: Log CI_SWAP_DROP_FAILED to CommandLog with remediation DDL */
+                        IF @commandlog_exists = 1
+                        BEGIN
+                            INSERT INTO dbo.CommandLog
+                                (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
+                                 Command, CommandType,
+                                 StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+                            VALUES
+                            (
+                                CASE WHEN @obfuscate = 1 THEN @pseudo_db     ELSE @db     END,
+                                CASE WHEN @obfuscate = 1 THEN @pseudo_schema ELSE @schema END,
+                                CASE WHEN @obfuscate = 1 THEN @pseudo_tbl    ELSE @tbl    END,
+                                N'U',
+                                CASE WHEN @obfuscate = 1 THEN @pseudo_cur_index_name ELSE @cur_index_name END,
+                                0,
+                                CASE WHEN @obfuscate = 1 THEN @pseudo_ci_drop ELSE @ci_drop_ddl END,
+                                N'CI_SWAP_DROP_FAILED',
+                                @start,
+                                SYSDATETIME(),
+                                ERROR_NUMBER(),
+                                LEFT(ERROR_MESSAGE(), 1000),
+                                (
+                                    SELECT
+                                        @Version AS Version,
+                                        @RunID AS RunID,
+                                        @ci_drop_ddl AS RemediationDDL
+                                    FOR XML RAW(N'ExtendedInfo'), ELEMENTS
+                                )
+                            );
+                        END
 
                         /* Restore lock timeout (prefix ran but suffix did not due to error) */
                         IF @LockTimeoutMs IS NOT NULL
@@ -5346,6 +5826,77 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
 
+                /*
+                #130: After CI swap with FK references, UPDATE STATISTICS on FK child table NCIs.
+                CI swap changes the base table from heap (RID locators) to clustered (key locators),
+                then back. FK child table NCIs reference the parent via row locators that change.
+                Auto-statistics may not fire due to low modification counts on child tables.
+                */
+                IF @action = N'CI_SWAP_ONLINE'
+                   AND @cur_has_fk_references = 1
+                   AND @UpdateStatsAfterRebuild = 1
+                   AND @ci_drop_failed = 0
+                BEGIN
+                    BEGIN TRY
+                        DECLARE @fk_child_stats_sql nvarchar(max);
+                        DECLARE @fk_child_count integer = 0;
+                        DECLARE @fk_child_start datetime2(3) = SYSDATETIME();
+
+                        /* Build dynamic SQL to update stats on all FK child table NCIs */
+                        SET @fk_child_stats_sql = N'USE ' + QUOTENAME(@db) + N';
+DECLARE @child_schema sysname, @child_table sysname, @child_full nvarchar(512);
+DECLARE fk_child_cursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT DISTINCT s.name, t.name
+    FROM sys.foreign_keys fk
+    JOIN sys.tables t ON t.object_id = fk.parent_object_id
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE fk.referenced_object_id = OBJECT_ID(@ref_full)
+      AND EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = t.object_id AND i.type = 2);
+OPEN fk_child_cursor;
+FETCH NEXT FROM fk_child_cursor INTO @child_schema, @child_table;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @child_full = QUOTENAME(@child_schema) + N''.'' + QUOTENAME(@child_table);
+    EXEC(N''UPDATE STATISTICS '' + @child_full + N'' WITH FULLSCAN;'');
+    SET @cnt = @cnt + 1;
+    FETCH NEXT FROM fk_child_cursor INTO @child_schema, @child_table;
+END
+CLOSE fk_child_cursor;
+DEALLOCATE fk_child_cursor;';
+                        EXEC sys.sp_executesql @fk_child_stats_sql,
+                            N'@ref_full nvarchar(512), @cnt integer OUTPUT',
+                            @ref_full = @full, @cnt = @fk_child_count OUTPUT;
+
+                        IF @fk_child_count > 0
+                        BEGIN
+                            DECLARE @fk_stats_ms integer = DATEDIFF(MILLISECOND, @fk_child_start, SYSDATETIME());
+                            SET @Msg = N'  Statistics updated on ' + CONVERT(nvarchar(10), @fk_child_count)
+                                     + N' FK child table(s) (' + CONVERT(nvarchar(10), @fk_stats_ms) + N'ms).';
+                            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                        END
+                    END TRY
+                    BEGIN CATCH
+                        SET @Msg = N'  WARNING: FK child table statistics update failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END CATCH
+                END
+
+                /*
+                #99: Filtered NCI warning after CI swap.
+                Filtered NCI statistics are especially prone to staleness because their small
+                row counts make auto-statistics updates infrequent. Warn when @UpdateStatsAfterRebuild=0.
+                */
+                IF @action = N'CI_SWAP_ONLINE'
+                   AND @cur_filtered_nci_count > 0
+                   AND @UpdateStatsAfterRebuild = 0
+                BEGIN
+                    SET @Msg = N'  WARNING: ' + @full + N' has '
+                             + CONVERT(nvarchar(10), @cur_filtered_nci_count)
+                             + N' filtered NCI(s). Filtered index statistics are prone to staleness after CI swap.'
+                             + N' Consider @UpdateStatsAfterRebuild=1 for tables with filtered indexes.';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                END
+
                 /* XE observability: rebuild succeeded with key metrics */
                 BEGIN TRY
                     SET @trace_msg = LEFT(N'sp_HeapDoctor: OK ' + @full
@@ -5355,7 +5906,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         + N' post=' + ISNULL(CONVERT(nvarchar(10), @post_fwd_count), N'?'), 128);
                     EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
                 END TRY
-                BEGIN CATCH END CATCH
+                BEGIN CATCH
+                    /* #113: Surface XE trace errors at debug level */
+                    IF @Debug = 1
+                    BEGIN
+                        SET @Msg = N'  [DEBUG] sp_trace_generateevent failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END
+                END CATCH
 
                 /*
                 Live calibration: accumulate throughput data from this rebuild.
@@ -5531,6 +6089,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) + N'.';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+                        /* #141: Clear breadcrumb - versioning successfully restored */
+                        IF @versioning_log_id IS NOT NULL AND @commandlog_exists = 1
+                            UPDATE dbo.CommandLog SET EndTime = SYSDATETIME(), ErrorNumber = 0
+                            WHERE ID = @versioning_log_id;
                     END TRY
                     BEGIN CATCH
                         SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
@@ -5573,7 +6136,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     SET @trace_msg = LEFT(N'sp_HeapDoctor: FAILED ' + @full + N' E' + CONVERT(nvarchar(10), @err_number), 128);
                     EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
                 END TRY
-                BEGIN CATCH END CATCH
+                BEGIN CATCH
+                    /* #113: Surface XE trace errors at debug level */
+                    IF @Debug = 1
+                    BEGIN
+                        SET @Msg = N'  [DEBUG] sp_trace_generateevent failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END
+                END CATCH
 
                 SET @failed_cnt += 1;
 
@@ -5643,6 +6213,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
                                  + N' (rebuild failed, but versioning restored).';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+                        /* #141: Clear breadcrumb - versioning successfully restored */
+                        IF @versioning_log_id IS NOT NULL AND @commandlog_exists = 1
+                            UPDATE dbo.CommandLog SET EndTime = SYSDATETIME(), ErrorNumber = 0
+                            WHERE ID = @versioning_log_id;
                     END TRY
                     BEGIN CATCH
                         SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
@@ -5681,7 +6256,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 + N' ' + CONVERT(nvarchar(10), DATEDIFF(SECOND, @RunStart, SYSDATETIME())) + N's', 128);
             EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
         END TRY
-        BEGIN CATCH END CATCH
+        BEGIN CATCH
+            /* #113: Surface XE trace errors at debug level */
+            IF @Debug = 1
+            BEGIN
+                SET @Msg = N'  [DEBUG] sp_trace_generateevent failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+        END CATCH
 
         /*
         Log run END to CommandLog
