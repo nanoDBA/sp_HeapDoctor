@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v1.0.2026.0302j
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.03.09
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -142,6 +142,160 @@ EXEC dbo.sp_HeapDoctor
     @UseResumable = 1,
     @FillFactor   = 90,
     @PlanOnly     = 0;
+```
+
+## Real-World Scenarios
+
+### Saturday night maintenance window: rebuild the worst heaps across all databases
+
+You have a 2-hour window starting at midnight.  You want online rebuilds where possible, a 10-second lock timeout so nothing blocks for long, MAXDOP 2 to leave CPU for overnight ETL, and only the top 10 worst heaps per database so the job finishes within the window.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases        = 'USER_DATABASES',
+    @PlanOnly         = 0,
+    @OnlinePreference = 'AUTO',
+    @LockTimeoutMs    = 10000,
+    @MaxRunSeconds    = 7200,
+    @Maxdop           = 2,
+    @TopN             = 10,
+    @EstimateTime     = 1;
+```
+
+### Investigating a slow report that scans a known heap
+
+The `SalesHistory` table in the `Reporting` database is a heap.  Users complain that a weekly report takes 40 minutes.  You want to see how bad the forwarded records are, what Query Store says about CPU, and whether a rebuild would help -- without touching anything yet.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases = 'Reporting',
+    @Tables    = 'dbo.SalesHistory',
+    @PlanOnly  = 1;
+```
+
+Check `forwarded_pct`, `total_cpu_ms`, and `forwarded_fetch_count` in the output.  If `forwarded_pct` is high but `forwarded_fetch_count` is near zero, the report may not be hitting forwarded records (it might use an NCI seek path).  If both are high, a rebuild will likely help.
+
+### Vendor database you cannot add indexes to
+
+The vendor says "no schema changes."  CI swap is off the table, but you can still do `ALTER TABLE REBUILD` because it doesn't change the schema.  The vendor's `AppData` database has 200+ heaps; you only care about ones larger than 50 MB with at least 5% forwarded records, and you want to skip write-heavy staging tables that will just re-fragment.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases       = 'AppData',
+    @MinPages        = 6400,
+    @MinForwardedPct = 5.00,
+    @SkipWriteHeavy  = 1,
+    @AllowCiSwap     = 0,
+    @PlanOnly        = 1;
+```
+
+### Standard Edition: careful offline rebuilds during off-hours
+
+Every rebuild is offline and holds Sch-M for the full duration.  You want large heaps only (80 MB+), limit to the top 3 worst, cap at 30 minutes total, and skip anything rebuilt in the last 30 days.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases           = 'USER_DATABASES',
+    @MinPages            = 10000,
+    @TopN                = 3,
+    @MaxRunSeconds       = 1800,
+    @MinDaysSinceRebuild = 30,
+    @PlanOnly            = 0,
+    @LockTimeoutMs       = 5000;
+```
+
+### Handing off a report to a consultant without exposing table names
+
+A performance consultant needs your forwarded record data but you cannot share real object names.  Generate an obfuscated plan-only report with a consistent seed so you can compare their recommendations back to real tables later.
+
+```sql
+/* Step 1: Generate the obfuscated report */
+EXEC dbo.sp_HeapDoctor
+    @Databases     = 'USER_DATABASES',
+    @ObfuscateKey  = 'acme-q1-review',
+    @ObfuscateSeed = 'consultant-handoff',
+    @EstimateTime  = 1,
+    @PlanOnly      = 1;
+/* Copy the result set (all metrics are real, only names are pseudonyms) */
+
+/* Step 2: When the consultant says "T_43306ED0 needs a rebuild", reveal it */
+EXEC dbo.sp_HeapDoctor
+    @RevealKey   = 'acme-q1-review',
+    @RevealRunID = '<RunID-from-step-1>';
+```
+
+### Post-deployment check: did the new release create forwarded records?
+
+After deploying a release that changed column widths on several tables, you want to scan just those tables across dev and prod to see if forwarded records appeared.  No execution, just a diagnostic.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases       = 'MyApp',
+    @Tables          = 'dbo.Customers, dbo.Invoices, dbo.LineItems',
+    @MinPages        = 100,
+    @MinForwardedPct = 0.01,
+    @PlanOnly        = 1;
+```
+
+### SQL Agent job with failure alerting
+
+Set up a recurring SQL Agent job that rebuilds heaps and raises an error if any rebuild fails, so the operator gets notified.
+
+```sql
+DECLARE @found int, @ok int, @bad int, @skip int;
+
+EXEC dbo.sp_HeapDoctor
+    @Databases        = 'USER_DATABASES',
+    @PlanOnly         = 0,
+    @OnlinePreference = 'AUTO',
+    @LockTimeoutMs    = 15000,
+    @MaxRunSeconds    = 3600,
+    @TopN             = 15,
+    @TargetsFound     = @found OUTPUT,
+    @Succeeded        = @ok OUTPUT,
+    @Failed           = @bad OUTPUT,
+    @Skipped          = @skip OUTPUT;
+
+IF @bad > 0
+    RAISERROR(N'sp_HeapDoctor: %d of %d rebuilds failed (%d skipped).', 16, 1, @bad, @found, @skip);
+```
+
+### Busy OLTP server: throttled scan with minimal latch contention
+
+Discovery itself can add load on a server with hundreds of databases.  Throttle the scan with a 500ms pause between databases, limit to 2 databases worth of targets, and use `@CpuSource = 'NONE'` to skip Query Store XML parsing entirely.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases      = 'USER_DATABASES',
+    @ScanThrottleMs = 500,
+    @CpuSource      = 'NONE',
+    @TopN           = 5,
+    @PlanOnly       = 1;
+```
+
+### Generate a script for change-control review before execution
+
+Your change advisory board requires pre-approved SQL before any production maintenance.  Generate the rebuild script, paste it into the change ticket, and execute it manually after approval.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases      = 'USER_DATABASES',
+    @GenerateScript = 1,
+    @TopN           = 10;
+```
+
+### CI swap for a heap with many forwarded records but no LOB columns
+
+The `OrderDetails` table is a 4 GB heap with 35% forwarded records and a unique nonclustered index on `(OrderID, LineNumber)`.  A regular `ALTER TABLE REBUILD` would hold Sch-M for the full duration.  CI swap creates a temp clustered index using that existing key, which eliminates forwarded records as a side effect of the B-tree reorg, then drops it to return the table to a heap -- all online.
+
+```sql
+EXEC dbo.sp_HeapDoctor
+    @Databases    = 'Sales',
+    @Tables       = 'dbo.OrderDetails',
+    @AllowCiSwap  = 1,
+    @PreferCiSwap = 1,
+    @PlanOnly     = 1;
+/* Check nci_count and key_source_index in the output before committing */
 ```
 
 ## Before You Run @PlanOnly = 0
@@ -596,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>1.0.2026.0302i</Version>
+  <Version>2026.03.09</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -967,39 +1121,34 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v1.0.2026.0302j *(current)*
+### v2026.03.09 *(current)*
 
-**Security and correctness fixes** (6 issues from sp-heapdoctor-issues agent + 5 additional):
+- 19 remaining issues across 7 batches (v0302k-v0302q)
 
+### v2026.03.06
+
+- Apply Erik Darling T-SQL style guide (~850 changes across sp_HeapDoctor.sql)
+- `integer` not `int`, `COUNT_BIG()` not `COUNT()`, `CONVERT()` not `CAST()`, `/* */` comments only
+
+### v2026.03.04
+
+- Adopt CalVer versioning (YYYY.MM.DD); prior version: 1.0.2026.0302j
 - **Security:** `@OutputTable` PARSENAME+QUOTENAME validation prevents SQL injection (#131, #132)
 - **Fix:** `@UpdateStatsAfterRebuild` now uses `USE [db]` + 2-part name, fixing UPDATE STATISTICS cross-database (#143)
 - **Fix:** `@GenerateScript` RAISERROR uses `%s` format to handle `%` in object names (#122)
-- **Fix:** Stale stats note corrected — factually accurate message about modification counter (#93)
+- **Fix:** Stale stats note corrected -- factually accurate message about modification counter (#93)
 - **Fix:** CI swap guard: XML indexes (type 3) and spatial indexes (type 4) added to exclusion list (#105)
-- **Docs:** `@Help` CI SWAP RESTRICTIONS block — partitioned heap and temporal history table CI swap blocks now explicitly documented with rationale (#137, #140)
-- **Docs:** `@GenerateScript` `@Help` note — SYSTEM_VERSIONING wrappers for temporal tables require manual addition (#119)
-- **Docs:** CommandLog START ExtendedInfo comment — clarifies included vs. omitted params for maintainers (#107)
+- **Docs:** `@Help` CI SWAP RESTRICTIONS block -- partitioned heap and temporal history table CI swap blocks now explicitly documented with rationale (#137, #140)
+- **Docs:** `@GenerateScript` `@Help` note -- SYSTEM_VERSIONING wrappers for temporal tables require manual addition (#119)
+- **Docs:** CommandLog START ExtendedInfo comment -- clarifies included vs. omitted params for maintainers (#107)
 - **Triage:** 19 BY_DESIGN GitHub issues closed with factual explanations; 19 NEEDS_INVESTIGATION issues labeled
-
-**New parameters added in v1.0.2026.0302i–j:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@UseResumable` | `1` | `RESUMABLE = ON` for CI swap CREATE INDEX. Detects and resumes paused operations |
-| `@IncludeTemporalHistory` | `0` | Include temporal history table heaps. Auto-manages SYSTEM_VERSIONING lifecycle |
-| `@OutputTable` | `NULL` | Persist result set to a user-specified table (auto-created if missing) |
-| `@GenerateScript` | `0` | Output executable T-SQL rebuild script instead of running rebuilds |
 
 ### v1.0.2026.0302i
 
 - Resumable CI swap (`@UseResumable`) + temporal history support (`@IncludeTemporalHistory`)
 - Paused CI swap operations auto-detected via `sys.index_resumable_operations` and resumed on next run
-- New result set column: `is_temporal_history`
-
-### v1.0.2026.0302h
-
-- `@OutputTable` — persist results for automation and trending
-- `@GenerateScript` — output copy-paste T-SQL rebuild scripts
+- `@OutputTable` -- persist results for automation and trending
+- `@GenerateScript` -- output copy-paste T-SQL rebuild scripts
 
 ## Credits
 

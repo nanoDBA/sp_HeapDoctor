@@ -51,9 +51,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.04 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.09 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.04 - Adopt CalVer versioning (YYYY.MM.DD); prior: 1.0.2026.0302j
+History:    2026.03.09 - 19 remaining issues across 7 batches (v0302k-v0302q)
+            2026.03.06 - Apply Erik Darling T-SQL style guide (~850 changes)
+            2026.03.04 - Adopt CalVer versioning (YYYY.MM.DD); prior: 1.0.2026.0302j
             2026.03.04 - Security + correctness fixes (#93, #105, #122, #131, #132, #143)
                           - @OutputTable: PARSENAME+QUOTENAME validation prevents SQL injection (#131, #132)
                           - @UpdateStatsAfterRebuild: USE [db] + 2-part name fixes UPDATE STATISTICS (#143)
