@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.03.09
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.03.11
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -750,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>2026.03.09</Version>
+  <Version>2026.03.11</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -1121,7 +1121,13 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.03.09 *(current)*
+### v2026.03.11 *(current)*
+
+- **Fix:** SYSTEM_VERSIONING re-enable failure now halts remaining targets in the database instead of silently continuing (#149)
+- Copy-pasteable `@ResumeRunID` EXEC statement emitted after plan-only runs (#159)
+- 24 persona-review issues triaged: 2 fixed, 12 BY_DESIGN, 7 WONTFIX, 3 closed with analysis
+
+### v2026.03.09
 
 - 19 remaining issues across 7 batches (v0302k-v0302q)
 
