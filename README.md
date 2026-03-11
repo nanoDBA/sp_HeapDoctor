@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.03.11
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.03.11.1
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -1121,11 +1121,20 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.03.11 *(current)*
+### v2026.03.11.1 *(current)*
+
+- `ranking_basis` now distinguishes `QS_DISABLED` from `QS_NO_DATA` (#160)
+- Filtered NCI statistics warning fires for all rebuild paths, not just CI swap (#163)
+- FK child statistics update no longer gated on `ci_drop_failed` (#164)
+- LOG_SPACE_INSUFFICIENT message mentions autogrowth not considered (#153)
+- Pre-flight lock check distinguishes sleeping sessions with open transactions (#167)
+- VLF temp table bug fix: CREATE once before loop instead of per iteration (#168)
+
+### v2026.03.11
 
 - **Fix:** SYSTEM_VERSIONING re-enable failure now halts remaining targets in the database instead of silently continuing (#149)
 - Copy-pasteable `@ResumeRunID` EXEC statement emitted after plan-only runs (#159)
-- 24 persona-review issues triaged: 2 fixed, 12 BY_DESIGN, 7 WONTFIX, 3 closed with analysis
+- 24 persona-review issues triaged: 8 fixed, 12 BY_DESIGN, 4 WONTFIX
 
 ### v2026.03.09
 

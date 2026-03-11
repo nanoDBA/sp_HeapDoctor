@@ -51,9 +51,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.11.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.11 - Fix #149: SYSTEM_VERSIONING re-enable failure now halts database targets
+History:    2026.03.11.1 - Fix 6 reopened issues (#153, #160, #163, #164, #167, #168)
+                          - #160: ranking_basis splits QS_NO_DATA into QS_DISABLED vs QS_NO_DATA
+                          - #163: Filtered NCI stats warning now fires for all rebuild paths (was CI swap only)
+                          - #164: FK child stats update no longer gated on ci_drop_failed
+                          - #153: LOG_SPACE_INSUFFICIENT message mentions autogrowth not considered
+                          - #167: Pre-flight lock check distinguishes sleeping sessions with open transactions
+                          - #168: VLF temp table created once before loop (was CREATE/DROP per iteration)
+            2026.03.11 - Fix #149: SYSTEM_VERSIONING re-enable failure now halts database targets
                           - #159: Copy-pasteable @ResumeRunID EXEC emitted after plan-only runs
             2026.03.09 - 19 remaining issues across 7 batches (v0302k-v0302q)
             2026.03.06 - Apply Erik Darling T-SQL style guide (~850 changes)
@@ -551,7 +558,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.03.11';
+    DECLARE @Version nvarchar(20) = N'2026.03.11.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -2521,6 +2528,7 @@ Ranked AS
         CASE
             WHEN @CpuSource_param = ''NONE'' THEN ''FWD_PCT''
             WHEN cbo.total_cpu_ms IS NOT NULL THEN ''QS_CPU''
+            WHEN @QsRw = 0 THEN ''QS_DISABLED''
             ELSE ''QS_NO_DATA''
         END AS ranking_basis,
         ISNULL(nc.nci_count, 0) AS nci_count,
@@ -3568,6 +3576,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     BEGIN
         DECLARE @vlf_db sysname, @vlf_count integer, @vlf_sql nvarchar(max);
         DECLARE @vlf_warnings nvarchar(max) = N'';
+
+        CREATE TABLE #VlfInfo (
+            RecoveryUnitId integer NULL, FileId integer NULL, FileSize bigint NULL,
+            StartOffset bigint NULL, FSeqNo integer NULL, Status integer NULL,
+            Parity tinyint NULL, CreateLSN numeric(25,0) NULL
+        );
+
         DECLARE vlf_cursor CURSOR LOCAL FAST_FORWARD FOR
             SELECT DISTINCT t.database_name
             FROM #Targets t
@@ -3579,15 +3594,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         WHILE @@FETCH_STATUS = 0
         BEGIN
             BEGIN TRY
-                CREATE TABLE #VlfInfo (
-                    RecoveryUnitId integer NULL, FileId integer NULL, FileSize bigint NULL,
-                    StartOffset bigint NULL, FSeqNo integer NULL, Status integer NULL,
-                    Parity tinyint NULL, CreateLSN numeric(25,0) NULL
-                );
+                TRUNCATE TABLE #VlfInfo;
                 SET @vlf_sql = N'USE ' + QUOTENAME(@vlf_db) + N'; DBCC LOGINFO WITH NO_INFOMSGS;';
                 INSERT INTO #VlfInfo EXEC sys.sp_executesql @vlf_sql;
                 SET @vlf_count = ROWCOUNT_BIG();
-                DROP TABLE #VlfInfo;
 
                 IF @vlf_count > 1000
                 BEGIN
@@ -3596,12 +3606,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 END
             END TRY
             BEGIN CATCH
-                IF OBJECT_ID(N'tempdb..#VlfInfo') IS NOT NULL DROP TABLE #VlfInfo;
+                /* Silently skip VLF check for this database */
             END CATCH
             FETCH NEXT FROM vlf_cursor INTO @vlf_db;
         END
         CLOSE vlf_cursor;
         DEALLOCATE vlf_cursor;
+        DROP TABLE #VlfInfo;
 
         IF @vlf_warnings <> N''
         BEGIN
@@ -5231,9 +5242,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 IF @cur_log_free_mb IS NOT NULL AND @cur_est_log_mb > @cur_log_free_mb
                 BEGIN
                     SET @Msg = N'  SKIPPED: ' + @full + N' - estimated log consumption ('
-                        + CONVERT(nvarchar(20), CONVERT(integer, @cur_est_log_mb)) + N' MB) exceeds available log free space ('
+                        + CONVERT(nvarchar(20), CONVERT(integer, @cur_est_log_mb)) + N' MB) exceeds current log free space ('
                         + CONVERT(nvarchar(20), CONVERT(integer, @cur_log_free_mb)) + N' MB). '
-                        + N'Free log space or increase log file size before rebuilding.';
+                        + N'Autogrowth is not considered; disk may have sufficient space. '
+                        + N'Pre-grow the log file or verify disk space before rebuilding.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     SET @skipped_cnt += 1;
                     INSERT INTO #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
@@ -5422,17 +5434,21 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             Warn before wasting a lock timeout cycle.
             */
             SET @preflight_sessions = 0;
+            DECLARE @preflight_sleeping integer = 0;
             BEGIN TRY
-                SET @verify_sql = N'SELECT @cnt = COUNT_BIG(DISTINCT request_session_id)
-                    FROM sys.dm_tran_locks
-                    WHERE resource_database_id = DB_ID(@db_param)
-                      AND resource_type = N''OBJECT''
-                      AND resource_associated_entity_id = OBJECT_ID(@full_param)
-                      AND request_session_id <> @@SPID
-                      AND request_status = N''GRANT'';';
+                SET @verify_sql = N'SELECT
+                        @cnt = COUNT_BIG(DISTINCT l.request_session_id),
+                        @sleeping = ISNULL(SUM(CASE WHEN s.status = N''sleeping'' AND s.open_transaction_count > 0 THEN 1 ELSE 0 END), 0)
+                    FROM sys.dm_tran_locks l
+                    JOIN sys.dm_exec_sessions s ON s.session_id = l.request_session_id
+                    WHERE l.resource_database_id = DB_ID(@db_param)
+                      AND l.resource_type = N''OBJECT''
+                      AND l.resource_associated_entity_id = OBJECT_ID(@full_param)
+                      AND l.request_session_id <> @@SPID
+                      AND l.request_status = N''GRANT'';';
                 EXEC sys.sp_executesql @verify_sql,
-                    N'@db_param sysname, @full_param nvarchar(512), @cnt integer OUTPUT',
-                    @db_param = @db, @full_param = @full, @cnt = @preflight_sessions OUTPUT;
+                    N'@db_param sysname, @full_param nvarchar(512), @cnt integer OUTPUT, @sleeping integer OUTPUT',
+                    @db_param = @db, @full_param = @full, @cnt = @preflight_sessions OUTPUT, @sleeping = @preflight_sleeping OUTPUT;
             END TRY
             BEGIN CATCH
                 SET @preflight_sessions = 0; /* don't block on pre-flight errors */
@@ -5441,7 +5457,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IF ISNULL(@preflight_sessions, 0) > 0
             BEGIN
                 SET @Msg = N'  NOTE: ' + CONVERT(nvarchar(10), @preflight_sessions)
-                         + N' active session(s) hold locks on ' + @full
+                         + N' session(s) hold locks on ' + @full
+                         + CASE WHEN @preflight_sleeping > 0
+                                THEN N' (' + CONVERT(nvarchar(10), @preflight_sleeping) + N' sleeping with open transactions)'
+                                ELSE N'' END
                          + N'. Sch-M acquisition may block or be blocked.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
@@ -5850,7 +5869,6 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 IF @action = N'CI_SWAP_ONLINE'
                    AND @cur_has_fk_references = 1
                    AND @UpdateStatsAfterRebuild = 1
-                   AND @ci_drop_failed = 0
                 BEGIN
                     BEGIN TRY
                         DECLARE @fk_child_stats_sql nvarchar(max);
@@ -5901,13 +5919,12 @@ DEALLOCATE fk_child_cursor;';
                 Filtered NCI statistics are especially prone to staleness because their small
                 row counts make auto-statistics updates infrequent. Warn when @UpdateStatsAfterRebuild=0.
                 */
-                IF @action = N'CI_SWAP_ONLINE'
-                   AND @cur_filtered_nci_count > 0
+                IF @cur_filtered_nci_count > 0
                    AND @UpdateStatsAfterRebuild = 0
                 BEGIN
                     SET @Msg = N'  WARNING: ' + @full + N' has '
                              + CONVERT(nvarchar(10), @cur_filtered_nci_count)
-                             + N' filtered NCI(s). Filtered index statistics are prone to staleness after CI swap.'
+                             + N' filtered NCI(s). Filtered index statistics are prone to staleness after rebuild.'
                              + N' Consider @UpdateStatsAfterRebuild=1 for tables with filtered indexes.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
