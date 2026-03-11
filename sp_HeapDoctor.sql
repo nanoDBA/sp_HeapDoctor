@@ -51,9 +51,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.09 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.09 - 19 remaining issues across 7 batches (v0302k-v0302q)
+History:    2026.03.11 - Fix #149: SYSTEM_VERSIONING re-enable failure now halts database targets
+                          - #159: Copy-pasteable @ResumeRunID EXEC emitted after plan-only runs
+            2026.03.09 - 19 remaining issues across 7 batches (v0302k-v0302q)
             2026.03.06 - Apply Erik Darling T-SQL style guide (~850 changes)
             2026.03.04 - Adopt CalVer versioning (YYYY.MM.DD); prior: 1.0.2026.0302j
             2026.03.04 - Security + correctness fixes (#93, #105, #122, #131, #132, #143)
@@ -549,7 +551,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.03.09';
+    DECLARE @Version nvarchar(20) = N'2026.03.11';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -4792,6 +4794,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 FOR XML RAW(N'ScanSummary'), ELEMENTS, TYPE
             )
         );
+
+        /* #159: Emit copy-pasteable resume EXEC so the operator can execute without re-scanning */
+        IF @TargetCount > 0
+        BEGIN
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+            SET @Msg = N'To execute these targets without re-scanning, run:';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            SET @Msg = N'  EXEC dbo.sp_HeapDoctor @ResumeRunID = '''
+                     + CONVERT(nvarchar(36), @RunID) + N''', @PlanOnly = 0;';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
     END
 
 /*#endregion 20-SCAN-SUMMARY */
@@ -6101,8 +6114,20 @@ DEALLOCATE fk_child_cursor;';
                         SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
                                  + N': ' + LEFT(ERROR_MESSAGE(), 500)
-                                 + N'. MANUAL RE-ENABLE REQUIRED.';
+                                 + N'. MANUAL RE-ENABLE REQUIRED. Skipping remaining targets in [' + @db + N'].';
                         RAISERROR(@Msg, 16, 1) WITH NOWAIT;
+                        SET @failed_cnt += 1;
+                        INSERT INTO #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
+                        VALUES (@tid,
+                            CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
+                            CASE WHEN @obfuscate = 1
+                                 THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                                 ELSE @full END,
+                            @action, @start, SYSDATETIME(), 0, N'FAILED: SYSTEM_VERSIONING_REENABLE_FAILED');
+                        /* Skip remaining targets in this database - temporal table is in unsafe state */
+                        UPDATE #Targets SET sort_order = -1
+                        WHERE database_name = @db AND sort_order > @i;
+                        CONTINUE;
                     END CATCH
                 END
             END TRY
@@ -6225,8 +6250,12 @@ DEALLOCATE fk_child_cursor;';
                         SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
                                  + N': ' + LEFT(ERROR_MESSAGE(), 500)
-                                 + N'. MANUAL RE-ENABLE REQUIRED.';
+                                 + N'. MANUAL RE-ENABLE REQUIRED. Skipping remaining targets in [' + @db + N'].';
                         RAISERROR(@Msg, 16, 1) WITH NOWAIT;
+                        /* Do NOT increment @failed_cnt here - outer CATCH already counted this rebuild as failed */
+                        /* Skip remaining targets in this database - temporal table is in unsafe state */
+                        UPDATE #Targets SET sort_order = -1
+                        WHERE database_name = @db AND sort_order > @i;
                     END CATCH
                 END
             END CATCH;
