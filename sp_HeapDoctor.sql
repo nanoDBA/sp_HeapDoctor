@@ -73,8 +73,8 @@ History:    2026.03.11.1 - Fix 6 reopened issues (#153, #160, #163, #164, #167, 
                           - CI swap guard: add XML index (type 3) and spatial (type 4) to exclusion (#105)
                           - Docs: @Help CI SWAP RESTRICTIONS block — partitioned heap and temporal history
                             table CI swap blocks now explicitly documented with rationale (#137, #140)
-                          - Docs: @GenerateScript @Help note — SYSTEM_VERSIONING wrappers for temporal
-                            tables require manual addition when using @GenerateScript (#119)
+                          - Fix: @GenerateScript @Help note — corrected to reflect automatic
+                            SYSTEM_VERSIONING wrapper generation for temporal targets (#119)
                           - Docs: CommandLog START ExtendedInfo comment — clarifies included vs. omitted
                             params for future maintainers (#107)
                           - 19 BY_DESIGN GitHub issues closed with explanations
@@ -631,10 +631,8 @@ COMMON PARAMETERS:
   @OutputTable       nvarchar(256) = NULL  Persist results to a table (auto-created if missing).
                                         e.g. dbo.HeapDoctorHistory. Includes RunID + CapturedAt.
   @GenerateScript    bit     = 0       Output executable T-SQL script (implies @PlanOnly=1).
-                                        Note: For temporal tables, generated CI swap commands
-                                        require manual SYSTEM_VERSIONING disable/enable wrappers.
-                                        sp_HeapDoctor executes these automatically in @Execute mode
-                                        but cannot include them in the generated script.
+                                        Temporal history targets include SYSTEM_VERSIONING
+                                        disable/enable wrappers automatically (Steps 1/2/3).
   @IncludeTemporalHistory bit = 0      Include temporal history table heaps in discovery.
                                         Rebuild requires SYSTEM_VERSIONING disable/enable on parent.
                                         CI swap is blocked for history tables (REBUILD only).
