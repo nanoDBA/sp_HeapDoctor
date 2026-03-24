@@ -51,9 +51,10 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.11.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.23 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.11.1 - Fix 6 reopened issues (#153, #160, #163, #164, #167, #168)
+History:    2026.03.23 - Fix @QsRw undeclared variable bug in CpuSource=NONE and QUICKIESTORE paths
+            2026.03.11.1 - Fix 6 reopened issues (#153, #160, #163, #164, #167, #168)
                           - #160: ranking_basis splits QS_NO_DATA into QS_DISABLED vs QS_NO_DATA
                           - #163: Filtered NCI stats warning now fires for all rebuild paths (was CI swap only)
                           - #164: FK child stats update no longer gated on ci_drop_failed
@@ -558,7 +559,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.03.11.1';
+    DECLARE @Version nvarchar(20) = N'2026.03.23';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -2453,9 +2454,16 @@ IF @QsRw = 0
         BEGIN
             SET @discovery_sql += N'
 /* 2) No CPU source; ranking by forwarded_pct only */
+DECLARE @QsRw bit = 0;
 ';
         END
-        /* QUICKIESTORE is handled separately below (not per-database dynamic SQL) */
+        ELSE /* QUICKIESTORE is handled separately below (not per-database dynamic SQL) */
+        BEGIN
+            SET @discovery_sql += N'
+/* 2) QUICKIESTORE: CPU handled outside loop; structural ranking only */
+DECLARE @QsRw bit = 0;
+';
+        END
 
         /* 4-7) Key finder, LOB check, ranking, target generation */
         SET @discovery_sql += N'

@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.03.11.1
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.03.23
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -750,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>2026.03.11.1</Version>
+  <Version>2026.03.23</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -1121,7 +1121,11 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.03.11.1 *(current)*
+### v2026.03.23 *(current)*
+
+- **Fix:** `@QsRw` variable undeclared in discovery SQL when `CpuSource=NONE` or `QUICKIESTORE`, causing error 137 and zero targets returned
+
+### v2026.03.11.1
 
 - `ranking_basis` now distinguishes `QS_DISABLED` from `QS_NO_DATA` (#160)
 - Filtered NCI statistics warning fires for all rebuild paths, not just CI swap (#163)

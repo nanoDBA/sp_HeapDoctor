@@ -2,7 +2,7 @@
 
 ## Current State (2026-03-13)
 
-**Version:** 2026.03.11.1
+**Version:** 2026.03.23
 **Test suite:** 26 automated test scripts in `tests/` (01-26) + cleanup (99)
 **All Batches 1-9 complete** -- 0302a through 0302i shipped
 **Batch 10 (v0302j):** Security + correctness fixes (#93, #105, #122, #131, #132, #143)
