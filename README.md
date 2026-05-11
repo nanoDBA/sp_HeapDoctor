@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.1
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.2
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -750,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>2026.05.11.1</Version>
+  <Version>2026.05.11.2</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -1121,7 +1121,25 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.05.11.1 *(current)*
+### v2026.05.11.2 *(current)*
+
+- **New:** `@HeapsInParallel nvarchar(1) = N'N'` — queue-based parallel rebuild (Phase A). When set to `'Y'`, sp_HeapDoctor uses Ola Hallengren's `dbo.Queue` parent table plus an auto-created `dbo.QueueHeapRebuild` child to coordinate work across multiple sessions. Run the same `EXEC` from N SQL Agent steps (or any N sessions); the first session to insert into `dbo.Queue` becomes the leader (runs discovery + populates the queue), subsequent sessions are workers (skip discovery and consume). All sessions then drain the queue concurrently via atomic `UPDATE ... OUTPUT` claims (`ROWLOCK, READPAST`) so contention skips rather than blocks.
+
+  ```sql
+  -- SQL Agent: identical step, run N times in parallel
+  EXEC dbo.sp_HeapDoctor
+      @Databases       = N'USER_DATABASES',
+      @Execute         = N'Y',
+      @HeapsInParallel = N'Y';
+  ```
+
+  Phase A intentionally defers dead-worker recovery, mop-up discovery, parameter fingerprint conflict detection, and orphan-row sweep. Requires Ola's `Queue.sql` to be installed in the target database (https://ola.hallengren.com/scripts/Queue.sql). `@PlanOnly = 1` is rejected with parallel mode.
+
+- The `@invocation_command` written to `dbo.CommandLog` records `@HeapsInParallel = N'Y'` when set, and it is the exact string used as the `dbo.Queue.Parameters` key — so two sessions invoking the same `EXEC` deterministically share a `QueueID`.
+
+- `@Help` ADVANCED PARAMETERS block split into four RAISERROR sub-blocks (it had silently been truncating earlier ADVANCED entries on Linux `sqlcmd`).
+
+### v2026.05.11.1
 
 - **New:** `@ExcludeDatabases nvarchar(max) = NULL` and `@ExcludeTables nvarchar(max) = NULL` parameters. Dedicated comma-separated exclusion patterns; users no longer need to embed `-` prefixes inside `@Databases` / `@Tables`. Wildcards (`%`) and multiple comma-separated patterns are supported. NULL `@Databases` + `@ExcludeDatabases` set implies `USER_DATABASES`; NULL `@Tables` + `@ExcludeTables` set implies `%` (all tables). Example: `EXEC sp_HeapDoctor @ExcludeDatabases = N'master, model, msdb, tempdb', @ExcludeTables = N'dbo.Archive%, dbo.Staging%';`
 - Both new params are logged to `dbo.CommandLog` via `@invocation_command` so audit trails preserve the user's original (separate) input.

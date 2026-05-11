@@ -51,9 +51,23 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.05.11.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.05.11.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.05.11.1 - Add @ExcludeDatabases and @ExcludeTables parameters
+History:    2026.05.11.2 - Add @HeapsInParallel parameter (queue-based parallel rebuild - Phase A)
+                          - Adopts Ola Hallengren's dbo.Queue parent-table pattern (same as sp_StatUpdate);
+                            auto-creates child table dbo.QueueHeapRebuild on first parallel run.
+                          - Multiple sessions invoking the same EXEC share a QueueID. The first session
+                            to INSERT into dbo.Queue is the leader and runs discovery; subsequent sessions
+                            are workers and skip discovery. Both then consume from the queue.
+                          - Atomic claim via UPDATE OUTPUT with ROWLOCK + READPAST so concurrent workers
+                            skip locked rows rather than blocking.
+                          - Re-entrancy applock bypassed in parallel mode; @PlanOnly = 1 rejected with
+                            parallel mode.
+                          - Phase B (dead-worker recovery, mop-up discovery, parameter fingerprint
+                            conflict detection, orphan row sweep) intentionally deferred.
+                          - @Help ADVANCED PARAMETERS block split into 4 RAISERROR sub-blocks to fit
+                            under the Linux sqlcmd ~970-char per-RAISERROR output limit.
+            2026.05.11.1 - Add @ExcludeDatabases and @ExcludeTables parameters
                           - Dedicated comma-separated exclusion patterns (no - prefix needed in value).
                           - Merged into @Databases / @Tables as -<pattern> entries before parsing,
                             so the existing recursive-CTE include/exclude parsers are reused.
@@ -525,6 +539,10 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     /* Logging */
     @LogToTable              nvarchar(1)    = N'Y', /* Y = log to dbo.CommandLog (current DB), N = no logging */
 
+    /* Parallel execution (Phase A) */
+    @HeapsInParallel         nvarchar(1)    = N'N', /* Y = queue-based parallel rebuild via dbo.Queue + dbo.QueueHeapRebuild. */
+                                                                /* Run the same EXEC from multiple sessions/Agent steps. Requires Ola Hallengren's dbo.Queue. */
+
     /* Output verbosity */
     @Debug                   bit            = 0,
 
@@ -582,7 +600,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.05.11.1';
+    DECLARE @Version nvarchar(20) = N'2026.05.11.2';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -656,13 +674,17 @@ COMMON PARAMETERS:
                                         LIMITED: allocation pages only (fastest, coarse fragmentation).
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays integer  = 90      CommandLog history window for throughput rates.
-  @BaselineRebuildMBPerMin integer = NULL  Cold-start: assumed MB/min when no CommandLog history
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'  @BaselineRebuildMBPerMin integer = NULL  Cold-start: assumed MB/min when no CommandLog history
                                         exists. Typical range 100-2000 (SSD vs HDD).
   @UpdateStatsAfterRebuild bit = 0    Run UPDATE STATISTICS WITH FULLSCAN after each rebuild.
   @CheckPermissionsOnly bit  = 0       Check required permissions per database and return.
   @AllowReplicationRebuild bit = 0    Published heaps skipped unless 1 (replication log flood risk).
   @Force             bit     = 0       Bypass re-entrancy guard (orphaned applock from KILLed run).
-  @OutputTable       nvarchar(256) = NULL  Persist results to a table (auto-created if missing).
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'  @OutputTable       nvarchar(256) = NULL  Persist results to a table (auto-created if missing).
                                         e.g. dbo.HeapDoctorHistory. Includes RunID + CapturedAt.
   @GenerateScript    bit     = 0       Output executable T-SQL script (implies @PlanOnly=1).
                                         Temporal history targets include SYSTEM_VERSIONING
@@ -670,9 +692,13 @@ COMMON PARAMETERS:
   @IncludeTemporalHistory bit = 0      Include temporal history table heaps in discovery.
                                         Rebuild requires SYSTEM_VERSIONING disable/enable on parent.
                                         CI swap is blocked for history tables (REBUILD only).
-  @UseResumable      bit     = 1       RESUMABLE = ON for CI swap CREATE INDEX (SQL 2019+).
-                                        On interrupt, index build is paused (not rolled back).
-                                        Resume detection: paused ops auto-resumed on next run.
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'  @UseResumable      bit     = 1       RESUMABLE = ON for CI swap CREATE INDEX (SQL 2019+).
+                                        Paused ops auto-resumed on next run.
+  @HeapsInParallel   nvarchar(1) = N    Y = queue-based parallel rebuild. Run same EXEC from N
+                                        sessions/Agent steps. Leader populates dbo.QueueHeapRebuild,
+                                        workers consume. Requires Ola Hallengren''s dbo.Queue.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'
@@ -974,6 +1000,28 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RETURN;
     END
 
+    /* Parallel mode (Phase A): @HeapsInParallel must be Y or N, and dbo.Queue must exist when Y. */
+    IF @HeapsInParallel IS NULL OR UPPER(@HeapsInParallel) NOT IN (N'Y', N'N')
+    BEGIN
+        RAISERROR(N'@HeapsInParallel must be N''Y'' (queue-based parallel) or N''N'' (serial; default).', 16, 1);
+        RETURN;
+    END
+    SET @HeapsInParallel = UPPER(@HeapsInParallel);
+
+    IF @HeapsInParallel = N'Y'
+       AND NOT EXISTS (SELECT 1 FROM sys.objects AS o JOIN sys.schemas AS s ON s.schema_id = o.schema_id
+                        WHERE o.type = N'U' AND s.name = N'dbo' AND o.name = N'Queue')
+    BEGIN
+        RAISERROR(N'@HeapsInParallel = ''Y'' requires Ola Hallengren''s dbo.Queue table in the current database. Download: https://ola.hallengren.com/scripts/Queue.sql', 16, 1);
+        RETURN;
+    END
+
+    IF @HeapsInParallel = N'Y' AND (@PlanOnly = 1 OR UPPER(ISNULL(@Execute, N'')) = N'N')
+    BEGIN
+        RAISERROR(N'@HeapsInParallel = ''Y'' requires execution mode (@PlanOnly = 0, or @Execute = ''Y''). Plan-only parallel runs queue work that nothing consumes.', 16, 1);
+        RETURN;
+    END
+
     IF @Maxdop IS NOT NULL AND @Maxdop < 0
     BEGIN
         RAISERROR(N'@Maxdop cannot be negative.', 16, 1);
@@ -1145,21 +1193,26 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     /* Prevents concurrent executions from interfering with each other. */
     /* Uses sp_getapplock with session-scoped exclusive lock. */
     /*-------------------------------------------------------------------------- */
-    DECLARE @lock_result integer;
-    EXEC @lock_result = sp_getapplock
-        @Resource = N'sp_HeapDoctor',
-        @LockMode = N'Exclusive',
-        @LockTimeout = 0,
-        @LockOwner = N'Session';
+    DECLARE @lock_result integer = 0;
+    /* Parallel mode (Phase A) skips the session-exclusive applock so multiple workers may run concurrently.
+       Leader election + dead-row coordination happens later via dbo.Queue UPDLOCK,HOLDLOCK. */
+    IF @HeapsInParallel = N'N'
+    BEGIN
+        EXEC @lock_result = sp_getapplock
+            @Resource = N'sp_HeapDoctor',
+            @LockMode = N'Exclusive',
+            @LockTimeout = 0,
+            @LockOwner = N'Session';
 
-    IF @lock_result < 0 AND @Force = 0
-    BEGIN
-        RAISERROR(N'Another instance of sp_HeapDoctor is already running in this SQL Server instance. Use @Force = 1 to bypass if the previous run was KILLed. Aborting.', 16, 1);
-        RETURN;
-    END
-    ELSE IF @lock_result < 0 AND @Force = 1
-    BEGIN
-        RAISERROR(N'WARNING: Bypassing re-entrancy guard via @Force = 1. Ensure no concurrent instance is actually running.', 10, 1) WITH NOWAIT;
+        IF @lock_result < 0 AND @Force = 0
+        BEGIN
+            RAISERROR(N'Another instance of sp_HeapDoctor is already running in this SQL Server instance. Use @Force = 1 to bypass if the previous run was KILLed, or @HeapsInParallel = ''Y'' for concurrent execution. Aborting.', 16, 1);
+            RETURN;
+        END
+        ELSE IF @lock_result < 0 AND @Force = 1
+        BEGIN
+            RAISERROR(N'WARNING: Bypassing re-entrancy guard via @Force = 1. Ensure no concurrent instance is actually running.', 10, 1) WITH NOWAIT;
+        END
     END
 
     /* Initialize obfuscation passphrase (after re-entrancy guard succeeds) */
@@ -1333,6 +1386,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @ScanThrottleMs = ' + CONVERT(nvarchar(10), @ScanThrottleMs);
     IF @LogToTable <> N'Y'
         SET @invocation_command += N', @LogToTable = N''' + @LogToTable + N'''';
+    IF @HeapsInParallel = N'Y'
+        SET @invocation_command += N', @HeapsInParallel = N''Y''';
     IF @EstimateTime = 1
         SET @invocation_command += N', @EstimateTime = 1';
     IF @EstimateLookbackDays <> 90
@@ -1424,6 +1479,129 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF @Tables IS NULL
             SET @Tables = N'%';
         SET @Tables = @Tables + ISNULL(@ExcludeTblTail, N'');
+    END
+
+    /*-------------------------------------------------------------------------- */
+    /* Parallel mode (Phase A): queue init + leader election */
+    /* */
+    /* Uses Ola Hallengren's dbo.Queue as the parent (one row per unique run) */
+    /* and an auto-created dbo.QueueHeapRebuild child holding per-target work. */
+    /* All sessions invoking the SAME EXEC (same @invocation_command) join the */
+    /* same QueueID. The first session to INSERT into dbo.Queue is the leader */
+    /* and runs discovery; subsequent sessions are workers and skip discovery. */
+    /* */
+    /* Deferred to Phase B: dead-worker recovery, mop-up discovery, orphan */
+    /* sweep, parameter fingerprint conflict detection. */
+    /*-------------------------------------------------------------------------- */
+    DECLARE @queue_id           integer = NULL;
+    DECLARE @parallel_is_leader bit     = 1;  /* irrelevant unless @HeapsInParallel = 'Y' */
+    DECLARE @parallel_worker    bit     = 0;  /* 1 = skip discovery (load targets from queue) */
+
+    IF @HeapsInParallel = N'Y'
+    BEGIN
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'Parallel mode: Initializing work queue...', 10, 1) WITH NOWAIT;
+
+        /* Auto-create dbo.QueueHeapRebuild if missing (matches sp_StatUpdate pattern) */
+        IF OBJECT_ID(N'dbo.QueueHeapRebuild', N'U') IS NULL
+        BEGIN
+            RAISERROR(N'Creating dbo.QueueHeapRebuild table for parallel processing...', 10, 1) WITH NOWAIT;
+
+            CREATE TABLE dbo.QueueHeapRebuild
+            (
+                QueueID                integer        NOT NULL,
+                DatabaseName           sysname        NOT NULL,
+                SchemaName             sysname        NOT NULL,
+                TableName              sysname        NOT NULL,
+                ObjectID               bigint         NOT NULL,
+                SortOrder              integer        NOT NULL DEFAULT 0,
+                ActionChosen           varchar(32)    NOT NULL,
+                PageCount              bigint         NULL,
+                RecordCount            bigint         NULL,
+                ForwardedRecordCount   bigint         NULL,
+                ForwardedPct           decimal(6,2)   NULL,
+                EstLogMB               decimal(18,2)  NULL,
+                HeapCompression        tinyint        NULL,
+                ReplicationHint        varchar(20)    NULL,
+                LockEscalation         tinyint        NULL,
+                HasFkReferences        bit            NULL,
+                FkRefCount             integer        NULL,
+                IsTemporalHistory      bit            NULL,
+                TemporalParentSchema   sysname        NULL,
+                TemporalParentTable    sysname        NULL,
+                CommandText            nvarchar(max)  NOT NULL,
+                CiDropCommand          nvarchar(max)  NULL,
+                VerifyCommand          nvarchar(max)  NULL,
+                TableStartTime         datetime2(7)   NULL,
+                TableEndTime           datetime2(7)   NULL,
+                SessionID              smallint       NULL,
+                ClaimLoginTime         datetime       NULL,
+                Status                 varchar(20)    NULL,
+                ErrorMessage           nvarchar(2000) NULL,
+                CONSTRAINT PK_QueueHeapRebuild
+                    PRIMARY KEY CLUSTERED (QueueID, DatabaseName, SchemaName, TableName),
+                CONSTRAINT FK_QueueHeapRebuild_Queue
+                    FOREIGN KEY (QueueID) REFERENCES dbo.Queue (QueueID)
+            );
+
+            CREATE NONCLUSTERED INDEX IX_QueueHeapRebuild_Unclaimed
+                ON dbo.QueueHeapRebuild (QueueID, SortOrder)
+                INCLUDE (DatabaseName, SchemaName, TableName, ObjectID, ActionChosen)
+                WHERE TableStartTime IS NULL;
+
+            /* ROWLOCK+READPAST hints lose effectiveness if lock escalation kicks in */
+            ALTER TABLE dbo.QueueHeapRebuild SET (LOCK_ESCALATION = DISABLE);
+
+            RAISERROR(N'Created dbo.QueueHeapRebuild table and indexes.', 10, 1) WITH NOWAIT;
+        END
+
+        /* Leader election: race on dbo.Queue insertion. Same @invocation_command -> same QueueID. */
+        SELECT @queue_id = q.QueueID
+        FROM dbo.Queue AS q
+        WHERE q.SchemaName = N'dbo'
+          AND q.ObjectName = N'sp_HeapDoctor'
+          AND q.Parameters = @invocation_command;
+
+        IF @queue_id IS NULL
+        BEGIN
+            BEGIN TRANSACTION;
+
+            SELECT @queue_id = q.QueueID
+            FROM dbo.Queue AS q WITH (UPDLOCK, HOLDLOCK)
+            WHERE q.SchemaName = N'dbo'
+              AND q.ObjectName = N'sp_HeapDoctor'
+              AND q.Parameters = @invocation_command;
+
+            IF @queue_id IS NULL
+            BEGIN
+                INSERT INTO dbo.Queue (SchemaName, ObjectName, Parameters)
+                SELECT N'dbo', N'sp_HeapDoctor', @invocation_command;
+
+                SET @queue_id = CONVERT(integer, SCOPE_IDENTITY());
+                SET @parallel_is_leader = 1;
+
+                DECLARE @LeaderMsg nvarchar(200) = N'  This session is the LEADER (QueueID = ' + CONVERT(nvarchar(10), @queue_id) + N'). Running discovery...';
+                RAISERROR(@LeaderMsg, 10, 1) WITH NOWAIT;
+            END
+            ELSE
+            BEGIN
+                SET @parallel_is_leader = 0;
+                SET @parallel_worker    = 1;
+            END
+
+            COMMIT TRANSACTION;
+        END
+        ELSE
+        BEGIN
+            SET @parallel_is_leader = 0;
+            SET @parallel_worker    = 1;
+        END
+
+        IF @parallel_worker = 1
+        BEGIN
+            DECLARE @WorkerMsg nvarchar(200) = N'  This session is a WORKER (joining QueueID = ' + CONVERT(nvarchar(10), @queue_id) + N'). Skipping discovery; consuming from queue.';
+            RAISERROR(@WorkerMsg, 10, 1) WITH NOWAIT;
+        END
     END
 
 /*#endregion 06-ENVIRONMENT */
@@ -1617,7 +1795,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     IF @DatabaseCount = 0
     BEGIN
         RAISERROR(N'No databases matched the @Databases pattern.', 16, 1);
-        EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+        IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
         RETURN;
     END
 
@@ -1891,7 +2069,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF @RevealKey IS NOT NULL
         BEGIN
             RAISERROR(N'@ResumeRunID and @RevealKey cannot be used together.', 16, 1);
-            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -1899,7 +2077,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF @commandlog_exists = 0
         BEGIN
             RAISERROR(N'@ResumeRunID requires dbo.CommandLog (stores the plan-only scan results).', 16, 1);
-            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -1930,7 +2108,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                          + N'. Run sp_HeapDoctor with @PlanOnly=1, @LogToTable=''Y'' first.';
                 RAISERROR(@Msg, 16, 1);
             END
-            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -1942,7 +2120,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                      + N' but current proc is v' + @Version
                      + N'. Re-run with @PlanOnly=1 to generate a compatible scan.';
             RAISERROR(@Msg, 16, 1);
-            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -1950,7 +2128,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF @resume_xml.exist(N'/ScanSummary/ObfuscatedMappingHex[text()]') = 1
         BEGIN
             RAISERROR(N'Cannot resume from an obfuscated plan-only scan. Run without @ObfuscateKey first.', 16, 1);
-            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -2160,7 +2338,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     /*-------------------------------------------------------------------------- */
     /* Per-database discovery loop (skipped in resume mode) */
     /*-------------------------------------------------------------------------- */
-    IF @resume_loaded = 0
+    IF @resume_loaded = 0 AND @parallel_worker = 0
     BEGIN
     DECLARE
         @CurrentDatabaseName sysname,
@@ -3296,7 +3474,7 @@ END
         IF @ColCount = 0
         BEGIN
             RAISERROR(N'sp_describe_first_result_set returned no columns for @QuickieExecSql. Cannot proceed.', 16, 1);
-            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -3306,7 +3484,7 @@ END
         OR CHARINDEX(QUOTENAME(@QuickieCpuUsColumn), @ddl) = 0
         BEGIN
             RAISERROR(N'Quickie output metadata does not contain required columns. Check @QuickiePlanIdColumn / @QuickieCpuUsColumn.', 16, 1);
-            EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -3461,7 +3639,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         UPDATE Reranked SET sort_order = new_rank;
     END
 
-    END /* IF @resume_loaded = 0 (skip discovery + QUICKIESTORE in resume mode) */
+    END /* IF @resume_loaded = 0 AND @parallel_worker = 0 (skip discovery + QUICKIESTORE in resume mode) */
 
 /*#endregion 14-QUICKIESTORE */
 
@@ -3475,7 +3653,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     SET @Msg = N'Total targets across all databases: ' + CONVERT(nvarchar(10), @TargetCount);
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
-    IF @resume_loaded = 0 AND @discovery_errors > 0
+    IF @resume_loaded = 0 AND @parallel_worker = 0 AND @discovery_errors > 0
     BEGIN
         SET @Msg = N'WARNING: ' + CONVERT(nvarchar(10), @discovery_errors)
                  + N' database(s) had errors during discovery scan. Check messages above.';
@@ -3761,7 +3939,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     These tables are invisible to discovery (index_id = 1, not 0) and require manual cleanup.
     Only scan databases in scope (not all databases on the server).
     */
-    IF @resume_loaded = 0
+    IF @resume_loaded = 0 AND @parallel_worker = 0
     BEGIN
         DECLARE @orphan_db sysname, @orphan_sql nvarchar(max), @orphan_results nvarchar(max);
         DECLARE orphan_cursor CURSOR LOCAL FAST_FORWARD FOR
@@ -3865,7 +4043,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             );
         END
 
-        EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+        IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
         RETURN;
     END
 
@@ -4047,7 +4225,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     END
 
     /* 9L: Trending columns from CommandLog history (skip in resume mode: already in XML) */
-    IF @resume_loaded = 0 AND @commandlog_exists = 1
+    IF @resume_loaded = 0 AND @parallel_worker = 0 AND @commandlog_exists = 1
     BEGIN
         UPDATE t
         SET
@@ -4089,7 +4267,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     /*-------------------------------------------------------------------------- */
     /* Size and impact projections (skip in resume mode: already in XML) */
     /*-------------------------------------------------------------------------- */
-    IF @resume_loaded = 0
+    IF @resume_loaded = 0 AND @parallel_worker = 0
     BEGIN
         UPDATE #Targets
         SET
@@ -4901,6 +5079,32 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
 /*#endregion 20-SCAN-SUMMARY */
 
+    /*-------------------------------------------------------------------------- */
+    /* Parallel mode (Phase A): leader populates dbo.QueueHeapRebuild from #Targets */
+    /* before any worker tries to claim. Workers skip this block. */
+    /*-------------------------------------------------------------------------- */
+    IF @HeapsInParallel = N'Y' AND @parallel_is_leader = 1 AND @PlanOnly = 0
+    BEGIN
+        INSERT INTO dbo.QueueHeapRebuild
+            (QueueID, DatabaseName, SchemaName, TableName, ObjectID, SortOrder, ActionChosen,
+             PageCount, RecordCount, ForwardedRecordCount, ForwardedPct, EstLogMB,
+             HeapCompression, ReplicationHint, LockEscalation,
+             HasFkReferences, FkRefCount,
+             IsTemporalHistory, TemporalParentSchema, TemporalParentTable,
+             CommandText, CiDropCommand, VerifyCommand)
+        SELECT
+            @queue_id, database_name, schema_name, table_name, object_id, sort_order, action_chosen,
+            page_count, record_count, forwarded_record_count, forwarded_pct, est_log_mb,
+            heap_compression, replication_hint, lock_escalation,
+            has_fk_references, fk_ref_count,
+            is_temporal_history, temporal_parent_schema, temporal_parent_table,
+            command_text, ci_drop_command, verify_command
+        FROM #Targets;
+
+        DECLARE @QueuedCountMsg nvarchar(200) = N'  Parallel mode: queued ' + CONVERT(nvarchar(10), ROWCOUNT_BIG()) + N' target(s) to dbo.QueueHeapRebuild (QueueID = ' + CONVERT(nvarchar(10), @queue_id) + N').';
+        RAISERROR(@QueuedCountMsg, 10, 1) WITH NOWAIT;
+    END
+
 /*#region 21-EXECUTION /* WHILE loop with rebuilds */ */
     /*-------------------------------------------------------------------------- */
     /* Execute if requested */
@@ -5075,12 +5279,115 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         END
 
         /*
-        WHILE loop - iterate by sort_order.
-        Commands already use 3-part names (db.schema.table) so no USE statement needed.
+        Parallel mode (Phase A): table variable for atomic UPDATE OUTPUT claim
+        from dbo.QueueHeapRebuild. Columns mirror what we need for the rebuild
+        body; diagnostic fields not stored in the queue (QS snapshot, NCI count,
+        usage_hint, etc.) stay NULL when claiming from the queue.
+        */
+        DECLARE @ClaimedTarget TABLE
+        (
+            DatabaseName           sysname        NOT NULL,
+            SchemaName             sysname        NOT NULL,
+            TableName              sysname        NOT NULL,
+            ObjectID               bigint         NOT NULL,
+            SortOrder              integer        NOT NULL,
+            ActionChosen           varchar(32)    NOT NULL,
+            PageCount              bigint         NULL,
+            RecordCount            bigint         NULL,
+            ForwardedRecordCount   bigint         NULL,
+            ForwardedPct           decimal(6,2)   NULL,
+            EstLogMB               decimal(18,2)  NULL,
+            HeapCompression        tinyint        NULL,
+            ReplicationHint        varchar(20)    NULL,
+            LockEscalation         tinyint        NULL,
+            HasFkReferences        bit            NULL,
+            FkRefCount             integer        NULL,
+            IsTemporalHistory      bit            NULL,
+            TemporalParentSchema   sysname        NULL,
+            TemporalParentTable    sysname        NULL,
+            CommandText            nvarchar(max)  NOT NULL,
+            CiDropCommand          nvarchar(max)  NULL,
+            VerifyCommand          nvarchar(max)  NULL
+        );
+
+        DECLARE @claim_login_time datetime =
+            (SELECT s.login_time FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID);
+
+        /*
+        WHILE loop - iterate by sort_order in serial mode, or claim atomically
+        from dbo.QueueHeapRebuild in parallel mode. Commands use 3-part names
+        (db.schema.table) so no USE statement is needed.
+
+        Parallel mode (Phase A): each iteration atomically claims a queue row,
+        DELETEs+INSERTs that row into #Targets (so the existing per-target SELECT
+        and rebuild body work unchanged), then UPDATEs the queue row with
+        TableEndTime after the rebuild. Workers consume from the same QueueID
+        concurrently; ROWLOCK+READPAST ensures each row is claimed by exactly one.
         */
         WHILE 1 = 1
         BEGIN
-            /* Get next target */
+            IF @HeapsInParallel = N'Y'
+            BEGIN
+                /* Reset claim buffer */
+                DELETE FROM @ClaimedTarget;
+
+                /* Atomic claim: UPDATE TOP (1) with ROWLOCK+READPAST so concurrent workers skip locked rows. */
+                ;WITH NextUnclaimed AS
+                (
+                    SELECT TOP (1) qhr.QueueID, qhr.DatabaseName, qhr.SchemaName, qhr.TableName
+                    FROM dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
+                    WHERE qhr.QueueID = @queue_id
+                      AND qhr.TableStartTime IS NULL
+                    ORDER BY qhr.SortOrder
+                )
+                UPDATE qhr
+                SET qhr.TableStartTime = SYSDATETIME(),
+                    qhr.SessionID      = @@SPID,
+                    qhr.ClaimLoginTime = @claim_login_time
+                OUTPUT inserted.DatabaseName, inserted.SchemaName, inserted.TableName,
+                       inserted.ObjectID, inserted.SortOrder, inserted.ActionChosen,
+                       inserted.PageCount, inserted.RecordCount, inserted.ForwardedRecordCount,
+                       inserted.ForwardedPct, inserted.EstLogMB, inserted.HeapCompression,
+                       inserted.ReplicationHint, inserted.LockEscalation,
+                       inserted.HasFkReferences, inserted.FkRefCount,
+                       inserted.IsTemporalHistory, inserted.TemporalParentSchema, inserted.TemporalParentTable,
+                       inserted.CommandText, inserted.CiDropCommand, inserted.VerifyCommand
+                INTO @ClaimedTarget
+                FROM NextUnclaimed AS nu
+                JOIN dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
+                  ON qhr.QueueID     = nu.QueueID
+                 AND qhr.DatabaseName = nu.DatabaseName
+                 AND qhr.SchemaName   = nu.SchemaName
+                 AND qhr.TableName    = nu.TableName;
+
+                IF NOT EXISTS (SELECT 1 FROM @ClaimedTarget) BREAK;
+
+                /* Replace #Targets contents with this single claimed row so the
+                   existing SELECT below picks it up. IDENTITY auto-assigns target_id. */
+                DELETE FROM #Targets;
+                INSERT INTO #Targets
+                    (database_name, object_id, schema_name, table_name,
+                     page_count, record_count, forwarded_record_count, forwarded_pct,
+                     action_chosen, command_text, ci_drop_command, verify_command,
+                     est_log_mb, heap_compression, replication_hint, lock_escalation,
+                     has_fk_references, fk_ref_count,
+                     is_temporal_history, temporal_parent_schema, temporal_parent_table,
+                     sort_order)
+                SELECT
+                    DatabaseName, ObjectID, SchemaName, TableName,
+                    ISNULL(PageCount, 0), RecordCount, ISNULL(ForwardedRecordCount, 0), ISNULL(ForwardedPct, 0),
+                    ActionChosen, CommandText, CiDropCommand, VerifyCommand,
+                    EstLogMB, ISNULL(HeapCompression, 0), ReplicationHint, ISNULL(LockEscalation, 0),
+                    ISNULL(HasFkReferences, 0), ISNULL(FkRefCount, 0),
+                    ISNULL(IsTemporalHistory, 0), TemporalParentSchema, TemporalParentTable,
+                    ISNULL(SortOrder, 0)
+                FROM @ClaimedTarget;
+
+                /* Reset @i so the SELECT below finds the freshly inserted row */
+                SET @i = -1;
+            END
+
+            /* Pick next target from #Targets - same SELECT for serial AND parallel modes. */
             SELECT TOP (1)
                 @cur_sort       = sort_order,
                 @tid            = target_id,
@@ -6357,6 +6664,26 @@ DEALLOCATE fk_child_cursor;';
                     END CATCH
                 END
             END CATCH;
+
+            /* Parallel mode: mark queue row complete (success or failure) so workers won't re-claim it. */
+            IF @HeapsInParallel = N'Y'
+            BEGIN
+                UPDATE qhr
+                SET qhr.TableEndTime = SYSDATETIME(),
+                    qhr.Status = CASE
+                                     WHEN EXISTS (SELECT 1 FROM #ExecLog el WHERE el.target_id = @tid AND el.succeeded = 1)
+                                         THEN N'SUCCEEDED'
+                                     WHEN EXISTS (SELECT 1 FROM #ExecLog el WHERE el.target_id = @tid AND el.succeeded = 0 AND el.error_number IS NOT NULL)
+                                         THEN N'FAILED'
+                                     ELSE N'SKIPPED'
+                                 END,
+                    qhr.ErrorMessage = LEFT((SELECT TOP (1) error_message FROM #ExecLog el WHERE el.target_id = @tid ORDER BY el.start_time DESC), 2000)
+                FROM dbo.QueueHeapRebuild AS qhr
+                WHERE qhr.QueueID     = @queue_id
+                  AND qhr.DatabaseName = @db
+                  AND qhr.SchemaName   = @schema
+                  AND qhr.TableName    = @tbl;
+            END
         END
 
         /*
@@ -6453,7 +6780,7 @@ DEALLOCATE fk_child_cursor;';
     END
 
     /* Release re-entrancy guard */
-    EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+    IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
 
     /* Return non-zero so SQL Agent jobs see failure */
     IF @failed_cnt > 0
