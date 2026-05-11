@@ -51,9 +51,17 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.23 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.05.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.23 - Fix @QsRw undeclared variable bug in CpuSource=NONE and QUICKIESTORE paths
+History:    2026.05.11 - Add @IncludeHealthyHeaps parameter
+                          - Bypasses both forwarded-record discovery filters (forwarded_record_count > 0
+                            AND @MinForwardedPct) so heaps with zero forwarded records are included.
+                          - @MinPages / @MaxPages and all safety guards still apply.
+                          - Primary use case: force-rebuild a known heap via @Tables scoping.
+                          - @invocation_command logs @IncludeHealthyHeaps = 1 to CommandLog when non-default.
+                          - @Help COMMON PARAMETERS RAISERROR split into two blocks (after @TopN) so the
+                            added param renders under the Linux sqlcmd ~970-char output limit.
+            2026.03.23 - Fix @QsRw undeclared variable bug in CpuSource=NONE and QUICKIESTORE paths
             2026.03.11.1 - Fix 6 reopened issues (#153, #160, #163, #164, #167, #168)
                           - #160: ranking_basis splits QS_NO_DATA into QS_DISABLED vs QS_NO_DATA
                           - #163: Filtered NCI stats warning now fires for all rebuild paths (was CI swap only)
@@ -476,6 +484,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @MinPages                bigint         = 1000,
     @MaxPages                bigint         = NULL, /* NULL = no cap; else only heaps with page_count <= @MaxPages */
     @MinForwardedPct         decimal(6,2)   = 2.00,
+    @IncludeHealthyHeaps     bit            = 0, /* 1 = bypass forwarded-record discovery filters (include heaps with 0 forwarded records / below @MinForwardedPct). Use with @Tables to force-rebuild a specific heap. */
     @SkipWriteHeavy          bit            = 0, /* 1 = exclude WRITE_HEAVY and WRITE_ONLY heaps entirely */
     @MinDaysSinceRebuild     integer            = NULL, /* NULL = no filter; skip heaps rebuilt fewer than N days ago */
 
@@ -559,7 +568,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.03.23';
+    DECLARE @Version nvarchar(20) = N'2026.05.11';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -597,12 +606,16 @@ COMMON PARAMETERS:
   @PlanOnly          bit     = 1       1=print commands only, 0=execute.
   @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
   @TopN              integer     = 25      Max targets per database.
-  @MinPages          bigint  = 1000    Discovery filter: heaps below this page count are excluded.
+', 10, 1, @Version) WITH NOWAIT;
+
+        RAISERROR(N'  @MinPages          bigint  = 1000    Discovery filter: heaps below this page count are excluded.
   @MinForwardedPct   decimal = 2.00    Min forwarded %% (= forwarded_records / total_rows * 100).
+  @IncludeHealthyHeaps bit  = 0       1=bypass forwarded-record filters; include heaps with 0 forwarded
+                                        records. Combine with @Tables to force-rebuild a specific heap.
   @SkipWriteHeavy    bit     = 0       1=exclude WRITE_HEAVY and WRITE_ONLY heaps entirely.
   @MinDaysSinceRebuild integer   = NULL    Skip heaps rebuilt fewer than N days ago (requires CommandLog).
   @LogToTable        nvarchar(1) = Y   Y=log to dbo.CommandLog, N=no logging.
-', 10, 1, @Version) WITH NOWAIT;
+', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'ADVANCED PARAMETERS:
   @CpuSource         varchar = QUERY_STORE  QUERY_STORE | QUICKIESTORE | NONE
@@ -730,6 +743,11 @@ DISCOVERY FILTERS:
   @MinPages, @MinForwardedPct, and @TopN are discovery-time filters. Heaps that do not
   meet these thresholds are excluded from results entirely, even in @PlanOnly mode.
   Set @MinPages=0, @MinForwardedPct=0 for a complete audit of all heaps.
+  @IncludeHealthyHeaps=1 bypasses BOTH forwarded filters (forwarded_record_count > 0
+  and @MinForwardedPct) so heaps with zero forwarded records are included. @MinPages and
+  @MaxPages still apply. Typical use: force-rebuild a known heap via @Tables. Without
+  @Tables scoping, a server-wide run with @IncludeHealthyHeaps=1 will queue every heap
+  in the instance; ranking_score collapses toward 0 so sort_order reflects little signal.
   forwarded_pct formula: forwarded_record_count / record_count * 100. The denominator
   is total rows (record_count), not pages. forwarded_record_count counts pointer stubs
   on original pages (one per forwarded row). Example: 1M rows, 50K forwarded = 5.0%%.
@@ -1267,6 +1285,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     IF @MaxPages IS NOT NULL
         SET @invocation_command += N', @MaxPages = ' + CONVERT(nvarchar(20), @MaxPages);
     SET @invocation_command += N', @MinForwardedPct = ' + CONVERT(nvarchar(10), @MinForwardedPct);
+    IF @IncludeHealthyHeaps = 1
+        SET @invocation_command += N', @IncludeHealthyHeaps = 1';
     IF @SkipWriteHeavy = 1
         SET @invocation_command += N', @SkipWriteHeavy = 1';
     IF @MinDaysSinceRebuild IS NOT NULL
@@ -2368,10 +2388,11 @@ OUTER APPLY (
     FROM sys.foreign_keys fk
     WHERE fk.referenced_object_id = ho.object_id
 ) fkr
-WHERE ips.forwarded_record_count > 0
+WHERE (@IncludeHealthyHeaps_param = 1 OR ips.forwarded_record_count > 0)
   AND ips.page_count >= @MinPages_param
   AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param)
-  AND (100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0)) >= @MinForwardedPct_param;
+  AND (@IncludeHealthyHeaps_param = 1
+       OR (100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0)) >= @MinForwardedPct_param);
 
 SET ANSI_WARNINGS ON;
 
@@ -3059,6 +3080,7 @@ END
             EXEC sys.sp_executesql
                 @discovery_sql,
                 N'@MinPages_param bigint, @MaxPages_param bigint, @MinForwardedPct_param decimal(6,2),
+                  @IncludeHealthyHeaps_param bit,
                   @LookbackDays_param integer, @TopN_param integer,
                   @AllowCiSwap_param bit, @PreferCiSwap_param bit, @Online_param bit,
                   @Maxdop_param integer, @FillFactor_param tinyint, @CpuSource_param varchar(20), @UptimeHours_param float,
@@ -3067,6 +3089,7 @@ END
                 @MinPages_param = @MinPages,
                 @MaxPages_param = @MaxPages,
                 @MinForwardedPct_param = @MinForwardedPct,
+                @IncludeHealthyHeaps_param = @IncludeHealthyHeaps,
                 @LookbackDays_param = @LookbackDays,
                 @TopN_param = @TopN,
                 @AllowCiSwap_param = @AllowCiSwap,
