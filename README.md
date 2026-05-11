@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.2
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.3
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -750,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>2026.05.11.2</Version>
+  <Version>2026.05.11.3</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -1121,7 +1121,13 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.05.11.2 *(current)*
+### v2026.05.11.3 *(current)*
+
+- **Fix:** Parallel mode workers (`@HeapsInParallel = N'Y'` not the leader) raced ahead of the leader's discovery, found an empty `dbo.QueueHeapRebuild`, and exited without claiming. Only the leader ever did work — so v2026.05.11.2 ran with multiple sessions but didn't actually parallelize. Now: the leader acquires an Exclusive `sp_getapplock` on `'sp_HeapDoctor_Discovery'` inside its leader-election transaction and holds it until the queue is populated; workers attempt a Shared lock on the same resource, which blocks behind the leader's Exclusive until release. Once the leader finishes populating, workers proceed into the consumer loop in lockstep.
+- Workers also no longer hit the "zero targets, nothing to do" early-exit in region 15 — they intentionally have an empty `#Targets` (they skipped discovery), and need to fall through to the execution loop to claim from the queue.
+- **Verified concurrent claim with 4 sessions + 50 demo heaps:** three distinct `SessionID`s on `dbo.QueueHeapRebuild` (36 + 15 + 4 = 55 rows), proving actual rebuild-time overlap across sessions.
+
+### v2026.05.11.2
 
 - **New:** `@HeapsInParallel nvarchar(1) = N'N'` — queue-based parallel rebuild (Phase A). When set to `'Y'`, sp_HeapDoctor uses Ola Hallengren's `dbo.Queue` parent table plus an auto-created `dbo.QueueHeapRebuild` child to coordinate work across multiple sessions. Run the same `EXEC` from N SQL Agent steps (or any N sessions); the first session to insert into `dbo.Queue` becomes the leader (runs discovery + populates the queue), subsequent sessions are workers (skip discovery and consume). All sessions then drain the queue concurrently via atomic `UPDATE ... OUTPUT` claims (`ROWLOCK, READPAST`) so contention skips rather than blocks.
 

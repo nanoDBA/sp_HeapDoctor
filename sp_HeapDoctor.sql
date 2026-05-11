@@ -51,9 +51,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.05.11.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.05.11.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.05.11.2 - Add @HeapsInParallel parameter (queue-based parallel rebuild - Phase A)
+History:    2026.05.11.3 - Fix parallel mode: workers now wait for leader's discovery + actually claim
+                          - Discovery applock: leader acquires Exclusive on N'sp_HeapDoctor_Discovery'
+                            inside the leader-election TRAN (before COMMIT). Workers attempt Shared
+                            (2-minute timeout); blocks until leader releases. Leader releases after
+                            INSERT INTO dbo.QueueHeapRebuild completes.
+                          - Without this gate, workers raced ahead of the leader's discovery, saw
+                            an empty queue, and exited immediately - so only the leader ever did work.
+                          - "Zero targets, nothing to do" early-exit (region 15) is now bypassed for
+                            workers (they have empty #Targets by design, since they skip discovery).
+                          - Verified with 4 concurrent sessions + 50 demo heaps: three distinct
+                            SessionIDs claimed rows (36 + 15 + 4 = 55), proving actual overlap.
+            2026.05.11.2 - Add @HeapsInParallel parameter (queue-based parallel rebuild - Phase A)
                           - Adopts Ola Hallengren's dbo.Queue parent-table pattern (same as sp_StatUpdate);
                             auto-creates child table dbo.QueueHeapRebuild on first parallel run.
                           - Multiple sessions invoking the same EXEC share a QueueID. The first session
@@ -600,7 +611,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.05.11.2';
+    DECLARE @Version nvarchar(20) = N'2026.05.11.3';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -1580,6 +1591,16 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                 SET @queue_id = CONVERT(integer, SCOPE_IDENTITY());
                 SET @parallel_is_leader = 1;
 
+                /* Acquire Discovery applock BEFORE committing dbo.Queue. This holds workers in
+                   their Shared-lock wait until the leader has finished populating the queue.
+                   Without this, workers race ahead, see an empty queue, and exit immediately. */
+                DECLARE @disc_lock_result integer;
+                EXEC @disc_lock_result = sp_getapplock
+                    @Resource    = N'sp_HeapDoctor_Discovery',
+                    @LockMode    = N'Exclusive',
+                    @LockOwner   = N'Session',
+                    @LockTimeout = 0;
+
                 DECLARE @LeaderMsg nvarchar(200) = N'  This session is the LEADER (QueueID = ' + CONVERT(nvarchar(10), @queue_id) + N'). Running discovery...';
                 RAISERROR(@LeaderMsg, 10, 1) WITH NOWAIT;
             END
@@ -1599,8 +1620,27 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
         IF @parallel_worker = 1
         BEGIN
-            DECLARE @WorkerMsg nvarchar(200) = N'  This session is a WORKER (joining QueueID = ' + CONVERT(nvarchar(10), @queue_id) + N'). Skipping discovery; consuming from queue.';
+            DECLARE @WorkerMsg nvarchar(200) = N'  This session is a WORKER (joining QueueID = ' + CONVERT(nvarchar(10), @queue_id) + N'). Waiting for leader to populate queue...';
             RAISERROR(@WorkerMsg, 10, 1) WITH NOWAIT;
+
+            /* Wait for leader's Discovery applock to release (Shared mode blocks behind Exclusive).
+               Once acquired, leader has finished populating dbo.QueueHeapRebuild. Release immediately. */
+            DECLARE @worker_wait_result integer;
+            EXEC @worker_wait_result = sp_getapplock
+                @Resource    = N'sp_HeapDoctor_Discovery',
+                @LockMode    = N'Shared',
+                @LockOwner   = N'Session',
+                @LockTimeout = 120000;  /* 2 minute cap; discovery on huge instances shouldn't exceed this */
+
+            IF @worker_wait_result >= 0
+            BEGIN
+                EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor_Discovery', @LockOwner = N'Session';
+                RAISERROR(N'  Leader finished discovery; worker starting consumer loop.', 10, 1) WITH NOWAIT;
+            END
+            ELSE
+            BEGIN
+                RAISERROR(N'  WARNING: Worker timed out waiting for leader''s Discovery applock. Proceeding with current queue state.', 10, 1) WITH NOWAIT;
+            END
         END
     END
 
@@ -3990,7 +4030,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
-    IF @TargetCount = 0
+    IF @TargetCount = 0 AND @parallel_worker = 0
     BEGIN
         RAISERROR(N'No heaps met thresholds in any database. Nothing to do.', 10, 1) WITH NOWAIT;
 
@@ -5103,6 +5143,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
         DECLARE @QueuedCountMsg nvarchar(200) = N'  Parallel mode: queued ' + CONVERT(nvarchar(10), ROWCOUNT_BIG()) + N' target(s) to dbo.QueueHeapRebuild (QueueID = ' + CONVERT(nvarchar(10), @queue_id) + N').';
         RAISERROR(@QueuedCountMsg, 10, 1) WITH NOWAIT;
+
+        /* Discovery + population complete: release the Discovery applock so any waiting workers
+           can proceed into their consumer loop. Leader continues into the consumer loop alongside them. */
+        EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor_Discovery', @LockOwner = N'Session';
     END
 
 /*#region 21-EXECUTION /* WHILE loop with rebuilds */ */
