@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.1
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -750,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>2026.05.11</Version>
+  <Version>2026.05.11.1</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -1121,7 +1121,13 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.05.11 *(current)*
+### v2026.05.11.1 *(current)*
+
+- **New:** `@ExcludeDatabases nvarchar(max) = NULL` and `@ExcludeTables nvarchar(max) = NULL` parameters. Dedicated comma-separated exclusion patterns; users no longer need to embed `-` prefixes inside `@Databases` / `@Tables`. Wildcards (`%`) and multiple comma-separated patterns are supported. NULL `@Databases` + `@ExcludeDatabases` set implies `USER_DATABASES`; NULL `@Tables` + `@ExcludeTables` set implies `%` (all tables). Example: `EXEC sp_HeapDoctor @ExcludeDatabases = N'master, model, msdb, tempdb', @ExcludeTables = N'dbo.Archive%, dbo.Staging%';`
+- Both new params are logged to `dbo.CommandLog` via `@invocation_command` so audit trails preserve the user's original (separate) input.
+- `@Help` COMMON PARAMETERS block split 3-way to fit the added params under the Linux `sqlcmd` ~970-char per-RAISERROR output truncation limit.
+
+### v2026.05.11
 
 - **New:** `@IncludeHealthyHeaps bit = 0` parameter bypasses both forwarded-record discovery filters (the implicit `forwarded_record_count > 0` check and `@MinForwardedPct`) so heaps with zero forwarded records are included in results. `@MinPages` / `@MaxPages` and all safety guards (memory-optimized, columnstore, temporal, CDC, etc.) still apply. Primary use case: force-rebuild a known heap by combining with `@Tables`, e.g. `EXEC sp_HeapDoctor @Tables = N'dbo.Orders', @IncludeHealthyHeaps = 1, @PlanOnly = 0`. Tested on SQL Server 2019, 2022, and 2025.
 - The `@invocation_command` written to CommandLog now includes `@IncludeHealthyHeaps = 1` when set, for audit traceability.

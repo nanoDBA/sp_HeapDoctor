@@ -51,9 +51,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.05.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.05.11.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.05.11 - Add @IncludeHealthyHeaps parameter
+History:    2026.05.11.1 - Add @ExcludeDatabases and @ExcludeTables parameters
+                          - Dedicated comma-separated exclusion patterns (no - prefix needed in value).
+                          - Merged into @Databases / @Tables as -<pattern> entries before parsing,
+                            so the existing recursive-CTE include/exclude parsers are reused.
+                          - NULL @Databases + @ExcludeDatabases set implies USER_DATABASES.
+                          - NULL @Tables + @ExcludeTables set implies % (all tables).
+                          - Both logged to CommandLog via @invocation_command (original user input
+                            preserved separately from the merged form).
+                          - @Help COMMON PARAMETERS RAISERROR split 3-way to fit new params under
+                            the Linux sqlcmd ~970-char per-RAISERROR output limit.
+            2026.05.11 - Add @IncludeHealthyHeaps parameter
                           - Bypasses both forwarded-record discovery filters (forwarded_record_count > 0
                             AND @MinForwardedPct) so heaps with zero forwarded records are included.
                           - @MinPages / @MaxPages and all safety guards still apply.
@@ -477,8 +487,12 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @Databases               nvarchar(max)  = NULL, /* NULL = current DB. Supports: USER_DATABASES, ALL_DATABASES, */
                                                                 /* SYSTEM_DATABASES, AVAILABILITY_GROUP_DATABASES, */
                                                                 /* wildcards (%), exclusions (-), comma-separated */
+    @ExcludeDatabases        nvarchar(max)  = NULL, /* Comma-separated DB patterns to exclude (wildcards OK; no - prefix needed). */
+                                                                /* Merged into @Databases as -<pattern> entries. If @Databases is NULL, implies USER_DATABASES. */
     @Tables                  nvarchar(max)  = NULL, /* NULL = all tables. Supports: schema.table, wildcards (%), */
                                                                 /* exclusions (-), comma-separated. Schema optional (defaults to %). */
+    @ExcludeTables           nvarchar(max)  = NULL, /* Comma-separated schema.table patterns to exclude (no - prefix needed). */
+                                                                /* Merged into @Tables as -<pattern> entries. If @Tables is NULL, implies %. */
     @LookbackDays            integer            = 7,
     @TopN                    integer            = 25, /* per database */
     @MinPages                bigint         = 1000,
@@ -568,7 +582,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.05.11';
+    DECLARE @Version nvarchar(20) = N'2026.05.11.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -600,13 +614,19 @@ COMMON PARAMETERS:
   @Databases         nvarchar(max) = NULL  NULL=current DB. USER_DATABASES, ALL_DATABASES,
                                         SYSTEM_DATABASES, AVAILABILITY_GROUP_DATABASES,
                                         wildcards (%%), exclusions (-), comma-separated.
-  @Tables            nvarchar(max) = NULL  NULL=all tables. schema.table format,
+  @ExcludeDatabases  nvarchar(max) = NULL  Patterns to exclude (no - prefix). Combines with @Databases;
+                                        implies USER_DATABASES when @Databases is NULL.
+', 10, 1, @Version) WITH NOWAIT;
+
+        RAISERROR(N'  @Tables            nvarchar(max) = NULL  NULL=all tables. schema.table format,
                                         wildcards (%%), exclusions (-), comma-separated.
                                         Schema optional (omit = any schema).
+  @ExcludeTables     nvarchar(max) = NULL  Patterns to exclude (no - prefix). Combines with @Tables;
+                                        implies all tables when @Tables is NULL.
   @PlanOnly          bit     = 1       1=print commands only, 0=execute.
   @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
   @TopN              integer     = 25      Max targets per database.
-', 10, 1, @Version) WITH NOWAIT;
+', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'  @MinPages          bigint  = 1000    Discovery filter: heaps below this page count are excluded.
   @MinForwardedPct   decimal = 2.00    Min forwarded %% (= forwarded_records / total_rows * 100).
@@ -1275,8 +1295,12 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
     /* Build reproducible invocation command for CommandLog (all non-default parameters) */
     SET @invocation_command = N'EXECUTE dbo.sp_HeapDoctor @Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N'''';
+    IF @ExcludeDatabases IS NOT NULL
+        SET @invocation_command += N', @ExcludeDatabases = N''' + REPLACE(@ExcludeDatabases, N'''', N'''''') + N'''';
     IF @Tables IS NOT NULL
         SET @invocation_command += N', @Tables = N''' + REPLACE(@Tables, N'''', N'''''') + N'''';
+    IF @ExcludeTables IS NOT NULL
+        SET @invocation_command += N', @ExcludeTables = N''' + REPLACE(@ExcludeTables, N'''', N'''''') + N'''';
     SET @invocation_command += N', @PlanOnly = ' + CONVERT(nvarchar(1), @PlanOnly);
     /* #107: Always include key filter params for historical audit (even at default values) */
     SET @invocation_command += N', @LookbackDays = ' + CONVERT(nvarchar(10), @LookbackDays);
@@ -1373,6 +1397,34 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     /* Resume mode flag (set to 1 when @ResumeRunID loads targets from CommandLog) */
     DECLARE @resume_loaded bit = 0;
     DECLARE @resume_xml xml = NULL;
+
+    /*-------------------------------------------------------------------------- */
+    /* Merge @ExcludeDatabases / @ExcludeTables into @Databases / @Tables. */
+    /* These are written AFTER @invocation_command so the audit log preserves */
+    /* the user's original (separate) param values, while the downstream */
+    /* recursive-CTE parsers (regions 07/08) see a single combined list. */
+    /*-------------------------------------------------------------------------- */
+    IF @ExcludeDatabases IS NOT NULL
+    BEGIN
+        DECLARE @ExcludeDbTail nvarchar(max) = N'';
+        SELECT @ExcludeDbTail = STRING_AGG(N', -' + LTRIM(RTRIM(value)), N'')
+        FROM STRING_SPLIT(@ExcludeDatabases, N',')
+        WHERE LTRIM(RTRIM(value)) <> N'';
+        IF @Databases IS NULL
+            SET @Databases = N'USER_DATABASES';
+        SET @Databases = @Databases + ISNULL(@ExcludeDbTail, N'');
+    END
+
+    IF @ExcludeTables IS NOT NULL
+    BEGIN
+        DECLARE @ExcludeTblTail nvarchar(max) = N'';
+        SELECT @ExcludeTblTail = STRING_AGG(N', -' + LTRIM(RTRIM(value)), N'')
+        FROM STRING_SPLIT(@ExcludeTables, N',')
+        WHERE LTRIM(RTRIM(value)) <> N'';
+        IF @Tables IS NULL
+            SET @Tables = N'%';
+        SET @Tables = @Tables + ISNULL(@ExcludeTblTail, N'');
+    END
 
 /*#endregion 06-ENVIRONMENT */
 
