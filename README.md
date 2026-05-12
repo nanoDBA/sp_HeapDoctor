@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.4
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.7
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -750,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>2026.05.11.4</Version>
+  <Version>2026.05.11.7</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -1121,7 +1121,12 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.05.11.4 *(current)*
+### v2026.05.11.7 *(current)*
+
+- **Test suite now public.** The `tests/` folder is no longer fully gitignored; the 29 `.sql` test files (`01_setup_test_data.sql` through `28_test_parallel_phase_a.sql` plus `99_*.sql`) are now in the repo. They use generic placeholders (`YourServer`, `YourPassword`) and contain no credentials, hostnames, or environment-specific identifiers. Run individually against any test SQL Server with `sqlcmd -S <host> -U <user> -P <password> -i tests/<file>.sql`. The local-only `README_TESTING.md` and shell test runner stay gitignored — they contain environment defaults.
+- **Identify the actual applock holder when the re-entrancy guard fails.** When `sp_getapplock` returns < 0 inside `sp_HeapDoctor`, the proc now queries `sys.dm_tran_locks` joined to `sys.dm_exec_sessions` to find the holder and includes that in the error message — SPID, login, program, host, status, open-transaction count, and how long the session has been idle. If the holder is sleeping with no open transaction (the common "leftover SSMS query window" case), the error message recommends `KILL <spid>;` as the resolution. Otherwise it warns the session looks active and suggests verifying before passing `@Force = 1`.
+
+### v2026.05.11.4
 
 - **Polish:** workers in parallel mode no longer emit an empty result set in SSMS or write an empty `@OutputTable`. Region 19 (the `SELECT FROM #Targets` plus `@OutputTable` INSERT) is now gated on `@parallel_worker = 0`. Workers intentionally have an empty `#Targets` (they skipped discovery), so producing output from them was just noise.
 - **Docs:** `@Help` and the parallel-mode section above now explicitly warn that a `KILL`ed worker leaves its claimed queue row stuck. Phase B will add automatic dead-worker recovery; until then, operators need to clear stale `dbo.QueueHeapRebuild` rows manually after a worker crash.

@@ -9,3 +9,8 @@
 !STYLE_GUIDE.md
 !tools/
 !tools/*.sql
+# Tests: only *.sql files (README_TESTING.md and shell scripts contain
+# environment-specific defaults like hostnames and credentials, so they
+# stay local).
+!tests/
+!tests/*.sql

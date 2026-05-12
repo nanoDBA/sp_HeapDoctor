@@ -51,9 +51,24 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.05.11.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.05.11.7 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.05.11.4 - Parallel mode polish (region 19 gate + dead-worker doc + concurrency test)
+History:    2026.05.11.7 - Two changes:
+                          1. Publish the test suite. The whitelist .gitignore now allows tests SQL
+                             files; all 29 .sql test files are visible in the public repo. They use
+                             generic placeholders (YourServer, YourPassword) and were audited for
+                             credentials, hostnames, IPs, usernames, SSH keys, and personal info.
+                             README_TESTING.md and the bash shell test stay local (they contain
+                             environment-specific defaults).
+                          2. Identify the actual applock holder when the re-entrancy guard fails.
+                             When sp_getapplock returns < 0, the proc now queries sys.dm_tran_locks
+                             joined to sys.dm_exec_sessions to find the holder and includes that in
+                             the error message: SPID, login, program, host, status, open transactions,
+                             and idle time. If the holder is sleeping with no open transaction (the
+                             common "leftover SSMS window" case), the error message recommends
+                             KILL <spid>;. Otherwise it warns the session looks active and suggests
+                             verifying before passing @Force = 1.
+            2026.05.11.4 - Parallel mode polish (region 19 gate + dead-worker doc + concurrency test)
                           - Region 19 (result-set SELECT + @OutputTable INSERT) gated on
                             @parallel_worker = 0. Workers have empty #Targets by design (they skipped
                             discovery) so they were emitting empty grids and useless @OutputTable INSERTs.
@@ -621,7 +636,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.05.11.4';
+    DECLARE @Version nvarchar(20) = N'2026.05.11.7';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -1230,7 +1245,57 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
         IF @lock_result < 0 AND @Force = 0
         BEGIN
-            RAISERROR(N'Another instance of sp_HeapDoctor is already running in this SQL Server instance. Use @Force = 1 to bypass if the previous run was KILLed, or @HeapsInParallel = ''Y'' for concurrent execution. Aborting.', 16, 1);
+            /* Diagnose who actually holds the lock so the user can decide: KILL the stale SPID, or
+               pass @Force = 1 if they know what they're doing. Common cause of a "false" error: an
+               SSMS query window that ran sp_HeapDoctor earlier is still open and idle but its session
+               (and its session-scoped applock) is still alive. The user thinks "nothing is running"
+               but SQL Server sees an open session that previously took the lock. */
+            DECLARE @holder_spid          smallint;
+            DECLARE @holder_login         sysname;
+            DECLARE @holder_program       nvarchar(128);
+            DECLARE @holder_host          nvarchar(128);
+            DECLARE @holder_status        nvarchar(30);
+            DECLARE @holder_open_txn      integer;
+            DECLARE @holder_last_req_end  datetime;
+            DECLARE @holder_idle_minutes  integer;
+            DECLARE @diag                 nvarchar(2000);
+
+            SELECT TOP (1)
+                @holder_spid         = l.request_session_id,
+                @holder_login        = s.login_name,
+                @holder_program      = s.program_name,
+                @holder_host         = s.host_name,
+                @holder_status       = s.status,
+                @holder_open_txn     = s.open_transaction_count,
+                @holder_last_req_end = s.last_request_end_time,
+                @holder_idle_minutes = DATEDIFF(MINUTE, s.last_request_end_time, SYSDATETIME())
+            FROM sys.dm_tran_locks AS l
+            JOIN sys.dm_exec_sessions AS s ON s.session_id = l.request_session_id
+            WHERE l.resource_type = N'APPLICATION'
+              AND l.resource_description LIKE N'%sp[_]HeapDoctor%'
+              AND l.request_mode    = N'X'
+              AND l.request_status  = N'GRANT';
+
+            IF @holder_spid IS NOT NULL
+            BEGIN
+                SET @diag = N'sp_HeapDoctor re-entrancy applock held by SPID ' + CONVERT(nvarchar(10), @holder_spid)
+                         + N' (login=' + ISNULL(@holder_login,   N'?')
+                         + N', program=' + ISNULL(@holder_program, N'?')
+                         + N', host='    + ISNULL(@holder_host,    N'?')
+                         + N', status='  + ISNULL(@holder_status,  N'?')
+                         + N', open_txn=' + ISNULL(CONVERT(nvarchar(10), @holder_open_txn), N'?')
+                         + N', idle_for=' + ISNULL(CONVERT(nvarchar(10), @holder_idle_minutes), N'?') + N'min'
+                         + N').';
+                IF @holder_status = N'sleeping' AND ISNULL(@holder_open_txn, 0) = 0
+                    SET @diag += N' That session is idle with no open transaction - probably a leftover SSMS window from a prior plan-only run. Resolve by: KILL ' + CONVERT(nvarchar(10), @holder_spid) + N'; (releases the applock), then re-run. Or pass @Force = 1 to bypass.';
+                ELSE
+                    SET @diag += N' That session looks active - sp_HeapDoctor may genuinely be running there. Verify before passing @Force = 1.';
+                RAISERROR(@diag, 16, 1);
+            END
+            ELSE
+            BEGIN
+                RAISERROR(N'Another instance of sp_HeapDoctor is already running in this SQL Server instance, but the holder could not be identified (insufficient permission for sys.dm_tran_locks? lock just released?). Use @Force = 1 to bypass, or @HeapsInParallel = ''Y'' for concurrent execution.', 16, 1);
+            END
             RETURN;
         END
         ELSE IF @lock_result < 0 AND @Force = 1
