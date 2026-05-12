@@ -1,6 +1,6 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.3
+**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.4
 
 Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
 
@@ -750,7 +750,7 @@ Each per-rebuild entry includes `ExtendedInfo` XML:
 
 ```xml
 <ExtendedInfo>
-  <Version>2026.05.11.3</Version>
+  <Version>2026.05.11.4</Version>
   <PageCount>12345</PageCount>
   <SizeMB>96.48</SizeMB>
   <ForwardedRecords>5000</ForwardedRecords>
@@ -1121,7 +1121,13 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.05.11.3 *(current)*
+### v2026.05.11.4 *(current)*
+
+- **Polish:** workers in parallel mode no longer emit an empty result set in SSMS or write an empty `@OutputTable`. Region 19 (the `SELECT FROM #Targets` plus `@OutputTable` INSERT) is now gated on `@parallel_worker = 0`. Workers intentionally have an empty `#Targets` (they skipped discovery), so producing output from them was just noise.
+- **Docs:** `@Help` and the parallel-mode section above now explicitly warn that a `KILL`ed worker leaves its claimed queue row stuck. Phase B will add automatic dead-worker recovery; until then, operators need to clear stale `dbo.QueueHeapRebuild` rows manually after a worker crash.
+- **Test:** new `tests/29_test_parallel_concurrency.sh` launches N concurrent `sqlcmd` processes and asserts `COUNT(DISTINCT SessionID) >= 2` on `dbo.QueueHeapRebuild`. This is the assertion that would have caught the v2026.05.11.2 leader-only regression. PASS on SQL 2019, 2022, 2025 (3 / 4 / 3 distinct workers respectively).
+
+### v2026.05.11.3
 
 - **Fix:** Parallel mode workers (`@HeapsInParallel = N'Y'` not the leader) raced ahead of the leader's discovery, found an empty `dbo.QueueHeapRebuild`, and exited without claiming. Only the leader ever did work — so v2026.05.11.2 ran with multiple sessions but didn't actually parallelize. Now: the leader acquires an Exclusive `sp_getapplock` on `'sp_HeapDoctor_Discovery'` inside its leader-election transaction and holds it until the queue is populated; workers attempt a Shared lock on the same resource, which blocks behind the leader's Exclusive until release. Once the leader finishes populating, workers proceed into the consumer loop in lockstep.
 - Workers also no longer hit the "zero targets, nothing to do" early-exit in region 15 — they intentionally have an empty `#Targets` (they skipped discovery), and need to fall through to the execution loop to claim from the queue.
@@ -1138,6 +1144,8 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
       @Execute         = N'Y',
       @HeapsInParallel = N'Y';
   ```
+
+  > **Operational warning (Phase A):** if a worker session is `KILL`ed (or its connection drops) mid-rebuild, its claimed queue row stays `TableStartTime IS NOT NULL, TableEndTime IS NULL` indefinitely. Other workers will *not* re-claim it. The forwarded records on that specific heap won't get rebuilt until you either manually clear the row (`UPDATE dbo.QueueHeapRebuild SET TableStartTime = NULL WHERE TableEndTime IS NULL AND SessionID = <dead_spid>;`) or `DROP TABLE dbo.QueueHeapRebuild` and re-run. Dead-worker recovery is on the Phase B roadmap.
 
   Phase A intentionally defers dead-worker recovery, mop-up discovery, parameter fingerprint conflict detection, and orphan-row sweep. Requires Ola's `Queue.sql` to be installed in the target database (https://ola.hallengren.com/scripts/Queue.sql). `@PlanOnly = 1` is rejected with parallel mode.
 

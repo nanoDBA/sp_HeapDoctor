@@ -51,9 +51,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.05.11.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.05.11.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.05.11.3 - Fix parallel mode: workers now wait for leader's discovery + actually claim
+History:    2026.05.11.4 - Parallel mode polish (region 19 gate + dead-worker doc + concurrency test)
+                          - Region 19 (result-set SELECT + @OutputTable INSERT) gated on
+                            @parallel_worker = 0. Workers have empty #Targets by design (they skipped
+                            discovery) so they were emitting empty grids and useless @OutputTable INSERTs.
+                          - @Help and README now explicitly warn that a KILLed worker leaves its claimed
+                            queue row stuck (TableStartTime NOT NULL, TableEndTime NULL); no other worker
+                            will re-claim it. Manual cleanup required until Phase B.
+                          - New test: tests/29_test_parallel_concurrency.sh - launches N concurrent
+                            sqlcmd processes, asserts >=2 distinct SessionIDs claimed rows. The test that
+                            would have caught the v0511.2 regression. PASS on SQL 2019/2022/2025.
+            2026.05.11.3 - Fix parallel mode: workers now wait for leader's discovery + actually claim
                           - Discovery applock: leader acquires Exclusive on N'sp_HeapDoctor_Discovery'
                             inside the leader-election TRAN (before COMMIT). Workers attempt Shared
                             (2-minute timeout); blocks until leader releases. Leader releases after
@@ -611,7 +621,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.05.11.3';
+    DECLARE @Version nvarchar(20) = N'2026.05.11.4';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -710,6 +720,9 @@ COMMON PARAMETERS:
   @HeapsInParallel   nvarchar(1) = N    Y = queue-based parallel rebuild. Run same EXEC from N
                                         sessions/Agent steps. Leader populates dbo.QueueHeapRebuild,
                                         workers consume. Requires Ola Hallengren''s dbo.Queue.
+                                        Phase A: if a worker is KILLed mid-rebuild, its claimed row
+                                        stays TableStartTime IS NOT NULL, TableEndTime IS NULL and
+                                        will NOT be retried by other workers. Manual cleanup needed.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'
@@ -4543,7 +4556,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 /*#region 19-OUTPUT /* Result set SELECT */ */
     /*-------------------------------------------------------------------------- */
     /* Output: target list + commands (single result set for INSERT...EXEC compatibility) */
+    /* Workers in parallel mode have an empty #Targets (they skipped discovery), */
+    /* so suppress both the result set and @OutputTable persistence to avoid an */
+    /* empty grid in SSMS and a useless @OutputTable INSERT. */
     /*-------------------------------------------------------------------------- */
+    IF @parallel_worker = 0
+    BEGIN
     SELECT
         @Version AS version,
         target_id,
@@ -4942,6 +4960,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RAISERROR(N'-- ================================================================', 10, 1) WITH NOWAIT;
         RAISERROR(N'-- End of generated script.', 10, 1) WITH NOWAIT;
     END
+    END /* IF @parallel_worker = 0 (skip output result set + @OutputTable for workers) */
 
 /*#endregion 19-OUTPUT */
 
