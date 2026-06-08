@@ -51,9 +51,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.05.11.7 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.06.08.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.05.11.7 - Two changes:
+History:    2026.06.08.1 - Doc clarity + advisory warnings
+                          - #181: @LockTimeoutMs documentation clarified (acquisition wait, NOT hold cap) in
+                            param comment, @Help, and RAISERROR wording. Pure doc change.
+                          - #179: @PlanCountWarnThreshold integer = 50 parameter added. Per-target advisory
+                            RAISERROR when qs_plan_count >= threshold (recompile storm risk before ALTER TABLE
+                            REBUILD invalidates cached plans). Logged to @invocation_command when non-default.
+                          - #182: Per-target NOTE during execution loop when usage_hint IN (WRITE_HEAVY,
+                            WRITE_ONLY) AND @SkipWriteHeavy = 0. Defaults unchanged. @SkipWriteHeavy = 1
+                            still excludes write-heavy heaps entirely.
+                          - #180, #183, #184: VERIFIED FALSE POSITIVE. @UpdateStatsAfterRebuild has existed
+                            since v0302e; ELSE-branch RAISERROR text was already accurate. No code change.
+            2026.05.11.7 - Two changes:
                           1. Publish the test suite. The whitelist .gitignore now allows tests SQL
                              files; all 29 .sql test files are visible in the public repo. They use
                              generic placeholders (YourServer, YourPassword) and were audited for
@@ -568,7 +579,8 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @PlanOnly                bit            = 1, /* 1 = print commands only, 0 = execute */
     @Execute                 nvarchar(1)    = NULL, /* Ola Hallengren convention: Y = execute (@PlanOnly=0), N = plan only (@PlanOnly=1) */
     @Maxdop                  integer            = NULL, /* optional MAXDOP on index ops (NULL = omit) */
-    @LockTimeoutMs           integer            = NULL, /* NULL = don't set; milliseconds for SET LOCK_TIMEOUT per rebuild */
+    @LockTimeoutMs           integer            = NULL, /* Lock ACQUISITION wait in ms (SET LOCK_TIMEOUT). Does NOT cap lock hold duration. NULL = don't set. */
+    @PlanCountWarnThreshold  integer            = 50,   /* RAISERROR advisory when target's qs_plan_count >= threshold (plan cache invalidation impact) */
     @MaxRunSeconds           integer            = NULL, /* when PlanOnly=0, stop after N seconds (NULL = no limit) */
     @ScanThrottleMs          integer            = NULL, /* NULL = no throttle; ms to WAITFOR between database scans */
 
@@ -636,7 +648,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.05.11.7';
+    DECLARE @Version nvarchar(20) = N'2026.06.08.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -700,7 +712,10 @@ COMMON PARAMETERS:
   @PreferCiSwap      bit     = 0       Prefer CI swap when safe key exists + online allowed.
   @FillFactor        tinyint = 0       Fill factor for CI swap CREATE INDEX (0=server default, 1-100).
   @Maxdop            integer     = NULL    MAXDOP on index ops (NULL=omit, 0=unlimited).
-  @LockTimeoutMs     integer     = NULL    Per-rebuild lock timeout in ms (NULL=don''t set).
+  @LockTimeoutMs     integer     = NULL    Lock ACQUISITION wait per rebuild in ms -- caps the wait to OBTAIN Sch-M, NOT how long the rebuild holds it. NULL=don''t set.
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'  @PlanCountWarnThreshold integer = 50   Warn before rebuild if target''s qs_plan_count >= N (recompile storm risk).
   @MaxRunSeconds     integer     = NULL    Stop after N seconds (NULL=no limit).
   @ScanThrottleMs    integer     = NULL    Wait ms between database scans (0-60000, NULL=off).
   @Debug             bit     = 0       Extra diagnostic output.
@@ -1469,6 +1484,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @Maxdop = ' + CONVERT(nvarchar(10), @Maxdop);
     IF @LockTimeoutMs IS NOT NULL
         SET @invocation_command += N', @LockTimeoutMs = ' + CONVERT(nvarchar(10), @LockTimeoutMs);
+    IF @PlanCountWarnThreshold <> 50
+        SET @invocation_command += N', @PlanCountWarnThreshold = ' + CONVERT(nvarchar(10), @PlanCountWarnThreshold);
     IF @MaxRunSeconds IS NOT NULL
         SET @invocation_command += N', @MaxRunSeconds = ' + CONVERT(nvarchar(10), @MaxRunSeconds);
     IF @ScanThrottleMs IS NOT NULL
@@ -5352,7 +5369,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             SET @LockPrefix = N'SET LOCK_TIMEOUT ' + CONVERT(nvarchar(20), @LockTimeoutMs) + N'; ';
             SET @LockSuffix = N' SET LOCK_TIMEOUT ' + CONVERT(nvarchar(20), @OriginalLockTimeout) + N';';
 
-            SET @Msg = N'Lock timeout: ' + CONVERT(nvarchar(20), @LockTimeoutMs) + N' ms per rebuild.';
+            SET @Msg = N'Lock acquisition timeout: ' + CONVERT(nvarchar(20), @LockTimeoutMs) + N' ms (caps wait to obtain Sch-M; hold duration = full rebuild duration).';
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         END
 
@@ -6084,6 +6101,24 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     SET @Msg = N'  WARNING: CDC-tracked table with CI swap. DDL may require capture instance recreation.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
+            END
+
+            /* #182: Write-heavy advisory - remind operator that forwarded records will recur quickly */
+            IF @cur_usage_hint IN (N'WRITE_HEAVY', N'WRITE_ONLY') AND @SkipWriteHeavy = 0
+            BEGIN
+                SET @Msg = N'  NOTE: ' + @full + N' usage_hint = ' + @cur_usage_hint
+                         + N'. Forwarded records recur fast on write-heavy heaps; rebuild ROI may be hours, not weeks. '
+                         + N'Use @SkipWriteHeavy = 1 to exclude entirely.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+
+            /* #179: Plan cache recompile storm advisory */
+            IF @cur_qs_plan_count IS NOT NULL AND @cur_qs_plan_count >= @PlanCountWarnThreshold
+            BEGIN
+                SET @Msg = N'  WARNING: ' + @full + N' has ' + CONVERT(nvarchar(10), @cur_qs_plan_count)
+                         + N' cached plan(s) in Query Store. ALTER TABLE REBUILD invalidates ALL cached plans for this table; '
+                         + N'expect a recompile spike when post-rebuild traffic resumes.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
 
             /*
