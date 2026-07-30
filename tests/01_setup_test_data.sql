@@ -85,6 +85,37 @@ END
 GO
 
 ------------------------------------------------------------------------
+-- 2b) Create dbo.Queue (Ola Hallengren pattern) - prerequisite for
+--     28_test_parallel_phase_a.sql, which requires the parent queue table
+--     to exist before @HeapsInParallel = 'Y' will run. Without it the proc
+--     correctly rejects parallel mode with a download link, which made
+--     test 28 look like a regression when it was a missing prerequisite.
+--     sp_HeapDoctor auto-creates the dbo.QueueHeapRebuild child table.
+------------------------------------------------------------------------
+IF OBJECT_ID(N'dbo.Queue', N'U') IS NULL
+BEGIN
+    RAISERROR(N'Creating dbo.Queue table (parallel-mode prerequisite)...', 10, 1) WITH NOWAIT;
+
+    CREATE TABLE dbo.Queue
+    (
+        QueueID          int IDENTITY(1,1) NOT NULL,
+        SchemaName       sysname       NOT NULL,
+        ObjectName       sysname       NOT NULL,
+        Parameters       nvarchar(max) NOT NULL,
+        QueueStartTime   datetime2(7)  NULL,
+        SessionID        smallint      NULL,
+        RequestID        int           NULL,
+        RequestStartTime datetime      NULL,
+        CONSTRAINT PK_Queue PRIMARY KEY CLUSTERED (QueueID ASC)
+    );
+END
+ELSE
+BEGIN
+    RAISERROR(N'dbo.Queue already exists, skipping creation.', 10, 1) WITH NOWAIT;
+END
+GO
+
+------------------------------------------------------------------------
 -- 3) Create test heaps
 ------------------------------------------------------------------------
 
