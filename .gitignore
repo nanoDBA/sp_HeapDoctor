@@ -3,6 +3,7 @@
 
 # Allow these files
 !.gitignore
+!.gitattributes
 !README.md
 !LICENSE
 !sp_HeapDoctor.sql
