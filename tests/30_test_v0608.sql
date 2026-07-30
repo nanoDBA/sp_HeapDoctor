@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.06.08.1: Advisory warnings + @LockTimeoutMs docs
+sp_HeapDoctor Test Harness - v2026.07.29.1: Advisory warnings + @LockTimeoutMs docs
 
 Tests:
   -- Issue #179: @PlanCountWarnThreshold parameter --
@@ -17,7 +17,7 @@ Tests:
   30H - @Help renders without error (@LockTimeoutMs + ADVANCED PARAMETERS split)
 
   -- Version --
-  30V - Version is 2026.06.08.1
+  30V - Version is 2026.07.29.1
 
 NOTE: Tests 30D, 30E, and the run-time advisory RAISERROR paths (#179 WARNING and
 #182 NOTE) fire inside the execution loop at severity 10. RAISERROR severity 10
@@ -104,7 +104,7 @@ CREATE TABLE #Results
 GO
 /*#endregion*/
 
-RAISERROR(N'=== Batch 30: v2026.06.08.1 (#179, #182, #181) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 30: v2026.07.29.1 (#179, #182, #181) ===', 10, 1) WITH NOWAIT;
 
 /*#region 30A*/
 ------------------------------------------------------------------------
@@ -337,10 +337,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver30 nvarchar(20);
 SELECT TOP (1) @ver30 = version FROM #Results;
 
-IF @ver30 = N'2026.06.08.1'
-    RAISERROR(N'  PASS 30V: Version is 2026.06.08.1.', 10, 1) WITH NOWAIT;
+IF @ver30 = N'2026.07.29.1'
+    RAISERROR(N'  PASS 30V: Version is 2026.07.29.1.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 30V: Version is %s (expected 2026.06.08.1).', 10, 1, @ver30) WITH NOWAIT;
+    RAISERROR(N'  FAIL 30V: Version is %s (expected 2026.07.29.1).', 10, 1, @ver30) WITH NOWAIT;
 GO
 /*#endregion*/
 

@@ -1126,6 +1126,13 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 - Removed the post-rebuild filtered-NCI statistics staleness warning (#186). It fired purely because a filtered index existed, contradicted the adjacent (correct) note that a rebuild leaves statistics unchanged, and recommended a table-wide `UPDATE STATISTICS ... WITH FULLSCAN` without evidence. Creating and dropping a clustered index each rebuild all rowstore nonclustered indexes, and a rowstore index create/rebuild refreshes that index's statistics by scanning all rows, so a CI swap leaves filtered statistics fresher rather than staler. Supersedes #163
 - `filtered_nci_count` is still discovered and reported; it no longer drives a runtime recommendation. No result-set columns changed
 
+### v2026.06.08.1
+
+- **`@PlanCountWarnThreshold integer = 50`** (#179). Emits a per-target advisory when a heap's `qs_plan_count` reaches the threshold, because `ALTER TABLE ... REBUILD` invalidates cached plans and a heap with many plans can trigger a recompile storm. Logged to the invocation command when non-default.
+- **Write-heavy NOTE during execution** (#182). When a target's `usage_hint` is `WRITE_HEAVY` or `WRITE_ONLY` and `@SkipWriteHeavy = 0`, the execution loop now says so per target. Defaults are unchanged; `@SkipWriteHeavy = 1` still excludes those heaps entirely.
+- **`@LockTimeoutMs` documentation corrected** (#181). It is a *lock acquisition wait*, not a cap on how long the rebuild holds its locks. Clarified in the parameter comment, `@Help`, and the runtime message. Documentation only.
+- **#180, #183, #184 closed as `stale-source`.** All three reported that the post-rebuild statistics message was factually wrong and that `@UpdateStatsAfterRebuild` did not exist. Both claims were true of an older snapshot only: the parameter has existed since v1.0.2026.0302e and the message had already been corrected. No code change. (The *filtered-index* branch of that same message was a separate, still-live defect — see #186 in v2026.07.29.1.)
+
 ### v2026.05.11.7
 
 - **Test suite now public.** The `tests/` folder is no longer fully gitignored; the 29 `.sql` test files (`01_setup_test_data.sql` through `28_test_parallel_phase_a.sql` plus `99_*.sql`) are now in the repo. They use generic placeholders (`YourServer`, `YourPassword`) and contain no credentials, hostnames, or environment-specific identifiers. Run individually against any test SQL Server with `sqlcmd -S <host> -U <user> -P <password> -i tests/<file>.sql`. The local-only `README_TESTING.md` and shell test runner stay gitignored — they contain environment defaults.
