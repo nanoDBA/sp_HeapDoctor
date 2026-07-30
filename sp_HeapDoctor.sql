@@ -51,9 +51,31 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.06.08.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.29.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.06.08.1 - Doc clarity + advisory warnings
+History:    2026.07.29.1 - #186: Remove causal filtered-statistics warning after heap rebuild
+                          - Removed the post-rebuild filtered-NCI staleness WARNING. Its only trigger was
+                            "heap has >= 1 filtered NCI AND @UpdateStatsAfterRebuild = 0" -- an existence
+                            check carrying no staleness signal -- and it contradicted the adjacent #93 note
+                            (which correctly states a rebuild leaves statistics unchanged) in the same run.
+                          - Documented engine behavior: creating and dropping a clustered index each rebuild
+                            ALL rowstore NCIs, and a rowstore index create/rebuild updates that index's
+                            statistics by scanning all rows (FULLSCAN-equivalent). A CI swap therefore leaves
+                            filtered NCI statistics FRESHER, not staler. On the ALTER TABLE REBUILD paths the
+                            NCIs are either rebuilt (same refresh) or untouched (#93's contract holds), so the
+                            causal claim is false either way.
+                          - filtered_nci_count is still discovered and still populated; it simply no longer
+                            drives a runtime recommendation. No result-set columns changed.
+                          - Supersedes #163, which expanded this warning to all rebuild paths on the premise
+                            #93 had already disproven. Distinct from #180/#183/#184, which concerned the
+                            general branch and were closed as stale-source.
+                          - New test file: 31_test_v0729.sql (9 tests). New fixture dbo.HeapFiltered
+                            (2 filtered NCIs) in 01_setup_test_data.sql -- no prior fixture had a
+                            filtered index, so this branch had never been exercised by a test.
+                          - Verified cross-version: SQL 2019 (15.0 CU32-GDR) 9/9, SQL 2022 (16.0 CU26)
+                            9/9 + 35/35 regression (test 02), SQL 2025 (17.0 CU7) 9/9 + 35/35.
+                            Confirmed in stdout that no rebuild emits a filtered-statistics claim.
+            2026.06.08.1 - Doc clarity + advisory warnings
                           - #181: @LockTimeoutMs documentation clarified (acquisition wait, NOT hold cap) in
                             param comment, @Help, and RAISERROR wording. Pure doc change.
                           - #179: @PlanCountWarnThreshold integer = 50 parameter added. Per-target advisory
@@ -648,7 +670,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.06.08.1';
+    DECLARE @Version nvarchar(20) = N'2026.07.29.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -2902,7 +2924,10 @@ NciCounts AS
 ),
 FilteredNciCounts AS
 (
-    /* #99: Count filtered NCIs per object for stale-stats warning */
+    /*
+    #99/#186: Count filtered NCIs per object. Informational discovery column only.
+    This must NOT drive a post-rebuild statistics recommendation -- see #186.
+    */
     SELECT object_id, CONVERT(integer, COUNT_BIG(*)) AS filtered_nci_count
     FROM sys.indexes
     WHERE type = 2
@@ -5321,7 +5346,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_nci_disabled     bit,     /* #129: NCI disabled TOCTOU check */
             @cur_has_fk_references bit,    /* #130: FK child stats after CI swap */
             @cur_fk_ref_count     integer,         /* #130: FK ref count for stats update */
-            @cur_filtered_nci_count integer,        /* #99: filtered NCI count */
+            @cur_filtered_nci_count integer,        /* #99/#186: filtered NCI count. Populated but not read since #186 removed the false staleness warning; retained for a future measured advisory. Do not delete as 'unused'. */
             @versioning_sql         nvarchar(max),
             @versioning_log_id      integer,       /* #141: CommandLog breadcrumb for temporal versioning */
             @has_paused_op          bit,
@@ -6466,19 +6491,17 @@ DEALLOCATE fk_child_cursor;';
                 END
 
                 /*
-                #99: Filtered NCI warning after CI swap.
-                Filtered NCI statistics are especially prone to staleness because their small
-                row counts make auto-statistics updates infrequent. Warn when @UpdateStatsAfterRebuild=0.
+                #186: The post-rebuild filtered-NCI staleness WARNING was removed here.
+                Do NOT reintroduce it. A rebuild does not make filtered index statistics stale:
+                creating and dropping a clustered index each rebuild all rowstore NCIs, and a
+                rowstore index create/rebuild updates that index's statistics by scanning all
+                rows. On ALTER TABLE REBUILD the NCIs are either rebuilt the same way or left
+                untouched, in which case the #93 note above already states the correct contract.
+                filtered_nci_count remains available as a discovery column. Any future filtered
+                statistics advisory must be driven by a measured signal (for example
+                sys.dm_db_stats_properties modification_counter / last_updated), never by the
+                mere existence of a filtered index. History: #99 -> #163 -> #186.
                 */
-                IF @cur_filtered_nci_count > 0
-                   AND @UpdateStatsAfterRebuild = 0
-                BEGIN
-                    SET @Msg = N'  WARNING: ' + @full + N' has '
-                             + CONVERT(nvarchar(10), @cur_filtered_nci_count)
-                             + N' filtered NCI(s). Filtered index statistics are prone to staleness after rebuild.'
-                             + N' Consider @UpdateStatsAfterRebuild=1 for tables with filtered indexes.';
-                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-                END
 
                 /* XE observability: rebuild succeeded with key metrics */
                 BEGIN TRY

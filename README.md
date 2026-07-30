@@ -1121,7 +1121,12 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.05.11.7 *(current)*
+### v2026.07.29.1 *(current)*
+
+- Removed the post-rebuild filtered-NCI statistics staleness warning (#186). It fired purely because a filtered index existed, contradicted the adjacent (correct) note that a rebuild leaves statistics unchanged, and recommended a table-wide `UPDATE STATISTICS ... WITH FULLSCAN` without evidence. Creating and dropping a clustered index each rebuild all rowstore nonclustered indexes, and a rowstore index create/rebuild refreshes that index's statistics by scanning all rows, so a CI swap leaves filtered statistics fresher rather than staler. Supersedes #163
+- `filtered_nci_count` is still discovered and reported; it no longer drives a runtime recommendation. No result-set columns changed
+
+### v2026.05.11.7
 
 - **Test suite now public.** The `tests/` folder is no longer fully gitignored; the 29 `.sql` test files (`01_setup_test_data.sql` through `28_test_parallel_phase_a.sql` plus `99_*.sql`) are now in the repo. They use generic placeholders (`YourServer`, `YourPassword`) and contain no credentials, hostnames, or environment-specific identifiers. Run individually against any test SQL Server with `sqlcmd -S <host> -U <user> -P <password> -i tests/<file>.sql`. The local-only `README_TESTING.md` and shell test runner stay gitignored — they contain environment defaults.
 - **Identify the actual applock holder when the re-entrancy guard fails.** When `sp_getapplock` returns < 0 inside `sp_HeapDoctor`, the proc now queries `sys.dm_tran_locks` joined to `sys.dm_exec_sessions` to find the holder and includes that in the error message — SPID, login, program, host, status, open-transaction count, and how long the session has been idle. If the holder is sleeping with no open transaction (the common "leftover SSMS query window" case), the error message recommends `KILL <spid>;` as the resolution. Otherwise it warns the session looks active and suggests verifying before passing `@Force = 1`.

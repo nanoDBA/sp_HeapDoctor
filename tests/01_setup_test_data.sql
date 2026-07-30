@@ -230,6 +230,48 @@ UPDATE dbo.HeapF
 SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000)
 WHERE ID <= 15000;
 
+-- HeapFiltered: heap with FILTERED NCIs (#186 regression fixture)
+-- No other fixture has a filtered index, so the filtered-NCI code path was
+-- never exercised before this. Filtered index creation requires these SET
+-- options; sqlcmd defaults are not guaranteed, so set them explicitly.
+RAISERROR(N'Creating dbo.HeapFiltered (heap with filtered NCIs)...', 10, 1) WITH NOWAIT;
+SET ANSI_NULLS ON;
+SET ANSI_PADDING ON;
+SET ANSI_WARNINGS ON;
+SET ARITHABORT ON;
+SET CONCAT_NULL_YIELDS_NULL ON;
+SET NUMERIC_ROUNDABORT OFF;
+SET QUOTED_IDENTIFIER ON;
+
+CREATE TABLE dbo.HeapFiltered
+(
+    ID       int           NOT NULL,
+    Status   varchar(20)   NOT NULL,
+    Padding  varchar(4000) NOT NULL,
+    MoreData varchar(4000) NULL
+);
+
+-- Two filtered NCIs, so filtered_nci_count is > 1 (catches an off-by-one
+-- that a single filtered index would hide).
+CREATE NONCLUSTERED INDEX IX_HeapFiltered_Pending
+    ON dbo.HeapFiltered(ID) WHERE Status = 'PENDING';
+CREATE NONCLUSTERED INDEX IX_HeapFiltered_Failed
+    ON dbo.HeapFiltered(ID) WHERE Status = 'FAILED';
+
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapFiltered (ID, Status, Padding, MoreData)
+SELECT TOP (20000)
+       n,
+       CASE n % 3 WHEN 0 THEN 'PENDING' WHEN 1 THEN 'FAILED' ELSE 'DONE' END,
+       REPLICATE('G', 10),
+       NULL
+FROM N;
+
+-- Grow rows in place so they migrate off-page and leave forwarded records
+UPDATE dbo.HeapFiltered
+SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000)
+WHERE ID <= 15000;
+
 -- HeapTemporal: system-versioned temporal heap (should be EXCLUDED from discovery)
 RAISERROR(N'Creating dbo.HeapTemporal (temporal table, should be excluded)...', 10, 1) WITH NOWAIT;
 CREATE TABLE dbo.HeapTemporal
@@ -265,6 +307,7 @@ BEGIN
     SELECT @sink = COUNT(*) FROM dbo.HeapC WHERE Padding LIKE '%X%';
     SELECT @sink = COUNT(*) FROM dbo.HeapE WHERE Padding LIKE '%X%';
     SELECT @sink = COUNT(*) FROM dbo.HeapF WHERE Padding LIKE '%X%';
+    SELECT @sink = COUNT(*) FROM dbo.HeapFiltered WHERE Padding LIKE '%X%';
     SET @iter += 1;
 END
 
