@@ -51,9 +51,31 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.29.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.29.1 - #186: Remove causal filtered-statistics warning after heap rebuild
+History:    2026.07.30.1 - #188: Fix post-rebuild row count validation (false data-loss warning)
+                          - The check compared the discovery-time record_count from
+                            dm_db_index_physical_stats against a post-rebuild count taken in
+                            HARDCODED 'SAMPLED' mode, ignoring @ScanMode. Both sides were
+                            extrapolations from a sample of pages, and a rebuild changes page
+                            density by design, so the estimates diverged routinely. Result: a
+                            false "Investigate potential data loss" WARNING after essentially
+                            every successful rebuild, on SQL 2019/2022/2025.
+                          - Both counts now come from sys.dm_db_partition_stats.row_count via one
+                            shared query, captured immediately before and after the rebuild.
+                            Maintained metadata: no scan, no sampling, identical methodology on
+                            both sides, so a difference means rows actually changed.
+                            index_id IN (0,1) covers the heap and the transient clustered form
+                            during a CI swap.
+                          - Tolerance dropped from (1% + 10 rows) to exact, now that both sides
+                            are exact. Severity reduced WARNING -> NOTE and the wording no longer
+                            asserts data loss: an ONLINE rebuild permits concurrent DML, so a
+                            delta is reported factually with its sign for the operator to judge.
+                          - Not fixed here: @ScanMode = 'LIMITED' remains broken independently -
+                            discovery fails with error 515 because LIMITED returns NULL for
+                            forwarded_record_count while #Heaps declares it NOT NULL.
+                          - New test file: 32_test_v0730.sql
+            2026.07.29.1 - #186: Remove causal filtered-statistics warning after heap rebuild
                           - Removed the post-rebuild filtered-NCI staleness WARNING. Its only trigger was
                             "heap has >= 1 filtered NCI AND @UpdateStatsAfterRebuild = 0" -- an existence
                             check carrying no staleness signal -- and it contradicted the adjacent #93 note
@@ -670,7 +692,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.07.29.1';
+    DECLARE @Version nvarchar(20) = N'2026.07.30.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -5320,6 +5342,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @verify_sql          nvarchar(max),
             @post_fwd_count      bigint,
             @post_row_count      bigint, /* #73: row count validation */
+            @pre_row_count       bigint, /* #188: pre-rebuild count, same source as @post_row_count */
+            @rowcount_sql        nvarchar(max), /* #188: shared row-count probe */
             @ci_drop_failed      bit,
             @cur_index_name      sysname,
             /* QS performance snapshot (per-target, from #Targets) */
@@ -6239,6 +6263,37 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /*
+            #188: Capture the pre-rebuild row count from sys.dm_db_partition_stats,
+            the same source used for the post-rebuild count below.
+
+            The previous implementation compared the discovery-time record_count
+            from dm_db_index_physical_stats against a post-rebuild count taken in
+            hardcoded SAMPLED mode. Both sides were extrapolations from a sample of
+            pages, and a rebuild changes page density by design, so the two
+            estimates diverged routinely -- producing a false "potential data loss"
+            warning after essentially every successful rebuild.
+
+            partition_stats.row_count is maintained metadata: no scan, no sampling,
+            and identical methodology on both sides, so a difference now means rows
+            actually changed. index_id IN (0, 1) covers the heap and the transient
+            clustered form during a CI swap.
+            */
+            SET @rowcount_sql = N'SELECT @rows_out = SUM(ps.row_count)
+                FROM ' + QUOTENAME(@db) + N'.sys.dm_db_partition_stats AS ps
+                WHERE ps.object_id = OBJECT_ID(@full_param)
+                AND   ps.index_id IN (0, 1);';
+
+            SET @pre_row_count = NULL;
+            BEGIN TRY
+                EXEC sys.sp_executesql @rowcount_sql,
+                    N'@full_param nvarchar(512), @rows_out bigint OUTPUT',
+                    @full_param = @full, @rows_out = @pre_row_count OUTPUT;
+            END TRY
+            BEGIN CATCH
+                SET @pre_row_count = NULL; /* probe failed; validation is skipped below */
+            END CATCH
+
+            /*
             Execute the main command (with lock timeout prefix/suffix)
             */
             SET @exec_cmd = @LockPrefix + @cmd + @LockSuffix;
@@ -6378,31 +6433,75 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END
                 END
 
-                /* #73: Row count validation after rebuild (detect data loss) */
-                IF @ci_drop_failed = 0 AND @cur_record_count IS NOT NULL
+                /*
+                #73/#188: Row count validation after rebuild.
+
+                Both counts come from sys.dm_db_partition_stats, captured with the
+                same query immediately before and after the rebuild, so the
+                comparison is exact rather than estimate-versus-estimate. Any
+                difference therefore reflects real row changes.
+
+                An ONLINE rebuild permits concurrent DML, so a difference is not by
+                itself evidence of loss -- the message states what changed and lets
+                the operator judge, rather than asserting data loss.
+                */
+                IF @ci_drop_failed = 0 AND @pre_row_count IS NOT NULL
                 BEGIN
+                    SET @post_row_count = NULL;
                     BEGIN TRY
-                        SET @verify_sql = N'SELECT @rows_out = SUM(record_count)
-                            FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, ''SAMPLED'')
-                            WHERE index_id = 0;';
-                        SET @post_row_count = NULL;
-                        EXEC sys.sp_executesql @verify_sql,
-                            N'@db_param sysname, @full_param nvarchar(512), @rows_out bigint OUTPUT',
-                            @db_param = @db, @full_param = @full, @rows_out = @post_row_count OUTPUT;
+                        EXEC sys.sp_executesql @rowcount_sql,
+                            N'@full_param nvarchar(512), @rows_out bigint OUTPUT',
+                            @full_param = @full, @rows_out = @post_row_count OUTPUT;
                     END TRY
                     BEGIN CATCH
-                        SET @post_row_count = NULL;
+                        SET @post_row_count = NULL; /* verification failed, don't block */
                     END CATCH
 
-                    IF @post_row_count IS NOT NULL
-                       AND ABS(@post_row_count - @cur_record_count) > (@cur_record_count * 0.01 + 10)
+                    IF @post_row_count IS NULL
                     BEGIN
-                        SET @Msg = N'  WARNING: Row count changed from '
-                            + CONVERT(nvarchar(20), @cur_record_count) + N' to '
-                            + CONVERT(nvarchar(20), @post_row_count) + N' on ' + @full
-                            + N'. Investigate potential data loss or concurrent DML.';
+                        /*
+                        Do not fail silently. A NULL post-count means the probe could
+                        not resolve the object, so validation did not happen -- which
+                        must not be mistaken for "no change detected".
+                        */
+                        SET @Msg = N'  NOTE: Row count validation SKIPPED on ' + @full
+                                 + N' (post-rebuild row count probe returned no value).';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
+                    ELSE IF @post_row_count <> @pre_row_count
+                    BEGIN
+                        /*
+                        The explanation depends on the rebuild mode. An ONLINE rebuild
+                        permits concurrent DML, so a delta is usually benign. An OFFLINE
+                        rebuild holds Sch-M for its duration, so no other session could
+                        have changed the row count -- there a delta is exactly the
+                        condition #73 exists to catch, and must not be explained away.
+                        */
+                        SET @Msg = CASE WHEN @action LIKE N'%ONLINE%'
+                                        THEN N'  NOTE: ' ELSE N'  WARNING: ' END
+                            + N'Row count changed from '
+                            + CONVERT(nvarchar(20), @pre_row_count) + N' to '
+                            + CONVERT(nvarchar(20), @post_row_count) + N' on ' + @full
+                            + N' during the rebuild (delta '
+                            + CASE WHEN @post_row_count >= @pre_row_count THEN N'+' ELSE N'' END
+                            + CONVERT(nvarchar(20), @post_row_count - @pre_row_count) + N').'
+                            + CASE WHEN @action LIKE N'%ONLINE%'
+                                   THEN N' An ONLINE rebuild permits concurrent DML, which is the'
+                                      + N' usual explanation; investigate only if this table was'
+                                      + N' expected to be quiescent.'
+                                   ELSE N' This was an OFFLINE rebuild holding a Sch-M lock, so no'
+                                      + N' other session could modify the table during it.'
+                                      + N' Investigate.'
+                              END;
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END
+                END
+                ELSE IF @ci_drop_failed = 0 AND @pre_row_count IS NULL
+                BEGIN
+                    /* Same reasoning as above, for a pre-rebuild probe that yielded nothing. */
+                    SET @Msg = N'  NOTE: Row count validation SKIPPED on ' + @full
+                             + N' (pre-rebuild row count probe returned no value).';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
 
                 /* #19/#91: Post-rebuild statistics handling */

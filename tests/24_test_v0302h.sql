@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.29.1: Batch H output features
+sp_HeapDoctor Test Harness - v2026.07.30.1: Batch H output features
 
 Tests:
   -- Issue #16: @OutputTable --
@@ -14,7 +14,7 @@ Tests:
   24G - @GenerateScript in invocation_command
 
   -- Version --
-  24V - Version is 2026.07.29.1
+  24V - Version is 2026.07.30.1
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 24_test_v0302i.sql
@@ -88,7 +88,7 @@ CREATE TABLE #Results
 );
 GO
 
-RAISERROR(N'=== Batch 24: v2026.07.29.1 (#16, #23) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 24: v2026.07.30.1 (#16, #23) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- Setup: clean up any prior test output table
@@ -287,10 +287,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver24 nvarchar(20);
 SELECT TOP 1 @ver24 = version FROM #Results;
 
-IF @ver24 = N'2026.07.29.1'
-    RAISERROR(N'  PASS 24V: Version is 2026.07.29.1.', 10, 1) WITH NOWAIT;
+IF @ver24 = N'2026.07.30.1'
+    RAISERROR(N'  PASS 24V: Version is 2026.07.30.1.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 24V: Version is %s (expected 2026.07.29.1).', 10, 1, @ver24) WITH NOWAIT;
+    RAISERROR(N'  FAIL 24V: Version is %s (expected 2026.07.30.1).', 10, 1, @ver24) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------
