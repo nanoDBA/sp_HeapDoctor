@@ -51,9 +51,25 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.31.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.30.1 - #188: Fix post-rebuild row count validation (false data-loss warning)
+History:    2026.07.31.1 - #194: Fix QUICKIESTORE - #Quickie DDL selected from a proc, not a TVF
+                          - The #Quickie builder read result-set metadata via
+                            sys.sp_describe_first_result_set, which is a STORED PROCEDURE and
+                            cannot appear in a FROM clause. Every run with
+                            @CpuSource = 'QUICKIESTORE' therefore died with
+                            Msg 208 - Invalid object name 'sys.sp_describe_first_result_set'.
+                            One of the two documented CPU sources was entirely non-functional.
+                          - Now uses the table-valued sys.dm_exec_describe_first_result_set.
+                          - Why it survived: the only QUICKIESTORE test asserts that OMITTING
+                            @QuickieExecSql is rejected, so the builder was never reached. New
+                            test 33C supplies a stub @QuickieExecSql shaped like sp_QuickieStore
+                            output, reaching the builder without installing sp_QuickieStore.
+                          - Failure reporting improved: metadata rows are materialised so a
+                            batch that cannot be described reports the underlying reason (which
+                            names the missing object) instead of only "returned no columns".
+                          - New test file: 33_test_v0731.sql
+            2026.07.30.1 - #188: Fix post-rebuild row count validation (false data-loss warning)
                           - The check compared the discovery-time record_count from
                             dm_db_index_physical_stats against a post-rebuild count taken in
                             HARDCODED 'SAMPLED' mode, ignoring @ScanMode. Both sides were
@@ -692,7 +708,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.07.30.1';
+    DECLARE @Version nvarchar(20) = N'2026.07.31.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -3639,23 +3655,64 @@ END
         DECLARE @ddl nvarchar(max) = N'CREATE TABLE #Quickie(';
         DECLARE @ColCount integer = 0;
 
-        ;WITH meta AS
+        /*
+        #194: sys.sp_describe_first_result_set is a STORED PROCEDURE and cannot be
+        selected FROM. The SELECT-able form is the table-valued function
+        sys.dm_exec_describe_first_result_set. The previous name made every
+        QUICKIESTORE run fail outright with:
+            Msg 208 - Invalid object name 'sys.sp_describe_first_result_set'.
+        It went unnoticed because the only QUICKIESTORE test asserts that OMITTING
+        @QuickieExecSql is rejected, so this builder was never reached.
+
+        Metadata rows are materialised first so the failure path can report WHY
+        the batch could not be described -- "returned no columns" alone does not
+        tell the operator that, say, sp_QuickieStore is not installed.
+        */
+        IF OBJECT_ID('tempdb..#QuickieMeta') IS NOT NULL DROP TABLE #QuickieMeta;
+
+        CREATE TABLE #QuickieMeta
         (
-            SELECT column_ordinal, name, system_type_name, is_nullable, error_number
-            FROM sys.sp_describe_first_result_set(@QuickieExecSql, NULL, 0)
-        )
+            column_ordinal   integer        NULL,
+            name             sysname        NULL,
+            system_type_name nvarchar(256)  NULL,
+            is_nullable      bit            NULL,
+            error_number     integer        NULL,
+            error_message    nvarchar(max)  NULL
+        );
+
+        BEGIN TRY
+            INSERT INTO #QuickieMeta WITH (TABLOCK)
+                (column_ordinal, name, system_type_name, is_nullable, error_number, error_message)
+            SELECT column_ordinal, name, system_type_name, is_nullable, error_number, error_message
+            FROM sys.dm_exec_describe_first_result_set(@QuickieExecSql, NULL, 0);
+        END TRY
+        BEGIN CATCH
+            SET @Msg = N'Could not describe @QuickieExecSql: ' + LEFT(ERROR_MESSAGE(), 800);
+            RAISERROR(@Msg, 16, 1);
+            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            RETURN;
+        END CATCH
+
         SELECT
             @ddl = @ddl + QUOTENAME(name) + N' ' + system_type_name + N' ' +
                    CASE WHEN is_nullable = 1 THEN N'NULL' ELSE N'NOT NULL' END + N',' + CHAR(10),
             @ColCount = @ColCount + 1
-        FROM meta
+        FROM #QuickieMeta
         WHERE error_number IS NULL
           AND name IS NOT NULL
         ORDER BY column_ordinal;
 
         IF @ColCount = 0
         BEGIN
-            RAISERROR(N'sp_describe_first_result_set returned no columns for @QuickieExecSql. Cannot proceed.', 16, 1);
+            /* Surface the describe error itself -- it names the missing object. */
+            DECLARE @QuickieMetaErr nvarchar(max) =
+                (SELECT TOP (1) error_message FROM #QuickieMeta
+                 WHERE error_number IS NOT NULL ORDER BY column_ordinal);
+
+            SET @Msg = N'Could not determine the result shape of @QuickieExecSql, so #Quickie cannot be built.'
+                     + ISNULL(N' Reason: ' + LEFT(@QuickieMetaErr, 800), N'')
+                     + N' Check that @QuickieExecSql runs standalone and that sp_QuickieStore is installed.';
+            RAISERROR(@Msg, 16, 1);
             IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
