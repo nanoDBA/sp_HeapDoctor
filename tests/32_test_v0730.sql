@@ -10,6 +10,7 @@ Tests:
   32E - SAMPLED record_count is NOT reliable - characterises why the old source was wrong
   32F - Rebuild with @ScanMode = DETAILED succeeds
   32H - No-loss rebuild leaves row count unchanged, so the message cannot fire
+  32I - TRUE POSITIVE: a genuine 1-row change during the rebuild IS detected
 
   NOT COVERED: @ScanMode = LIMITED. That mode is independently broken -- discovery
   fails with error 515 because dm_db_index_physical_stats returns NULL for
@@ -336,6 +337,84 @@ BEGIN
         + N' post=' + CONVERT(nvarchar(20), @post32h) + N'.';
     RAISERROR(@m32h, 10, 1) WITH NOWAIT;
 END
+GO
+/*#endregion*/
+
+/*#region 32I*/
+------------------------------------------------------------------------
+-- 32I: #188 - TRUE POSITIVE. A genuine row-count change during the rebuild
+-- must be detected.
+--
+-- This was long believed to need a second session issuing concurrent DML,
+-- which would be racy against a sub-second rebuild. It does not: a DDL
+-- trigger on ALTER_TABLE fires INSIDE the rebuild statement, in the same
+-- session and transaction, and can modify the very table being altered.
+-- That makes the delta deterministic -- no timing window at all.
+--
+-- Note the magnitude: a ONE row change. The old 1% + 10 row tolerance would
+-- have missed this entirely; the exact comparison catches it.
+--
+-- The message itself is RAISERROR severity 10 and cannot be captured in
+-- T-SQL, so this asserts the CONDITION the proc evaluates (post <> pre, by
+-- exactly the injected amount) plus a successful rebuild. The cross-version
+-- harness greps stdout for "Row count changed" to confirm emission.
+------------------------------------------------------------------------
+RAISERROR(N'Test 32I: genuine row-count change is detected (#188)...', 10, 1) WITH NOWAIT;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.triggers WHERE name = 'trg_hd32i_inject' AND parent_class = 1)
+    DROP TRIGGER trg_hd32i_inject ON DATABASE;
+GO
+/* QUOTED_IDENTIFIER must be ON at CREATE time: the trigger uses an XML data
+   type method, and a module captures that option at creation, not at fire time. */
+SET QUOTED_IDENTIFIER ON;
+GO
+CREATE TRIGGER trg_hd32i_inject ON DATABASE FOR ALTER_TABLE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]','sysname') = N'HeapF'
+        INSERT dbo.HeapF (ID, Padding, MoreData) VALUES (987654, REPLICATE('Z',10), NULL);
+END
+GO
+
+SET QUOTED_IDENTIFIER ON;
+DECLARE @pre32i bigint, @post32i bigint, @found32i integer, @succ32i integer;
+
+SELECT @pre32i = SUM(ps.row_count)
+FROM sys.dm_db_partition_stats AS ps
+WHERE ps.object_id = OBJECT_ID(N'dbo.HeapF')
+AND   ps.index_id IN (0, 1);
+
+EXEC dbo.sp_HeapDoctor
+    @Databases    = N'HeapDoctorTest',
+    @Tables       = N'dbo.HeapF',
+    @CpuSource    = N'NONE',
+    @PlanOnly     = 0,
+    @TargetsFound = @found32i OUTPUT,
+    @Succeeded    = @succ32i  OUTPUT;
+
+SELECT @post32i = SUM(ps.row_count)
+FROM sys.dm_db_partition_stats AS ps
+WHERE ps.object_id = OBJECT_ID(N'dbo.HeapF')
+AND   ps.index_id IN (0, 1);
+
+IF @found32i >= 1 AND @succ32i >= 1 AND @post32i = @pre32i + 1
+    RAISERROR(N'  PASS 32I: injector changed the row count by 1 during the rebuild; the proc''s comparison detects it.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @m32i nvarchar(400) = N'  FAIL 32I: targets='
+        + ISNULL(CONVERT(nvarchar(10), @found32i), N'NULL') + N' succeeded='
+        + ISNULL(CONVERT(nvarchar(10), @succ32i), N'NULL')
+        + N' pre=' + ISNULL(CONVERT(nvarchar(20), @pre32i), N'NULL')
+        + N' post=' + ISNULL(CONVERT(nvarchar(20), @post32i), N'NULL')
+        + N' (expected post = pre + 1).';
+    RAISERROR(@m32i, 10, 1) WITH NOWAIT;
+END
+GO
+
+IF EXISTS (SELECT 1 FROM sys.triggers WHERE name = 'trg_hd32i_inject' AND parent_class = 1)
+    DROP TRIGGER trg_hd32i_inject ON DATABASE;
 GO
 /*#endregion*/
 
