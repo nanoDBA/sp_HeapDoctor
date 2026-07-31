@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.1: Post-rebuild row count validation (#188)
+sp_HeapDoctor Test Harness - v2026.07.31.2: Post-rebuild row count validation (#188)
 
 Tests:
   -- Issue #188: row count validation compared SAMPLED estimates --
@@ -12,13 +12,12 @@ Tests:
   32H - No-loss rebuild leaves row count unchanged, so the message cannot fire
   32I - TRUE POSITIVE: a genuine 1-row change during the rebuild IS detected
 
-  NOT COVERED: @ScanMode = LIMITED. That mode is independently broken -- discovery
-  fails with error 515 because dm_db_index_physical_stats returns NULL for
-  forwarded_record_count in LIMITED mode while #Heaps declares it NOT NULL. Tracked
-  separately; #188 does not fix it.
+  NOT COVERED HERE: @ScanMode = LIMITED. That mode is now rejected at validation
+  (#189) because it cannot see forwarded records at all, so there is no LIMITED
+  rebuild path left to test. See 34_test_v0731b.sql.
 
   -- Version --
-  32V - Version is 2026.07.31.1
+  32V - Version is 2026.07.31.2
 
 NOTE: the row-count warning fires via RAISERROR at severity 10, which goes only
 to the client message stream and cannot be captured by INSERT...EXEC. Its
@@ -46,7 +45,7 @@ SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 /*#endregion*/
 
-RAISERROR(N'=== Batch 32: v2026.07.31.1 (#188 row count validation) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 32: v2026.07.31.2 (#188 row count validation) ===', 10, 1) WITH NOWAIT;
 
 /*#region 32A*/
 ------------------------------------------------------------------------
@@ -376,10 +375,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver32 nvarchar(20);
 SELECT TOP (1) @ver32 = version FROM #Results;
 
-IF @ver32 = N'2026.07.31.1'
-    RAISERROR(N'  PASS 32V: Version is 2026.07.31.1.', 10, 1) WITH NOWAIT;
+IF @ver32 = N'2026.07.31.2'
+    RAISERROR(N'  PASS 32V: Version is 2026.07.31.2.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 32V: Version is %s (expected 2026.07.31.1).', 10, 1, @ver32) WITH NOWAIT;
+    RAISERROR(N'  FAIL 32V: Version is %s (expected 2026.07.31.2).', 10, 1, @ver32) WITH NOWAIT;
 GO
 /*#endregion*/
 

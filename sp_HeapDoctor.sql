@@ -51,9 +51,25 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.31.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.31.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.31.1 - #194: Fix QUICKIESTORE - #Quickie DDL selected from a proc, not a TVF
+History:    2026.07.31.2 - #189: Reject @ScanMode = 'LIMITED' instead of failing inside discovery
+                          - LIMITED passed validation and then failed with error 515 (NOT NULL
+                            violation on #Heaps.forwarded_record_count), surfacing as a
+                            per-database scan error plus an empty target list -- easy to misread
+                            as "no heaps qualify". The parameter was effectively unusable.
+                          - Verified directly: in LIMITED mode dm_db_index_physical_stats returns
+                            NULL for record_count, forwarded_record_count, ghost_record_count and
+                            avg_page_space_used_in_percent; only page_count and
+                            avg_fragmentation_in_percent are populated. This procedure ranks heaps
+                            BY forwarded records, so LIMITED cannot serve its purpose. Supporting
+                            it would mean a page/fragmentation-only ranking -- a different tool.
+                          - Now rejected at validation with a message naming the reason. @Help and
+                            the parameter comment no longer offer it; the unreachable banner branch
+                            is removed.
+                          - Unblocks #188, whose LIMITED acceptance criterion was unreachable.
+                          - New test file: 34_test_v0731b.sql
+            2026.07.31.1 - #194: Fix QUICKIESTORE - #Quickie DDL selected from a proc, not a TVF
                           - The #Quickie builder read result-set metadata via
                             sys.sp_describe_first_result_set, which is a STORED PROCEDURE and
                             cannot appear in a FROM clause. Every run with
@@ -655,7 +671,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @Debug                   bit            = 0,
 
     /* Discovery scan */
-    @ScanMode                nvarchar(20)   = N'SAMPLED', /* #135: dm_db_index_physical_stats mode (SAMPLED/DETAILED/LIMITED) */
+    @ScanMode                nvarchar(20)   = N'SAMPLED', /* #135/#189: dm_db_index_physical_stats mode (SAMPLED/DETAILED; LIMITED cannot see forwarded records) */
 
     /* Throughput estimation */
     @EstimateTime            bit            = 0, /* 1 = show estimated rebuild time per target */
@@ -708,7 +724,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.07.31.1';
+    DECLARE @Version nvarchar(20) = N'2026.07.31.2';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -782,7 +798,7 @@ COMMON PARAMETERS:
   @ScanMode          nvarchar(20) = N''SAMPLED'' Discovery scan mode for dm_db_index_physical_stats.
                                         SAMPLED: ~1%% of pages (fast, may miss recent fragmentation).
                                         DETAILED: all pages (accurate, slower on large databases).
-                                        LIMITED: allocation pages only (fastest, coarse fragmentation).
+                                        LIMITED is NOT supported: it cannot see forwarded records (#189).
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays integer  = 90      CommandLog history window for throughput rates.
 ', 10, 1) WITH NOWAIT;
@@ -1169,9 +1185,23 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
     /* #135: @ScanMode validation */
     SET @ScanMode = UPPER(LTRIM(RTRIM(@ScanMode)));
-    IF @ScanMode NOT IN (N'SAMPLED', N'DETAILED', N'LIMITED')
+    /*
+    #189: LIMITED is deliberately NOT accepted. sys.dm_db_index_physical_stats
+    in LIMITED mode reads allocation pages only and returns NULL for
+    record_count, forwarded_record_count, ghost_record_count and
+    avg_page_space_used_in_percent -- verified directly, only page_count and
+    avg_fragmentation_in_percent are populated. This procedure exists to rank
+    heaps BY forwarded records, so LIMITED cannot serve its purpose.
+
+    Previously LIMITED passed validation and then failed deep inside discovery
+    with error 515 (NOT NULL violation inserting forwarded_record_count into
+    #Heaps), which surfaced as a per-database scan error and an empty target
+    list -- easy to misread as "no heaps qualify". Rejecting up front, with the
+    reason, is the honest behaviour.
+    */
+    IF @ScanMode NOT IN (N'SAMPLED', N'DETAILED')
     BEGIN
-        RAISERROR(N'@ScanMode must be SAMPLED, DETAILED, or LIMITED.', 16, 1);
+        RAISERROR(N'@ScanMode must be SAMPLED or DETAILED. LIMITED is not supported: in LIMITED mode dm_db_index_physical_stats returns NULL for forwarded_record_count, record_count, ghost_record_count and avg_page_space_used_in_percent, so the forwarded records this procedure exists to find are invisible. Use SAMPLED (default, fast, estimates) or DETAILED (exact, slower).', 16, 1);
         RETURN;
     END
 
@@ -1607,7 +1637,6 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
              + CASE @ScanMode
                    WHEN N'SAMPLED' THEN N' (forwarded record counts are estimates)'
                    WHEN N'DETAILED' THEN N' (accurate counts, slower scan)'
-                   WHEN N'LIMITED' THEN N' (allocation pages only, coarse fragmentation)'
                    ELSE N'' END;
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
