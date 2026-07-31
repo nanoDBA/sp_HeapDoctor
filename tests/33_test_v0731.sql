@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.3: QUICKIESTORE DDL builder (#194)
+sp_HeapDoctor Test Harness - v2026.07.31.4: QUICKIESTORE DDL builder (#194)
 
 Tests:
   -- Issue #194: #Quickie DDL builder used a proc name as a TVF --
@@ -9,7 +9,7 @@ Tests:
   33D - An unresolvable @QuickieExecSql reports the underlying reason, naming it
 
   -- Version --
-  33V - Version is 2026.07.31.3
+  33V - Version is 2026.07.31.4
 
 WHY 33C EXISTS: the only prior QUICKIESTORE coverage (4C) asserts that OMITTING
 @QuickieExecSql raises a validation error, so it never reached the DDL builder.
@@ -26,7 +26,7 @@ SET QUOTED_IDENTIFIER ON;
 USE [HeapDoctorTest];
 GO
 
-RAISERROR(N'=== Batch 33: v2026.07.31.3 (#194 QUICKIESTORE DDL builder) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 33: v2026.07.31.4 (#194 QUICKIESTORE DDL builder) ===', 10, 1) WITH NOWAIT;
 
 /*#region 33A*/
 ------------------------------------------------------------------------
@@ -153,10 +153,10 @@ EXEC master.sys.sp_executesql
       FROM sys.sql_modules WHERE object_id = OBJECT_ID(N''dbo.sp_HeapDoctor'');',
     N'@v nvarchar(20) OUTPUT', @v = @ver33 OUTPUT;
 
-IF @ver33 LIKE N'%2026.07.31.3%'
-    RAISERROR(N'  PASS 33V: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
+IF @ver33 LIKE N'%2026.07.31.4%'
+    RAISERROR(N'  PASS 33V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 33V: Version is %s (expected 2026.07.31.3).', 10, 1, @ver33) WITH NOWAIT;
+    RAISERROR(N'  FAIL 33V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver33) WITH NOWAIT;
 GO
 /*#endregion*/
 

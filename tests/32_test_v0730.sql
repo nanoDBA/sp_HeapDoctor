@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.3: Post-rebuild row count validation (#188)
+sp_HeapDoctor Test Harness - v2026.07.31.4: Post-rebuild row count validation (#188)
 
 Tests:
   -- Issue #188: row count validation compared SAMPLED estimates --
@@ -17,7 +17,7 @@ Tests:
   rebuild path left to test. See 34_test_v0731b.sql.
 
   -- Version --
-  32V - Version is 2026.07.31.3
+  32V - Version is 2026.07.31.4
 
 NOTE: the row-count warning fires via RAISERROR at severity 10, which goes only
 to the client message stream and cannot be captured by INSERT...EXEC. Its
@@ -45,7 +45,7 @@ SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 /*#endregion*/
 
-RAISERROR(N'=== Batch 32: v2026.07.31.3 (#188 row count validation) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 32: v2026.07.31.4 (#188 row count validation) ===', 10, 1) WITH NOWAIT;
 
 /*#region 32A*/
 ------------------------------------------------------------------------
@@ -375,10 +375,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver32 nvarchar(20);
 SELECT TOP (1) @ver32 = version FROM #Results;
 
-IF @ver32 = N'2026.07.31.3'
-    RAISERROR(N'  PASS 32V: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
+IF @ver32 = N'2026.07.31.4'
+    RAISERROR(N'  PASS 32V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 32V: Version is %s (expected 2026.07.31.3).', 10, 1, @ver32) WITH NOWAIT;
+    RAISERROR(N'  FAIL 32V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver32) WITH NOWAIT;
 GO
 /*#endregion*/
 

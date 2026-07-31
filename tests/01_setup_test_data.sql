@@ -189,6 +189,7 @@ CREATE TABLE dbo.ResultsTemplate
     est_ci_swap_overhead_mb decimal(18,2)  NULL,
     est_log_mb              decimal(18,2)  NULL,
     days_since_last_rebuild integer        NULL,
+    warning_severity        varchar(16)    NULL,
     sqlserver_start_time    datetime       NULL,
     uptime_hours            decimal(10,1)  NULL,
     page_io_latch_wait_count bigint        NULL,
@@ -393,6 +394,45 @@ FROM N;
 UPDATE dbo.HeapFiltered
 SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000)
 WHERE ID <= 15000;
+
+-- #185 severity-tier fixtures.
+--
+-- Every other heap here defaults to LOCK_ESCALATION = TABLE, which is itself a
+-- structural signal -- so they ALL qualify and cannot isolate anything. These two
+-- use LOCK_ESCALATION = AUTO to remove that signal:
+--
+--   HeapPlainAuto  - no structural signal at all      -> expect NONE
+--   HeapCiSwapAuto - unique NCI, so the CI swap path  -> expect CAUTIONARY
+--
+RAISERROR(N'Creating dbo.HeapPlainAuto / dbo.HeapCiSwapAuto (#185 tier fixtures)...', 10, 1) WITH NOWAIT;
+
+CREATE TABLE dbo.HeapPlainAuto
+(
+    ID       int           NOT NULL,
+    Padding  varchar(4000) NOT NULL,
+    MoreData varchar(4000) NULL
+);
+ALTER TABLE dbo.HeapPlainAuto SET (LOCK_ESCALATION = AUTO);
+
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapPlainAuto (ID, Padding, MoreData)
+SELECT TOP (20000) n, REPLICATE('P', 10), NULL FROM N;
+UPDATE dbo.HeapPlainAuto SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
+
+CREATE TABLE dbo.HeapCiSwapAuto
+(
+    ID       int           NOT NULL,
+    Padding  varchar(4000) NOT NULL,
+    MoreData varchar(4000) NULL
+);
+ALTER TABLE dbo.HeapCiSwapAuto SET (LOCK_ESCALATION = AUTO);
+/* a unique, non-nullable NC index makes this a CI swap candidate */
+CREATE UNIQUE NONCLUSTERED INDEX UX_HeapCiSwapAuto_ID ON dbo.HeapCiSwapAuto(ID);
+
+;WITH N AS (SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) FROM sys.all_objects)
+INSERT dbo.HeapCiSwapAuto (ID, Padding, MoreData)
+SELECT TOP (20000) n, REPLICATE('C', 10), NULL FROM N;
+UPDATE dbo.HeapCiSwapAuto SET Padding = REPLICATE('X', 3000), MoreData = REPLICATE('Y', 3000) WHERE ID <= 15000;
 
 -- HeapTemporal: system-versioned temporal heap (should be EXCLUDED from discovery)
 RAISERROR(N'Creating dbo.HeapTemporal (temporal table, should be excluded)...', 10, 1) WITH NOWAIT;

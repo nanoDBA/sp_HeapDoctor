@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.3: Batch G discovery
+sp_HeapDoctor Test Harness - v2026.07.31.4: Batch G discovery
 
 Tests:
   -- Issue #22: IO latch wait stats --
@@ -16,7 +16,7 @@ Tests:
   23I - Baseline populates est_pages_per_sec on targets
 
   -- Version --
-  23V - Version is 2026.07.31.3
+  23V - Version is 2026.07.31.4
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 23_test_v0302i.sql
@@ -32,7 +32,7 @@ IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
 SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
-RAISERROR(N'=== Batch 23: v2026.07.31.3 (#22, #88) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 23: v2026.07.31.4 (#22, #88) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 23A: #22 - page_io_latch_wait_count column exists in result set
@@ -253,10 +253,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver23 nvarchar(20);
 SELECT TOP 1 @ver23 = version FROM #Results;
 
-IF @ver23 = N'2026.07.31.3'
-    RAISERROR(N'  PASS 23V: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
+IF @ver23 = N'2026.07.31.4'
+    RAISERROR(N'  PASS 23V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 23V: Version is %s (expected 2026.07.31.3).', 10, 1, @ver23) WITH NOWAIT;
+    RAISERROR(N'  FAIL 23V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver23) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

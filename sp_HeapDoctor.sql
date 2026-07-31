@@ -51,9 +51,32 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.31.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.31.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.31.3 - #187: Durable per-target disposition stream
+History:    2026.07.31.4 - #185: Structural churn signals decide whether to warn; footprint scales it
+                          - The first warning boundary was footprint-centric: a heap inside a
+                            fragile plan ecosystem or a lock-sensitive concurrency surface stayed
+                            silent purely because it was small. Size tells you what a rebuild
+                            COSTS, not whether the chosen action intersects something delicate.
+                          - New warning_severity column: NONE | INFORMATIONAL | CAUTIONARY | SEVERE,
+                            decided in ONE place after projections. A structural signal floors the
+                            tier at CAUTIONARY; footprint (>1024 MB size, log, or CI-swap overhead)
+                            escalates to SEVERE but can never de-escalate.
+                          - Qualifying signals, any one sufficient: forced plans, Query Store plan
+                            breadth >= @PlanCountWarnThreshold, lock escalation = TABLE, or the CI
+                            swap path. Replication/CDC deliberately excluded -- it keeps its own
+                            warnings. Live lock exposure is runtime-only and escalates there.
+                          - has_forced_plans is now carried onto #Targets. It was computed in
+                            discovery solely to gate CI swap and never reached the target list, so
+                            half the plan-fragility signal was invisible downstream. Defaults to 0
+                            on the resume path, whose XML predates the column.
+                          - New per-target advisory naming the reason. All advisories stay at
+                            RAISERROR severity 10: severity 16 turns an advisory into a
+                            batch-aborting error that TRY/CATCH swallows and Agent steps fail on.
+                          - New test file: 36_test_v0731d.sql, plus HeapPlainAuto / HeapCiSwapAuto
+                            fixtures with LOCK_ESCALATION = AUTO. Every other fixture defaults to
+                            TABLE, which is itself a signal, so none of them can isolate anything.
+            2026.07.31.3 - #187: Durable per-target disposition stream
                           - New CommandType 'HEAP_TARGET_EVENT': one durable event per disposed
                             target, keyed by RunID + TargetId at a FIXED ExtendedInfo path in
                             every row, with branch-specific facts confined under <Detail>.
@@ -748,7 +771,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.07.31.3';
+    DECLARE @Version nvarchar(20) = N'2026.07.31.4';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -2279,6 +2302,14 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         est_space_savings_mb     decimal(18,2)  NULL,
         est_ci_swap_overhead_mb  decimal(18,2)  NULL,
         est_log_mb               decimal(18,2)  NULL,
+        /* #185: advisory severity tier. Structural signals decide WHETHER to warn;
+           footprint only decides HOW LOUDLY. See the single decision below. */
+        warning_severity         varchar(16)    NULL,
+        /* #185: forced plans are a structural churn signal. Computed in discovery
+           (it also gates CI swap there) and now carried through so the severity
+           decision can see it. Defaults to 0 on the resume path, whose XML
+           predates this column. */
+        has_forced_plans         bit            NOT NULL DEFAULT 0,
         days_since_last_rebuild  integer            NULL,
         sort_order               integer            NOT NULL DEFAULT 0,
         /* Obfuscation: pseudo_ columns hold pseudonyms when @ObfuscateKey is provided. */
@@ -3147,7 +3178,8 @@ INSERT INTO #Targets
     action_chosen, command_text, ci_drop_command,
     qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
     qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count, qs_query_hashes,
-    usage_hint, ranking_score, verify_command
+    usage_hint, ranking_score, verify_command,
+    has_forced_plans   /* #185 */
 )
 SELECT TOP (@TopN_param)
     DB_NAME(),
@@ -3258,7 +3290,8 @@ SELECT TOP (@TopN_param)
     r.usage_hint,
     r.ranking_score,
     /* 8O: Verification command for change management */
-    N''SELECT forwarded_record_count FROM sys.dm_db_index_physical_stats(DB_ID(N'''''' + QUOTENAME(DB_NAME()) + N''''''), OBJECT_ID(N'''''' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) + N''''''), 0, NULL, N''''SAMPLED'''');''
+    N''SELECT forwarded_record_count FROM sys.dm_db_index_physical_stats(DB_ID(N'''''' + QUOTENAME(DB_NAME()) + N''''''), OBJECT_ID(N'''''' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) + N''''''), 0, NULL, N''''SAMPLED'''');'',
+    r.has_forced_plans   /* #185 */
 FROM Ranked r
 ORDER BY r.target_rank;
 
@@ -4587,6 +4620,58 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         WHERE d.recovery_model_desc = N'FULL';
     END
 
+    /*
+    #185: decide the advisory severity tier for every target, in ONE place.
+
+    The old boundary was footprint-centric: a heap sitting inside a fragile plan
+    ecosystem or a lock-sensitive concurrency surface stayed silent purely because
+    it was small. Size tells you what a rebuild COSTS; it does not tell you whether
+    the chosen action intersects something delicate.
+
+    So structural signals decide WHETHER to warn, and footprint decides HOW LOUDLY:
+
+        structural signal present                      -> CAUTIONARY (floor)
+        structural signal present + large footprint    -> SEVERE
+        large footprint only, no structural signal     -> INFORMATIONAL
+        neither                                        -> NONE
+
+    Footprint can escalate but never de-escalate: a structural signal is never
+    merely informational, however small the heap.
+
+    Qualifying structural signals, any one sufficient on its own:
+      - plan-ecosystem fragility: forced plans, or Query Store plan breadth at or
+        above @PlanCountWarnThreshold (a rebuild invalidates cached plans)
+      - concurrency surface: lock escalation set to TABLE
+      - the CI swap path was chosen (two NCI rebuilds, tempdb sort space, Sch-M at
+        both ends, and a failure mode that leaves the table clustered)
+
+    Replication/CDC is deliberately NOT a qualifying signal; it keeps its own
+    dedicated warnings. Live lock exposure is a runtime signal from the pre-flight
+    lock check and cannot be known here, so it escalates at execution time instead.
+    */
+    UPDATE #Targets
+    SET warning_severity =
+        CASE
+            WHEN (has_forced_plans = 1
+                  OR (qs_plan_count IS NOT NULL AND qs_plan_count >= @PlanCountWarnThreshold)
+                  OR lock_escalation = 0   /* 0 = TABLE */
+                  OR action_chosen = 'CI_SWAP_ONLINE')
+                 AND (ISNULL(size_mb, 0) > 1024
+                      OR ISNULL(est_log_mb, 0) > 1024
+                      OR ISNULL(est_ci_swap_overhead_mb, 0) > 1024)
+                THEN 'SEVERE'
+            WHEN has_forced_plans = 1
+                 OR (qs_plan_count IS NOT NULL AND qs_plan_count >= @PlanCountWarnThreshold)
+                 OR lock_escalation = 0   /* 0 = TABLE */
+                 OR action_chosen = 'CI_SWAP_ONLINE'
+                THEN 'CAUTIONARY'
+            WHEN ISNULL(size_mb, 0) > 1024
+                 OR ISNULL(est_log_mb, 0) > 1024
+                 OR ISNULL(est_ci_swap_overhead_mb, 0) > 1024
+                THEN 'INFORMATIONAL'
+            ELSE 'NONE'
+        END;
+
     /* Churn detection: warn about heaps rebuilt 5+ times in 90 days */
     IF EXISTS (SELECT 1 FROM #Targets WHERE rebuilds_in_90d >= 5)
     BEGIN
@@ -4859,6 +4944,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         est_ci_swap_overhead_mb,
         est_log_mb,
         days_since_last_rebuild,
+        warning_severity,   /* #185: NONE | INFORMATIONAL | CAUTIONARY | SEVERE */
         @SqlServerStartTime AS sqlserver_start_time,
         CONVERT(decimal(10,1), @UptimeHours) AS uptime_hours,
         page_io_latch_wait_count,
@@ -5486,7 +5572,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_nci_disabled     bit,     /* #129: NCI disabled TOCTOU check */
             @cur_has_fk_references bit,    /* #130: FK child stats after CI swap */
             @cur_fk_ref_count     integer,         /* #130: FK ref count for stats update */
-            @cur_filtered_nci_count integer,        /* #99/#186: filtered NCI count. Populated but not read since #186 removed the false staleness warning; retained for a future measured advisory. Do not delete as 'unused'. */
+            @cur_filtered_nci_count integer,       /* #99/#186: filtered NCI count. Populated but not read since #186 removed the false staleness warning; retained for a future measured advisory. Do not delete as 'unused'. */
+            @cur_warning_severity   varchar(16),   /* #185: advisory tier for this target */
+            @cur_has_forced_plans   bit,           /* #185: structural churn signal */
             @versioning_sql         nvarchar(max),
             @versioning_log_id      integer,       /* #141: CommandLog breadcrumb for temporal versioning */
             @has_paused_op          bit,
@@ -5725,6 +5813,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 @cur_qs_query_count    = qs_query_count,
                 @cur_qs_query_hashes   = qs_query_hashes,
                 @cur_usage_hint        = usage_hint,
+                @cur_warning_severity  = warning_severity,   /* #185 */
+                @cur_has_forced_plans  = has_forced_plans,   /* #185 */
                 @cur_ranking_score     = ranking_score,
                 @cur_replication_hint  = replication_hint,
                 @cur_lock_escalation   = lock_escalation,
@@ -6186,6 +6276,47 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             BEGIN
                 SET @Msg = N'  WARNING: Active bulk insert detected on ' + @full
                          + N'. Rebuild will block until bulk operation completes.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+
+            /*
+            #185: structural churn advisory.
+
+            This is the warning the old footprint-centric boundary could not
+            produce: it fires because the target is operationally delicate, not
+            because it is big. Footprint only decides how loudly -- see the
+            single tier decision in the projections region.
+
+            Reported at RAISERROR severity 10 like every other advisory. Severity
+            16 would turn an advisory into a batch-aborting error that TRY/CATCH
+            can swallow and that fails SQL Agent steps.
+            */
+            IF @cur_warning_severity IS NOT NULL AND @cur_warning_severity <> 'NONE'
+            BEGIN
+                DECLARE @ws_reason nvarchar(400) = N'';
+
+                IF @cur_has_forced_plans = 1
+                    SET @ws_reason += N'forced plans; ';
+                IF @cur_qs_plan_count IS NOT NULL AND @cur_qs_plan_count >= @PlanCountWarnThreshold
+                    SET @ws_reason += N'Query Store plan breadth ('
+                                    + CONVERT(nvarchar(10), @cur_qs_plan_count) + N' plans); ';
+                IF @cur_lock_escalation = 0   /* 0 = TABLE */
+                    SET @ws_reason += N'lock escalation is TABLE; ';
+                IF @action = N'CI_SWAP_ONLINE'
+                    SET @ws_reason += N'CI swap path; ';
+
+                SET @Msg = N'  '
+                    + CASE @cur_warning_severity
+                           WHEN 'SEVERE'      THEN N'CRITICAL'
+                           WHEN 'CAUTIONARY'  THEN N'WARNING'
+                           ELSE N'NOTE' END
+                    + N' [' + @cur_warning_severity + N']: ' + @full
+                    + CASE WHEN LEN(@ws_reason) > 0
+                           THEN N' is operationally delicate -- ' + LEFT(@ws_reason, LEN(@ws_reason) - 1)
+                           ELSE N' has a large footprint' END
+                    + CASE WHEN @cur_warning_severity = 'SEVERE'
+                           THEN N'. Footprint raises this to SEVERE.'
+                           ELSE N'.' END;
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
 

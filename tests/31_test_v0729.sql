@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.3: Remove causal filtered-statistics warning (#186)
+sp_HeapDoctor Test Harness - v2026.07.31.4: Remove causal filtered-statistics warning (#186)
 
 Tests:
   -- Issue #186: filtered-NCI staleness warning removed --
@@ -13,7 +13,7 @@ Tests:
   31H - Reintroduction guard: removed operator-facing message text stays absent
 
   -- Version --
-  31V - Version is 2026.07.31.3
+  31V - Version is 2026.07.31.4
 
 NOTE: The removed WARNING fired via RAISERROR at severity 10 inside the execution
 loop. Severity 10 output goes only to the client message stream and cannot be
@@ -45,7 +45,7 @@ SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 /*#endregion*/
 
-RAISERROR(N'=== Batch 31: v2026.07.31.3 (#186 filtered-statistics warning removal) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 31: v2026.07.31.4 (#186 filtered-statistics warning removal) ===', 10, 1) WITH NOWAIT;
 
 /*#region 31A*/
 ------------------------------------------------------------------------
@@ -308,10 +308,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver31 nvarchar(20);
 SELECT TOP (1) @ver31 = version FROM #Results;
 
-IF @ver31 = N'2026.07.31.3'
-    RAISERROR(N'  PASS 31V: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
+IF @ver31 = N'2026.07.31.4'
+    RAISERROR(N'  PASS 31V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 31V: Version is %s (expected 2026.07.31.3).', 10, 1, @ver31) WITH NOWAIT;
+    RAISERROR(N'  FAIL 31V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver31) WITH NOWAIT;
 GO
 /*#endregion*/
 

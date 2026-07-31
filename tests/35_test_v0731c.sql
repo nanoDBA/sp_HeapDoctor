@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.3: per-target disposition stream (#187)
+sp_HeapDoctor Test Harness - v2026.07.31.4: per-target disposition stream (#187)
 
 Tests:
   35A - HEAP_TARGET_EVENT rows are written for a run
@@ -12,7 +12,7 @@ Tests:
   35H - HEAP_REBUILD_END is still written (remains the authoritative summary)
 
   -- Version --
-  35V - Version is 2026.07.31.3
+  35V - Version is 2026.07.31.4
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -U sa -P YourPassword -d HeapDoctorTest -i 35_test_v0731c.sql
@@ -23,7 +23,7 @@ SET QUOTED_IDENTIFIER ON;
 USE [HeapDoctorTest];
 GO
 
-RAISERROR(N'=== Batch 35: v2026.07.31.3 (#187 target disposition stream) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 35: v2026.07.31.4 (#187 target disposition stream) ===', 10, 1) WITH NOWAIT;
 
 /*#region 35A*/
 RAISERROR(N'Test 35A: HEAP_TARGET_EVENT rows written (#187)...', 10, 1) WITH NOWAIT;
@@ -295,10 +295,10 @@ EXEC dbo.sp_HeapDoctor @Databases = N'HeapDoctorTest', @CpuSource = N'NONE', @Pl
 DECLARE @ver35 nvarchar(20);
 SELECT TOP (1) @ver35 = version FROM #Results;
 
-IF @ver35 = N'2026.07.31.3'
-    RAISERROR(N'  PASS 35V: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
+IF @ver35 = N'2026.07.31.4'
+    RAISERROR(N'  PASS 35V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 35V: Version is %s (expected 2026.07.31.3).', 10, 1, @ver35) WITH NOWAIT;
+    RAISERROR(N'  FAIL 35V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver35) WITH NOWAIT;
 
 IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
 GO

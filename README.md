@@ -530,6 +530,30 @@ The target list result set (returned in both plan-only and execute modes) contai
 | `heap_compression` | varchar(4) | Data compression on the heap: `NONE`, `ROW`, or `PAGE`.  Preserved during rebuild |
 | `replication_hint` | varchar(20) | Replication status: `PUBLISHED`, `MERGE_PUBLISHED`, `CDC`, combinations, or NULL.  CDC + CI swap warns about capture instance |
 | `lock_escalation` | varchar(10) | Lock escalation setting: `TABLE`, `AUTO`, or `DISABLE`.  `TABLE` warns for online rebuilds |
+| `warning_severity` | varchar(16) | How delicate this rebuild is: `NONE`, `INFORMATIONAL`, `CAUTIONARY`, or `SEVERE`.  See below |
+
+#### `warning_severity`
+
+Triage which targets deserve a maintenance window rather than reading every warning line.
+
+A target is **structurally delicate** if any of these hold: forced Query Store plans, plan
+breadth at or above `@PlanCountWarnThreshold`, `lock_escalation = TABLE`, or a chosen action
+of `CI_SWAP_ONLINE`.  Any one of them floors the target at `CAUTIONARY`.
+
+**Footprint escalates, but never de-escalates.**  A large footprint (`size_mb`, `est_log_mb`,
+or `est_ci_swap_overhead_mb` above 1024 MB) raises a structurally delicate target to `SEVERE`.
+A large footprint on its own — no structural signal — is only `INFORMATIONAL`, because size
+alone makes a rebuild slow, not risky.
+
+| Value | Meaning |
+|-------|---------|
+| `NONE` | No structural signal, ordinary footprint |
+| `INFORMATIONAL` | Large, but structurally unremarkable.  Expect a long rebuild |
+| `CAUTIONARY` | Structurally delicate.  Review before running unattended |
+| `SEVERE` | Structurally delicate *and* large.  Strongest candidate for a maintenance window |
+
+This is advisory only: it never changes which targets are selected, how they are ranked, or
+which action is chosen.
 
 ### Trending (from CommandLog history)
 
