@@ -22,66 +22,8 @@ GO
 -- Reusable capture table (matches first result set of sp_HeapDoctor)
 ------------------------------------------------------------------------
 IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
-CREATE TABLE #Results
-(
-    version                nvarchar(20)  NULL,
-    target_id              int           NOT NULL,
-    sort_order             int           NOT NULL,
-    database_name          sysname       NOT NULL,
-    schema_name            sysname       NOT NULL,
-    table_name             sysname       NOT NULL,
-    page_count             bigint        NOT NULL,
-    record_count           bigint        NULL,
-    forwarded_record_count bigint        NOT NULL,
-    forwarded_pct          decimal(6,2)  NOT NULL,
-    forwarded_fetch_count  bigint        NULL,
-    avg_page_space_pct     decimal(5,2)  NULL,
-    avg_frag_pct           decimal(5,2)  NULL,
-    ghost_record_count     bigint        NULL,
-    total_cpu_ms           bigint        NULL,
-    ranking_basis          varchar(20)   NOT NULL,
-    nci_count              int           NOT NULL,
-    key_source_index       sysname       NULL,
-    action_chosen          varchar(32)   NOT NULL,
-    est_pages_per_sec      float         NULL,
-    est_seconds            int           NULL,
-    est_duration           nvarchar(20)  NULL,
-    qs_snapshot_time_utc   datetime2(3)  NULL,
-    qs_total_logical_reads bigint        NULL,
-    qs_total_physical_reads bigint       NULL,
-    qs_total_duration_ms   bigint        NULL,
-    qs_total_executions    bigint        NULL,
-    qs_plan_count          int           NULL,
-    qs_query_count         int           NULL,
-    usage_hint             varchar(30)   NULL,
-    ranking_score          decimal(8,4)  NULL,
-    ranking_algo_version   nvarchar(10)  NULL,
-    heap_compression       varchar(4)    NULL,
-    replication_hint       varchar(20)   NULL,
-    lock_escalation        varchar(10)   NULL,
-    partition_count        int           NULL,
-    has_schema_bound_views int           NULL,
-    has_indexed_views      int           NULL,
-    has_fk_references      int           NULL,
-    fk_ref_count           int           NULL,
-    filegroup_name         sysname       NULL,
-    command_text           nvarchar(max) NULL,
-    ci_drop_command        nvarchar(max) NULL,
-    verify_command         nvarchar(max) NULL,
-    prev_forwarded_pct     decimal(6,2)  NULL,
-    rebuilds_in_90d        int           NULL,
-    size_mb                decimal(18,2) NULL,
-    est_space_savings_mb   decimal(18,2) NULL,
-    est_ci_swap_overhead_mb decimal(18,2) NULL,
-    est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL,
-    sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL,
-    page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL,
-    is_temporal_history    bit           NULL,
-    recommended_action     nvarchar(50)  NULL
-);
+/* #190: the column list lives once, in dbo.ResultsTemplate (see 01_setup_test_data.sql) */
+SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
 ------------------------------------------------------------------------
@@ -139,13 +81,13 @@ EXEC dbo.sp_HeapDoctor
 IF NOT EXISTS (SELECT 1 FROM #Results WHERE table_name = 'HeapTemporal')
     RAISERROR(N'  PASS 5A-1: HeapTemporal correctly excluded (temporal_type = 1).', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 5A-1: HeapTemporal should not appear (temporal table).', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5A-1: HeapTemporal should not appear (temporal table).', 10, 1) WITH NOWAIT;
 
 -- 5A-2: HeapTemporalHistory should NOT appear (temporal_type = 2 for history table)
 IF NOT EXISTS (SELECT 1 FROM #Results WHERE table_name = 'HeapTemporalHistory')
     RAISERROR(N'  PASS 5A-2: HeapTemporalHistory correctly excluded (history table).', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 5A-2: HeapTemporalHistory should not appear.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5A-2: HeapTemporalHistory should not appear.', 10, 1) WITH NOWAIT;
 
 -- 5A-3: Non-temporal heaps should still appear
 DECLARE @5a_count int = (SELECT COUNT(*) FROM #Results WHERE table_name IN ('HeapA','HeapB','HeapC'));
@@ -153,7 +95,7 @@ IF @5a_count = 3
     RAISERROR(N'  PASS 5A-3: Non-temporal heaps (A, B, C) still discovered.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5a_msg nvarchar(200) = N'  *** FAIL 5A-3: Expected 3 non-temporal heaps, found ' + CAST(@5a_count AS nvarchar(10));
+    DECLARE @5a_msg nvarchar(200) = N'  FAIL 5A-3: Expected 3 non-temporal heaps, found ' + CAST(@5a_count AS nvarchar(10));
     RAISERROR(@5a_msg, 10, 1) WITH NOWAIT;
 END
 GO
@@ -171,10 +113,10 @@ DECLARE @5b_heape_comp varchar(4) = (SELECT heap_compression FROM #Results WHERE
 IF @5b_heape_comp = 'PAGE'
     RAISERROR(N'  PASS 5B-1: HeapE heap_compression = PAGE.', 10, 1) WITH NOWAIT;
 ELSE IF @5b_heape_comp IS NULL
-    RAISERROR(N'  *** FAIL 5B-1: HeapE not found in results.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5B-1: HeapE not found in results.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5b1_msg nvarchar(200) = N'  *** FAIL 5B-1: HeapE heap_compression = ' + ISNULL(@5b_heape_comp, 'NULL') + N', expected PAGE.';
+    DECLARE @5b1_msg nvarchar(200) = N'  FAIL 5B-1: HeapE heap_compression = ' + ISNULL(@5b_heape_comp, 'NULL') + N', expected PAGE.';
     RAISERROR(@5b1_msg, 10, 1) WITH NOWAIT;
 END
 
@@ -183,10 +125,10 @@ DECLARE @5b_heapf_comp varchar(4) = (SELECT heap_compression FROM #Results WHERE
 IF @5b_heapf_comp = 'ROW'
     RAISERROR(N'  PASS 5B-2: HeapF heap_compression = ROW.', 10, 1) WITH NOWAIT;
 ELSE IF @5b_heapf_comp IS NULL
-    RAISERROR(N'  *** FAIL 5B-2: HeapF not found in results.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5B-2: HeapF not found in results.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5b2_msg nvarchar(200) = N'  *** FAIL 5B-2: HeapF heap_compression = ' + ISNULL(@5b_heapf_comp, 'NULL') + N', expected ROW.';
+    DECLARE @5b2_msg nvarchar(200) = N'  FAIL 5B-2: HeapF heap_compression = ' + ISNULL(@5b_heapf_comp, 'NULL') + N', expected ROW.';
     RAISERROR(@5b2_msg, 10, 1) WITH NOWAIT;
 END
 
@@ -196,7 +138,7 @@ IF @5b_heapa_comp = 'NONE'
     RAISERROR(N'  PASS 5B-3: HeapA heap_compression = NONE.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5b3_msg nvarchar(200) = N'  *** FAIL 5B-3: HeapA heap_compression = ' + ISNULL(@5b_heapa_comp, 'NULL') + N', expected NONE.';
+    DECLARE @5b3_msg nvarchar(200) = N'  FAIL 5B-3: HeapA heap_compression = ' + ISNULL(@5b_heapa_comp, 'NULL') + N', expected NONE.';
     RAISERROR(@5b3_msg, 10, 1) WITH NOWAIT;
 END
 GO
@@ -228,24 +170,24 @@ BEGIN
     RAISERROR(@5c1_skip, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 5C-1: HeapE CI_SWAP_ONLINE command missing DATA_COMPRESSION = PAGE.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5C-1: HeapE CI_SWAP_ONLINE command missing DATA_COMPRESSION = PAGE.', 10, 1) WITH NOWAIT;
 
 -- 5C-2: HeapA command should NOT include DATA_COMPRESSION (uncompressed)
 DECLARE @5c_heapa_cmd nvarchar(max) = (SELECT command_text FROM #Results WHERE table_name = 'HeapA');
 IF @5c_heapa_cmd NOT LIKE '%DATA_COMPRESSION%'
     RAISERROR(N'  PASS 5C-2: HeapA command does not include DATA_COMPRESSION (correct, uncompressed).', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 5C-2: HeapA command has DATA_COMPRESSION but heap is uncompressed.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5C-2: HeapA command has DATA_COMPRESSION but heap is uncompressed.', 10, 1) WITH NOWAIT;
 
 -- 5C-3: HeapF rebuild command should include DATA_COMPRESSION = ROW
 DECLARE @5c_heapf_cmd nvarchar(max) = (SELECT command_text FROM #Results WHERE table_name = 'HeapF');
 IF @5c_heapf_cmd LIKE '%DATA_COMPRESSION = ROW%'
     RAISERROR(N'  PASS 5C-3: HeapF rebuild command includes DATA_COMPRESSION = ROW.', 10, 1) WITH NOWAIT;
 ELSE IF @5c_heapf_cmd IS NULL
-    RAISERROR(N'  *** FAIL 5C-3: HeapF not found in results.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5C-3: HeapF not found in results.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5c3_msg nvarchar(200) = N'  *** FAIL 5C-3: HeapF command missing DATA_COMPRESSION = ROW. Command: ' + LEFT(ISNULL(@5c_heapf_cmd, ''), 150);
+    DECLARE @5c3_msg nvarchar(200) = N'  FAIL 5C-3: HeapF command missing DATA_COMPRESSION = ROW. Command: ' + LEFT(ISNULL(@5c_heapf_cmd, ''), 150);
     RAISERROR(@5c3_msg, 10, 1) WITH NOWAIT;
 END
 GO
@@ -286,10 +228,10 @@ WHERE object_id = OBJECT_ID('dbo.HeapE') AND index_id = 0;
 IF @5d_comp = 2
     RAISERROR(N'  PASS 5D-1: HeapE still has PAGE compression after rebuild.', 10, 1) WITH NOWAIT;
 ELSE IF @5d_comp = 0
-    RAISERROR(N'  *** FAIL 5D-1: HeapE lost compression (now NONE). DATA_COMPRESSION not preserved.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5D-1: HeapE lost compression (now NONE). DATA_COMPRESSION not preserved.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5d1_msg nvarchar(200) = N'  *** FAIL 5D-1: HeapE compression = ' + CAST(ISNULL(@5d_comp, -1) AS nvarchar(10)) + N', expected 2 (PAGE).';
+    DECLARE @5d1_msg nvarchar(200) = N'  FAIL 5D-1: HeapE compression = ' + CAST(ISNULL(@5d_comp, -1) AS nvarchar(10)) + N', expected 2 (PAGE).';
     RAISERROR(@5d1_msg, 10, 1) WITH NOWAIT;
 END
 
@@ -303,7 +245,7 @@ IF ISNULL(@5d_fwd, 0) = 0
     RAISERROR(N'  PASS 5D-2: HeapE forwarded records = 0 after rebuild.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5d2_msg nvarchar(200) = N'  *** FAIL 5D-2: HeapE still has ' + CAST(@5d_fwd AS nvarchar(20)) + N' forwarded records.';
+    DECLARE @5d2_msg nvarchar(200) = N'  FAIL 5D-2: HeapE still has ' + CAST(@5d_fwd AS nvarchar(20)) + N' forwarded records.';
     RAISERROR(@5d2_msg, 10, 1) WITH NOWAIT;
 END
 GO
@@ -342,10 +284,10 @@ WHERE object_id = OBJECT_ID('dbo.HeapF') AND index_id = 0;
 IF @5e_comp = 1
     RAISERROR(N'  PASS 5E-1: HeapF still has ROW compression after rebuild.', 10, 1) WITH NOWAIT;
 ELSE IF @5e_comp = 0
-    RAISERROR(N'  *** FAIL 5E-1: HeapF lost compression (now NONE). DATA_COMPRESSION not preserved.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 5E-1: HeapF lost compression (now NONE). DATA_COMPRESSION not preserved.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5e1_msg nvarchar(200) = N'  *** FAIL 5E-1: HeapF compression = ' + CAST(ISNULL(@5e_comp, -1) AS nvarchar(10)) + N', expected 1 (ROW).';
+    DECLARE @5e1_msg nvarchar(200) = N'  FAIL 5E-1: HeapF compression = ' + CAST(ISNULL(@5e_comp, -1) AS nvarchar(10)) + N', expected 1 (ROW).';
     RAISERROR(@5e1_msg, 10, 1) WITH NOWAIT;
 END
 GO
@@ -364,7 +306,7 @@ IF @5f_rc_planonly = 0
     RAISERROR(N'  PASS 5F-1: RETURN = 0 for @PlanOnly = 1 (no execution).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5f1_msg nvarchar(200) = N'  *** FAIL 5F-1: RETURN = ' + CAST(@5f_rc_planonly AS nvarchar(10)) + N' for @PlanOnly = 1, expected 0.';
+    DECLARE @5f1_msg nvarchar(200) = N'  FAIL 5F-1: RETURN = ' + CAST(@5f_rc_planonly AS nvarchar(10)) + N' for @PlanOnly = 1, expected 0.';
     RAISERROR(@5f1_msg, 10, 1) WITH NOWAIT;
 END
 GO
@@ -455,7 +397,7 @@ IF @5g_ver LIKE N'2026.%'
     RAISERROR(N'  PASS 5G-1: Version matches 2026.x.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @5g_msg nvarchar(200) = N'  *** FAIL 5G-1: Version = ' + ISNULL(@5g_ver, 'NULL') + N', expected 2026.x.';
+    DECLARE @5g_msg nvarchar(200) = N'  FAIL 5G-1: Version = ' + ISNULL(@5g_ver, 'NULL') + N', expected 2026.x.';
     RAISERROR(@5g_msg, 10, 1) WITH NOWAIT;
 END
 
@@ -469,5 +411,5 @@ IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
-RAISERROR(N'Batch 6 tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
+RAISERROR(N'Batch 6 tests complete. Review results above.', 10, 1) WITH NOWAIT;
 GO

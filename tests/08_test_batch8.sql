@@ -28,66 +28,8 @@ GO
 -- Reusable capture table (matches first result set of sp_HeapDoctor)
 ------------------------------------------------------------------------
 IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
-CREATE TABLE #Results
-(
-    version                nvarchar(20)  NULL,
-    target_id              int           NOT NULL,
-    sort_order             int           NOT NULL,
-    database_name          sysname       NOT NULL,
-    schema_name            sysname       NOT NULL,
-    table_name             sysname       NOT NULL,
-    page_count             bigint        NOT NULL,
-    record_count           bigint        NULL,
-    forwarded_record_count bigint        NOT NULL,
-    forwarded_pct          decimal(6,2)  NOT NULL,
-    forwarded_fetch_count  bigint        NULL,
-    avg_page_space_pct     decimal(5,2)  NULL,
-    avg_frag_pct           decimal(5,2)  NULL,
-    ghost_record_count     bigint        NULL,
-    total_cpu_ms           bigint        NULL,
-    ranking_basis          varchar(20)   NOT NULL,
-    nci_count              int           NOT NULL,
-    key_source_index       sysname       NULL,
-    action_chosen          varchar(32)   NOT NULL,
-    est_pages_per_sec      float         NULL,
-    est_seconds            int           NULL,
-    est_duration           nvarchar(20)  NULL,
-    qs_snapshot_time_utc   datetime2(3)  NULL,
-    qs_total_logical_reads bigint        NULL,
-    qs_total_physical_reads bigint       NULL,
-    qs_total_duration_ms   bigint        NULL,
-    qs_total_executions    bigint        NULL,
-    qs_plan_count          int           NULL,
-    qs_query_count         int           NULL,
-    usage_hint             varchar(30)   NULL,
-    ranking_score          decimal(8,4)  NULL,
-    ranking_algo_version   nvarchar(10)  NULL,
-    heap_compression       varchar(4)    NULL,
-    replication_hint       varchar(20)   NULL,
-    lock_escalation        varchar(10)   NULL,
-    partition_count        int           NULL,
-    has_schema_bound_views int           NULL,
-    has_indexed_views      int           NULL,
-    has_fk_references      int           NULL,
-    fk_ref_count           int           NULL,
-    filegroup_name         sysname       NULL,
-    command_text           nvarchar(max) NULL,
-    ci_drop_command        nvarchar(max) NULL,
-    verify_command         nvarchar(max) NULL,
-    prev_forwarded_pct     decimal(6,2)  NULL,
-    rebuilds_in_90d        int           NULL,
-    size_mb                decimal(18,2) NULL,
-    est_space_savings_mb   decimal(18,2) NULL,
-    est_ci_swap_overhead_mb decimal(18,2) NULL,
-    est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL,
-    sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL,
-    page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL,
-    is_temporal_history    bit           NULL,
-    recommended_action     nvarchar(50)  NULL
-);
+/* #190: the column list lives once, in dbo.ResultsTemplate (see 01_setup_test_data.sql) */
+SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
 IF OBJECT_ID('tempdb..#TestCounts') IS NOT NULL DROP TABLE #TestCounts;
@@ -157,12 +99,12 @@ IF @lock_test >= 0
 BEGIN
     -- Release our test lock
     EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
-    RAISERROR(N'  PASS: 8B - Re-entrancy lock released after normal run.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8B: Re-entrancy lock released after normal run.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 8B - Could not acquire applock after proc completed (lock not released?).', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 8B: Could not acquire applock after proc completed (lock not released?).', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -187,7 +129,7 @@ EXEC dbo.sp_HeapDoctor
 
 IF EXISTS (SELECT 1 FROM #Results WHERE ranking_basis IN ('QS_CPU', 'QS_NO_DATA'))
 BEGIN
-    RAISERROR(N'  PASS: 8C - QS mapping works with tightened LIKE pattern.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8C: QS mapping works with tightened LIKE pattern.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE IF NOT EXISTS (SELECT 1 FROM #Results)
@@ -197,7 +139,7 @@ BEGIN
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 8C - All results have FWD_PCT ranking_basis; QS mapping may be broken.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 8C: All results have FWD_PCT ranking_basis; QS mapping may be broken.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -223,12 +165,12 @@ EXEC dbo.sp_HeapDoctor
 
 IF @tf IS NOT NULL AND @tf > 0
 BEGIN
-    RAISERROR(N'  PASS: 8K - @TargetsFound output parameter populated.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8K: @TargetsFound output parameter populated.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 8K - @TargetsFound is ' + ISNULL(CAST(@tf AS nvarchar(10)), N'NULL');
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 8K: @TargetsFound is ' + ISNULL(CAST(@tf AS nvarchar(10)), N'NULL');
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
@@ -236,12 +178,12 @@ END
 -- @Succeeded/@Failed/@Skipped should be NULL in PlanOnly mode
 IF @s IS NULL AND @f IS NULL AND @sk IS NULL
 BEGIN
-    RAISERROR(N'  PASS: 8K2 - Execution output params NULL in PlanOnly mode.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8K2: Execution output params NULL in PlanOnly mode.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 8K2 - Execution output params should be NULL in PlanOnly mode.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 8K2: Execution output params should be NULL in PlanOnly mode.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -265,14 +207,14 @@ EXEC dbo.sp_HeapDoctor
 IF NOT EXISTS (SELECT 1 FROM #Results WHERE verify_command IS NULL)
    AND EXISTS (SELECT 1 FROM #Results WHERE verify_command LIKE '%dm_db_index_physical_stats%')
 BEGIN
-    RAISERROR(N'  PASS: 8O - verify_command populated for all targets.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8O: verify_command populated for all targets.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @null_verify int;
     SELECT @null_verify = COUNT(*) FROM #Results WHERE verify_command IS NULL;
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 8O - ' + CAST(@null_verify AS nvarchar(10)) + N' target(s) have NULL verify_command.';
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 8O: ' + CAST(@null_verify AS nvarchar(10)) + N' target(s) have NULL verify_command.';
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
@@ -307,12 +249,12 @@ IF EXISTS (
       AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%<RunID>%'
 )
 BEGIN
-    RAISERROR(N'  PASS: 8F - RunID found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8F: RunID found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 8F - RunID not found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 8F: RunID not found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 
@@ -324,12 +266,12 @@ IF EXISTS (
       AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%<RunID>%'
 )
 BEGIN
-    RAISERROR(N'  PASS: 8F2 - RunID found in START ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8F2: RunID found in START ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 8F2 - RunID not found in START ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 8F2: RunID not found in START ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -359,12 +301,12 @@ EXEC dbo.sp_HeapDoctor
 
 IF @s2 IS NOT NULL AND @s2 >= 0 AND @f2 IS NOT NULL AND @sk2 IS NOT NULL
 BEGIN
-    RAISERROR(N'  PASS: 8E - Execution output params populated (verifies #ExecLog).', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8E: Execution output params populated (verifies #ExecLog).', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 8E - Succeeded=' + ISNULL(CAST(@s2 AS nvarchar(10)), N'NULL')
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 8E: Succeeded=' + ISNULL(CAST(@s2 AS nvarchar(10)), N'NULL')
              + N', Failed=' + ISNULL(CAST(@f2 AS nvarchar(10)), N'NULL')
              + N', Skipped=' + ISNULL(CAST(@sk2 AS nvarchar(10)), N'NULL');
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -389,11 +331,11 @@ BEGIN TRY
         @CpuSource = 'QUERY_STORE',
         @PlanOnly = 1;
 
-    RAISERROR(N'  PASS: 8M - QS execution with COLLATE DATABASE_DEFAULT succeeded.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8M: QS execution with COLLATE DATABASE_DEFAULT succeeded.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 8M - Error: ' + LEFT(ERROR_MESSAGE(), 500);
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 8M: Error: ' + LEFT(ERROR_MESSAGE(), 500);
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END CATCH
@@ -416,11 +358,11 @@ BEGIN TRY
         @CpuSource = 'NONE',
         @PlanOnly = 1;
 
-    RAISERROR(N'  PASS: 8N - TDE check did not error on non-TDE database.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8N: TDE check did not error on non-TDE database.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 8N - Error: ' + LEFT(ERROR_MESSAGE(), 500);
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 8N: Error: ' + LEFT(ERROR_MESSAGE(), 500);
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END CATCH
@@ -441,14 +383,14 @@ EXEC dbo.sp_HeapDoctor
 
 IF EXISTS (SELECT 1 FROM #Results WHERE version LIKE '2026.%')
 BEGIN
-    RAISERROR(N'  PASS: 8V - Version starts with 2026.x.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8V: Version starts with 2026.x.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @v8 nvarchar(20);
     SELECT TOP 1 @v8 = version FROM #Results;
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 8V - Expected version 2026.x, got: ' + ISNULL(@v8, N'NULL');
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 8V: Expected version 2026.x, got: ' + ISNULL(@v8, N'NULL');
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END

@@ -162,6 +162,6 @@ GO
 
 /*#region 33-SUMMARY*/
 RAISERROR(N'', 10, 1) WITH NOWAIT;
-RAISERROR(N'=== Batch 33 tests complete. Review PASS/FAIL results above. ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 33 tests complete. Review results above. ===', 10, 1) WITH NOWAIT;
 GO
 /*#endregion*/

@@ -105,7 +105,7 @@ IF ISNULL(@3a_fwd_total, 0) = 0
     RAISERROR(N'  PASS 3A-1: All forwarded records eliminated after rebuild.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg nvarchar(200) = N'  *** FAIL 3A-1: ' + CAST(@3a_fwd_total AS nvarchar(20)) + N' forwarded records remain.';
+    DECLARE @3a_msg nvarchar(200) = N'  FAIL 3A-1: ' + CAST(@3a_fwd_total AS nvarchar(20)) + N' forwarded records remain.';
     RAISERROR(@3a_msg, 10, 1) WITH NOWAIT;
 END
 
@@ -113,13 +113,13 @@ END
 IF EXISTS (SELECT 1 FROM dbo.CommandLog WHERE CommandType = 'HEAP_REBUILD_START')
     RAISERROR(N'  PASS 3A-2: HEAP_REBUILD_START entry found in CommandLog.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3A-2: Missing HEAP_REBUILD_START entry in CommandLog.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3A-2: Missing HEAP_REBUILD_START entry in CommandLog.', 10, 1) WITH NOWAIT;
 
 -- 3A-3: CommandLog should have HEAP_REBUILD_END entry
 IF EXISTS (SELECT 1 FROM dbo.CommandLog WHERE CommandType = 'HEAP_REBUILD_END')
     RAISERROR(N'  PASS 3A-3: HEAP_REBUILD_END entry found in CommandLog.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3A-3: Missing HEAP_REBUILD_END entry in CommandLog.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3A-3: Missing HEAP_REBUILD_END entry in CommandLog.', 10, 1) WITH NOWAIT;
 
 -- 3A-4: Per-rebuild entries should exist (one per target)
 DECLARE @3a_rebuild_count int = (
@@ -134,7 +134,7 @@ BEGIN
 END
 ELSE
 BEGIN
-    DECLARE @3a_msg3 nvarchar(200) = N'  *** FAIL 3A-4: Expected >= 3 per-rebuild entries, found ' + CAST(@3a_rebuild_count AS nvarchar(10));
+    DECLARE @3a_msg3 nvarchar(200) = N'  FAIL 3A-4: Expected >= 3 per-rebuild entries, found ' + CAST(@3a_rebuild_count AS nvarchar(10));
     RAISERROR(@3a_msg3, 10, 1) WITH NOWAIT;
 END
 
@@ -144,7 +144,7 @@ IF @3a_err_count = 0
     RAISERROR(N'  PASS 3A-5: All CommandLog entries have ErrorNumber = 0.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg4 nvarchar(200) = N'  *** FAIL 3A-5: ' + CAST(@3a_err_count AS nvarchar(10)) + N' CommandLog entries have non-zero ErrorNumber.';
+    DECLARE @3a_msg4 nvarchar(200) = N'  FAIL 3A-5: ' + CAST(@3a_err_count AS nvarchar(10)) + N' CommandLog entries have non-zero ErrorNumber.';
     RAISERROR(@3a_msg4, 10, 1) WITH NOWAIT;
 END
 
@@ -160,7 +160,7 @@ IF @3a_post_count >= 3
     RAISERROR(N'  PASS 3A-6: PostRebuildForwardedRecords found in ExtendedInfo XML.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg5 nvarchar(200) = N'  *** FAIL 3A-6: Expected >= 3 entries with PostRebuildForwardedRecords, found ' + CAST(@3a_post_count AS nvarchar(10));
+    DECLARE @3a_msg5 nvarchar(200) = N'  FAIL 3A-6: Expected >= 3 entries with PostRebuildForwardedRecords, found ' + CAST(@3a_post_count AS nvarchar(10));
     RAISERROR(@3a_msg5, 10, 1) WITH NOWAIT;
 END
 
@@ -176,7 +176,7 @@ IF @3a_size_zero = 0
     RAISERROR(N'  PASS 3A-7: All ExtendedInfo SizeMB values are > 0 (no integer truncation).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg6 nvarchar(200) = N'  *** FAIL 3A-7: ' + CAST(@3a_size_zero AS nvarchar(10)) + N' entries have SizeMB = 0 (integer division bug).';
+    DECLARE @3a_msg6 nvarchar(200) = N'  FAIL 3A-7: ' + CAST(@3a_size_zero AS nvarchar(10)) + N' entries have SizeMB = 0 (integer division bug).';
     RAISERROR(@3a_msg6, 10, 1) WITH NOWAIT;
 END
 
@@ -194,7 +194,7 @@ BEGIN
     RAISERROR(@3a_msg7, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 3A-8: HEAP_REBUILD_END missing or no StopReason in ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3A-8: HEAP_REBUILD_END missing or no StopReason in ExtendedInfo.', 10, 1) WITH NOWAIT;
 
 -- 3A-9: Per-rebuild entries should have DatabaseName, SchemaName, ObjectName populated
 DECLARE @3a_missing_names int = (
@@ -207,7 +207,7 @@ IF @3a_missing_names = 0
     RAISERROR(N'  PASS 3A-9: All rebuild entries have DatabaseName, SchemaName, ObjectName populated.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg8 nvarchar(200) = N'  *** FAIL 3A-9: ' + CAST(@3a_missing_names AS nvarchar(10)) + N' entries missing name columns.';
+    DECLARE @3a_msg8 nvarchar(200) = N'  FAIL 3A-9: ' + CAST(@3a_missing_names AS nvarchar(10)) + N' entries missing name columns.';
     RAISERROR(@3a_msg8, 10, 1) WITH NOWAIT;
 END
 
@@ -225,7 +225,7 @@ IF @3a_order_bad = 0
     RAISERROR(N'  PASS 3A-10: CommandLog entries in chronological order.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg9 nvarchar(200) = N'  *** FAIL 3A-10: ' + CAST(@3a_order_bad AS nvarchar(10)) + N' entry pairs out of chronological order.';
+    DECLARE @3a_msg9 nvarchar(200) = N'  FAIL 3A-10: ' + CAST(@3a_order_bad AS nvarchar(10)) + N' entry pairs out of chronological order.';
     RAISERROR(@3a_msg9, 10, 1) WITH NOWAIT;
 END
 
@@ -241,7 +241,7 @@ IF @3a_bad_cmds = 0
     RAISERROR(N'  PASS 3A-11: All rebuild commands are ALTER TABLE or CREATE CLUSTERED INDEX.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg10 nvarchar(200) = N'  *** FAIL 3A-11: ' + CAST(@3a_bad_cmds AS nvarchar(10)) + N' commands have unexpected syntax.';
+    DECLARE @3a_msg10 nvarchar(200) = N'  FAIL 3A-11: ' + CAST(@3a_bad_cmds AS nvarchar(10)) + N' commands have unexpected syntax.';
     RAISERROR(@3a_msg10, 10, 1) WITH NOWAIT;
 END
 
@@ -257,7 +257,7 @@ IF @3a_qs_present = 0
     RAISERROR(N'  PASS 3A-12: QS snapshot elements absent in ExtendedInfo (CpuSource=NONE, as expected).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg11 nvarchar(200) = N'  *** FAIL 3A-12: ' + CAST(@3a_qs_present AS nvarchar(10)) + N' entries have QsTotalLogicalReads despite CpuSource=NONE.';
+    DECLARE @3a_msg11 nvarchar(200) = N'  FAIL 3A-12: ' + CAST(@3a_qs_present AS nvarchar(10)) + N' entries have QsTotalLogicalReads despite CpuSource=NONE.';
     RAISERROR(@3a_msg11, 10, 1) WITH NOWAIT;
 END
 
@@ -277,7 +277,7 @@ BEGIN
     RAISERROR(@3a_msg12, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 3A-13: ForwardedFetchCount missing from all ExtendedInfo entries.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3A-13: ForwardedFetchCount missing from all ExtendedInfo entries.', 10, 1) WITH NOWAIT;
 
 -- 3A-14: IndexType should be 0 (heap) for per-rebuild CommandLog entries
 DECLARE @3a_idx_bad int = (
@@ -290,7 +290,7 @@ IF @3a_idx_bad = 0
     RAISERROR(N'  PASS 3A-14: IndexType = 0 (heap) for all per-rebuild CommandLog entries.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3a_msg13 nvarchar(200) = N'  *** FAIL 3A-14: ' + CAST(@3a_idx_bad AS nvarchar(10)) + N' entries have IndexType <> 0.';
+    DECLARE @3a_msg13 nvarchar(200) = N'  FAIL 3A-14: ' + CAST(@3a_idx_bad AS nvarchar(10)) + N' entries have IndexType <> 0.';
     RAISERROR(@3a_msg13, 10, 1) WITH NOWAIT;
 END
 
@@ -349,7 +349,7 @@ WHERE t.name = 'HeapB'
 IF @3b_idx_type = 0
     RAISERROR(N'  PASS 3B-1: HeapB is still a heap after CI swap.', 10, 1) WITH NOWAIT;
 ELSE IF @3b_idx_type = 1
-    RAISERROR(N'  *** FAIL 3B-1: Clustered index left behind on HeapB.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3B-1: Clustered index left behind on HeapB.', 10, 1) WITH NOWAIT;
 ELSE
     RAISERROR(N'  INFO 3B-1: HeapB index type is unexpected. Check sys.indexes.', 10, 1) WITH NOWAIT;
 
@@ -363,7 +363,7 @@ IF ISNULL(@3b_fwd, 0) = 0
     RAISERROR(N'  PASS 3B-2: HeapB forwarded records = 0.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3b_msg nvarchar(200) = N'  *** FAIL 3B-2: HeapB still has ' + CAST(@3b_fwd AS nvarchar(20)) + N' forwarded records.';
+    DECLARE @3b_msg nvarchar(200) = N'  FAIL 3B-2: HeapB still has ' + CAST(@3b_fwd AS nvarchar(20)) + N' forwarded records.';
     RAISERROR(@3b_msg, 10, 1) WITH NOWAIT;
 END
 
@@ -371,7 +371,7 @@ END
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.HeapB') AND name = 'UX_HeapB_ID' AND type = 2)
     RAISERROR(N'  PASS 3B-3: UX_HeapB_ID nonclustered index still exists after CI swap.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3B-3: UX_HeapB_ID is missing or changed type after CI swap.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3B-3: UX_HeapB_ID is missing or changed type after CI swap.', 10, 1) WITH NOWAIT;
 
 -- 3B-4: CommandLog should have CI_SWAP entries (on Enterprise/Developer)
 DECLARE @3b_ci_count int = (SELECT COUNT(*) FROM dbo.CommandLog WHERE CommandType = 'CI_SWAP_ONLINE');
@@ -387,7 +387,7 @@ BEGIN
     IF @3b_offline > 0
         RAISERROR(N'  PASS 3B-4: No CI_SWAP_ONLINE (Standard Edition?), but HEAP_REBUILD entries present.', 10, 1) WITH NOWAIT;
     ELSE
-        RAISERROR(N'  *** FAIL 3B-4: No CI_SWAP or HEAP_REBUILD entries in CommandLog.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  FAIL 3B-4: No CI_SWAP or HEAP_REBUILD entries in CommandLog.', 10, 1) WITH NOWAIT;
 END
 
 -- 3B-5: CI_SWAP entries should have IndexName set to the temp CI name
@@ -405,7 +405,7 @@ END
 ELSE IF @3b_ci_count = 0
     RAISERROR(N'  SKIP 3B-5: No CI_SWAP_ONLINE entries (Standard Edition?).', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3B-5: CI_SWAP entry missing IndexName with CX__Temp__ prefix.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3B-5: CI_SWAP entry missing IndexName with CX__Temp__ prefix.', 10, 1) WITH NOWAIT;
 
 -- CommandLog for manual review
 SELECT ID, CommandType, ObjectName, IndexName, IndexType, Command, ErrorNumber
@@ -460,7 +460,7 @@ BEGIN
     RAISERROR(@3c_msg, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 3C-1: HEAP_REBUILD_END missing or no StopReason.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3C-1: HEAP_REBUILD_END missing or no StopReason.', 10, 1) WITH NOWAIT;
 
 -- Note: On fast hardware, all 3 rebuilds may complete in < 1 second. That's OK.
 -- The test validates the code path runs without error.
@@ -509,7 +509,7 @@ BEGIN
     RAISERROR(@3d_msg1, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 3D-1: No SKIPPED entries in CommandLog when @MaxRunSeconds=0.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3D-1: No SKIPPED entries in CommandLog when @MaxRunSeconds=0.', 10, 1) WITH NOWAIT;
 
 -- 3D-2: SKIPPED entries should have ExtendedInfo with PageCount
 DECLARE @3d_with_info int = (
@@ -523,7 +523,7 @@ DECLARE @3d_with_info int = (
 IF @3d_with_info >= 1
     RAISERROR(N'  PASS 3D-2: SKIPPED entries have ExtendedInfo with PageCount.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3D-2: SKIPPED entries missing or incomplete ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3D-2: SKIPPED entries missing or incomplete ExtendedInfo.', 10, 1) WITH NOWAIT;
 
 -- 3D-3: No actual rebuilds should have happened (all skipped)
 DECLARE @3d_rebuilt int = (
@@ -537,7 +537,7 @@ IF @3d_rebuilt = 0
     RAISERROR(N'  PASS 3D-3: No actual rebuilds executed (all targets skipped as expected).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3d_msg3 nvarchar(200) = N'  *** FAIL 3D-3: ' + CAST(@3d_rebuilt AS nvarchar(10)) + N' targets were rebuilt despite @MaxRunSeconds=0.';
+    DECLARE @3d_msg3 nvarchar(200) = N'  FAIL 3D-3: ' + CAST(@3d_rebuilt AS nvarchar(10)) + N' targets were rebuilt despite @MaxRunSeconds=0.';
     RAISERROR(@3d_msg3, 10, 1) WITH NOWAIT;
 END
 
@@ -553,7 +553,7 @@ BEGIN
     RAISERROR(@3d_msg4, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 3D-4: HEAP_REBUILD_END missing or no StopReason.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3D-4: HEAP_REBUILD_END missing or no StopReason.', 10, 1) WITH NOWAIT;
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
@@ -693,24 +693,24 @@ BEGIN
     RAISERROR(@3e_msg1, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 3E-1: est_pages_per_sec is NULL despite CommandLog history.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3E-1: est_pages_per_sec is NULL despite CommandLog history.', 10, 1) WITH NOWAIT;
 
 -- 3E-2: est_seconds should be populated where est_pages_per_sec is
 DECLARE @3e_with_sec int = (SELECT COUNT(*) FROM #Est WHERE est_seconds IS NOT NULL);
 IF @3e_with_sec >= 1
     RAISERROR(N'  PASS 3E-2: est_seconds populated from history.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3E-2: est_seconds is NULL despite having est_pages_per_sec.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3E-2: est_seconds is NULL despite having est_pages_per_sec.', 10, 1) WITH NOWAIT;
 
 -- 3E-3: est_duration should be in HH:MM:SS format
 DECLARE @3e_dur nvarchar(20) = (SELECT TOP 1 est_duration FROM #Est WHERE est_duration IS NOT NULL);
 IF @3e_dur IS NOT NULL AND @3e_dur LIKE '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
     RAISERROR(N'  PASS 3E-3: est_duration is in HH:MM:SS format.', 10, 1) WITH NOWAIT;
 ELSE IF @3e_dur IS NULL
-    RAISERROR(N'  *** FAIL 3E-3: est_duration is NULL despite having history.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3E-3: est_duration is NULL despite having history.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3e_msg3 nvarchar(200) = N'  *** FAIL 3E-3: est_duration has unexpected format: ' + @3e_dur;
+    DECLARE @3e_msg3 nvarchar(200) = N'  FAIL 3E-3: est_duration has unexpected format: ' + @3e_dur;
     RAISERROR(@3e_msg3, 10, 1) WITH NOWAIT;
 END
 
@@ -719,7 +719,7 @@ DECLARE @3e_bad_rate int = (SELECT COUNT(*) FROM #Est WHERE est_pages_per_sec IS
 IF @3e_bad_rate = 0
     RAISERROR(N'  PASS 3E-4: All est_pages_per_sec values are > 0.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3E-4: Some est_pages_per_sec values are <= 0.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3E-4: Some est_pages_per_sec values are <= 0.', 10, 1) WITH NOWAIT;
 
 -- Display estimates for manual review
 SELECT table_name, page_count, action_chosen, est_pages_per_sec, est_seconds, est_duration
@@ -792,7 +792,7 @@ END
 ELSE IF @3f_rebuild_count = 0
     RAISERROR(N'  SKIP 3F-1: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3F-1: No entries have QsTotalLogicalReads despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3F-1: No entries have QsTotalLogicalReads despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
 
 -- 3F-2: QsQueryHashes element present and non-empty for entries with QS data
 DECLARE @3f_qs_hashes_count int = (
@@ -812,7 +812,7 @@ END
 ELSE IF @3f_rebuild_count = 0
     RAISERROR(N'  SKIP 3F-2: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3F-2: No entries have QsQueryHashes despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3F-2: No entries have QsQueryHashes despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
 
 -- 3F-3: QsSnapshotTimeUtc element present for entries with QS data
 DECLARE @3f_qs_snap_count int = (
@@ -831,7 +831,7 @@ END
 ELSE IF @3f_rebuild_count = 0
     RAISERROR(N'  SKIP 3F-3: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 3F-3: No entries have QsSnapshotTimeUtc despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 3F-3: No entries have QsSnapshotTimeUtc despite CpuSource=QUERY_STORE.', 10, 1) WITH NOWAIT;
 
 -- Display ExtendedInfo for review
 SELECT ID, CommandType, ObjectName,
@@ -871,7 +871,7 @@ ELSE IF @3g_rebuild_count = 0
     RAISERROR(N'  SKIP 3G-1: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3g_msg1 nvarchar(200) = N'  *** FAIL 3G-1: RankingScore present in '
+    DECLARE @3g_msg1 nvarchar(200) = N'  FAIL 3G-1: RankingScore present in '
         + CAST(@3g_score_count AS nvarchar(10)) + N'/' + CAST(@3g_rebuild_count AS nvarchar(10)) + N' entries.';
     RAISERROR(@3g_msg1, 10, 1) WITH NOWAIT;
 END
@@ -890,11 +890,11 @@ ELSE IF @3g_rebuild_count = 0
     RAISERROR(N'  SKIP 3G-2: No successful per-rebuild entries found.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @3g_msg2 nvarchar(200) = N'  *** FAIL 3G-2: Only ' + CAST(@3g_positive AS nvarchar(10)) + N'/' + CAST(@3g_rebuild_count AS nvarchar(10)) + N' entries have RankingScore > 0.';
+    DECLARE @3g_msg2 nvarchar(200) = N'  FAIL 3G-2: Only ' + CAST(@3g_positive AS nvarchar(10)) + N'/' + CAST(@3g_rebuild_count AS nvarchar(10)) + N' entries have RankingScore > 0.';
     RAISERROR(@3g_msg2, 10, 1) WITH NOWAIT;
 END
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
-RAISERROR(N'Execution tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
+RAISERROR(N'Execution tests complete. Review results above.', 10, 1) WITH NOWAIT;
 GO

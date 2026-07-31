@@ -50,14 +50,14 @@ EXEC dbo.sp_HeapDoctor
 IF OBJECT_ID(N'dbo.QueueHeapRebuild', N'U') IS NOT NULL
     RAISERROR(N'  PASS 28A-1: dbo.QueueHeapRebuild auto-created.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 28A-1: dbo.QueueHeapRebuild missing after parallel run.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 28A-1: dbo.QueueHeapRebuild missing after parallel run.', 10, 1) WITH NOWAIT;
 
 /* 28A-2: dbo.Queue got a new row for sp_HeapDoctor */
 DECLARE @new_queue_rows int = (SELECT COUNT_BIG(*) FROM dbo.Queue WHERE ObjectName = N'sp_HeapDoctor');
 IF @new_queue_rows >= 1
     RAISERROR(N'  PASS 28A-2: dbo.Queue has at least 1 row for sp_HeapDoctor.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 28A-2: dbo.Queue has no rows for sp_HeapDoctor.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 28A-2: dbo.Queue has no rows for sp_HeapDoctor.', 10, 1) WITH NOWAIT;
 
 /* 28A-3: All queue rows marked SUCCEEDED */
 DECLARE @total_rows int     = (SELECT COUNT_BIG(*) FROM dbo.QueueHeapRebuild);
@@ -66,7 +66,7 @@ IF @total_rows >= 3 AND @total_rows = @succeeded_rows
     RAISERROR(N'  PASS 28A-3: All queue rows marked SUCCEEDED.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @s3 nvarchar(200) = N'  *** FAIL 28A-3: Expected >=3 rows all SUCCEEDED. Got total=' + CONVERT(nvarchar(10), @total_rows) + N', succeeded=' + CONVERT(nvarchar(10), @succeeded_rows);
+    DECLARE @s3 nvarchar(200) = N'  FAIL 28A-3: Expected >=3 rows all SUCCEEDED. Got total=' + CONVERT(nvarchar(10), @total_rows) + N', succeeded=' + CONVERT(nvarchar(10), @succeeded_rows);
     RAISERROR(@s3, 10, 1) WITH NOWAIT;
 END
 
@@ -74,7 +74,7 @@ END
 IF NOT EXISTS (SELECT 1 FROM dbo.QueueHeapRebuild WHERE TableStartTime IS NULL OR TableEndTime IS NULL OR TableEndTime < TableStartTime)
     RAISERROR(N'  PASS 28A-4: Claim/completion timestamps populated and ordered.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 28A-4: Some queue rows have NULL or inverted timestamps.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 28A-4: Some queue rows have NULL or inverted timestamps.', 10, 1) WITH NOWAIT;
 
 /* 28A-5: Forwarded records actually eliminated on rebuilt heaps */
 DECLARE @still_forwarded int = 0;
@@ -89,7 +89,7 @@ IF ISNULL(@still_forwarded, 0) = 0
     RAISERROR(N'  PASS 28A-5: Zero forwarded records remain on rebuilt heaps.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @s5 nvarchar(200) = N'  *** FAIL 28A-5: ' + CONVERT(nvarchar(10), @still_forwarded) + N' forwarded records remain after rebuild.';
+    DECLARE @s5 nvarchar(200) = N'  FAIL 28A-5: ' + CONVERT(nvarchar(10), @still_forwarded) + N' forwarded records remain after rebuild.';
     RAISERROR(@s5, 10, 1) WITH NOWAIT;
 END
 
@@ -103,7 +103,7 @@ IF @cmdlog_rebuild_count >= 3
     RAISERROR(N'  PASS 28A-6: CommandLog has per-rebuild entries (parallel rebuilds log normally).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @s6 nvarchar(200) = N'  *** FAIL 28A-6: Expected >=3 CommandLog rebuild entries, got ' + CONVERT(nvarchar(10), @cmdlog_rebuild_count);
+    DECLARE @s6 nvarchar(200) = N'  FAIL 28A-6: Expected >=3 CommandLog rebuild entries, got ' + CONVERT(nvarchar(10), @cmdlog_rebuild_count);
     RAISERROR(@s6, 10, 1) WITH NOWAIT;
 END
 
@@ -115,7 +115,7 @@ DECLARE @latest_cmd nvarchar(max) = (
 IF @latest_cmd LIKE N'%@HeapsInParallel = N''Y''%'
     RAISERROR(N'  PASS 28A-7: @invocation_command logged @HeapsInParallel = N''Y''.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 28A-7: @HeapsInParallel not logged in @invocation_command.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 28A-7: @HeapsInParallel not logged in @invocation_command.', 10, 1) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------
@@ -140,7 +140,7 @@ IF @rebuild_count_after = @rebuild_count_before
     RAISERROR(N'  PASS 28B-1: Second invocation joined existing queue and found no work (worker mode).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @s8 nvarchar(200) = N'  *** FAIL 28B-1: Expected no new rebuilds, got ' + CONVERT(nvarchar(10), @rebuild_count_after - @rebuild_count_before);
+    DECLARE @s8 nvarchar(200) = N'  FAIL 28B-1: Expected no new rebuilds, got ' + CONVERT(nvarchar(10), @rebuild_count_after - @rebuild_count_before);
     RAISERROR(@s8, 10, 1) WITH NOWAIT;
 END
 GO
@@ -156,14 +156,14 @@ BEGIN TRY
         @CpuSource       = 'NONE',
         @PlanOnly        = 1,
         @HeapsInParallel = N'Y';
-    RAISERROR(N'  *** FAIL 28C-1: Expected validation error, none raised.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 28C-1: Expected validation error, none raised.', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
     IF ERROR_MESSAGE() LIKE N'%requires execution mode%'
         RAISERROR(N'  PASS 28C-1: @PlanOnly=1 with parallel mode correctly rejected.', 10, 1) WITH NOWAIT;
     ELSE
     BEGIN
-        DECLARE @e1 nvarchar(2000) = N'  *** FAIL 28C-1: Wrong error message: ' + LEFT(ERROR_MESSAGE(), 1500);
+        DECLARE @e1 nvarchar(2000) = N'  FAIL 28C-1: Wrong error message: ' + LEFT(ERROR_MESSAGE(), 1500);
         RAISERROR(@e1, 10, 1) WITH NOWAIT;
     END
 END CATCH
@@ -187,14 +187,14 @@ BEGIN TRY
         @Execute         = 'Y',
         @Tables          = N'dbo.HeapA',
         @HeapsInParallel = N'Y';
-    RAISERROR(N'  *** FAIL 28D-1: Expected error about missing dbo.Queue.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 28D-1: Expected error about missing dbo.Queue.', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
     IF ERROR_MESSAGE() LIKE N'%dbo.Queue%'
         RAISERROR(N'  PASS 28D-1: Missing dbo.Queue raises clear error with download link.', 10, 1) WITH NOWAIT;
     ELSE
     BEGIN
-        DECLARE @e2 nvarchar(2000) = N'  *** FAIL 28D-1: Wrong error message: ' + LEFT(ERROR_MESSAGE(), 1500);
+        DECLARE @e2 nvarchar(2000) = N'  FAIL 28D-1: Wrong error message: ' + LEFT(ERROR_MESSAGE(), 1500);
         RAISERROR(@e2, 10, 1) WITH NOWAIT;
     END
 END CATCH

@@ -19,10 +19,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @CpuSource = 'INVALID', @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for invalid CpuSource ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4A: Should have raised error for invalid CpuSource', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg nvarchar(4000) = N'PASS 4A: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -34,10 +34,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @OnlinePreference = 'MAYBE', @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for invalid OnlinePreference ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4B: Should have raised error for invalid OnlinePreference', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4B nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4B nvarchar(4000) = N'PASS 4B: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4B, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -49,10 +49,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @CpuSource = 'QUICKIESTORE', @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for missing QuickieExecSql ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4C: Should have raised error for missing QuickieExecSql', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4C nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4C nvarchar(4000) = N'PASS 4C: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4C, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -64,10 +64,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @Maxdop = -1, @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for negative Maxdop ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4D: Should have raised error for negative Maxdop', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4D nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4D nvarchar(4000) = N'PASS 4D: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4D, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -79,10 +79,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @Databases = 'NonExistentDB_XYZ_999', @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for no matching databases ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4E: Should have raised error for no matching databases', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4E nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4E nvarchar(4000) = N'PASS 4E: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4E, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -158,7 +158,7 @@ BEGIN TRY
     RAISERROR(N'  PASS 4J: @Maxdop=0 accepted without error.', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4J nvarchar(4000) = N'  *** FAIL 4J: @Maxdop=0 raised unexpected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4J nvarchar(4000) = N'  FAIL 4J: @Maxdop=0 raised unexpected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4J, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -174,7 +174,7 @@ BEGIN TRY
     RAISERROR(N'  PASS 4K: @MaxRunSeconds=0 ran without error (all targets skipped).', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4K nvarchar(4000) = N'  *** FAIL 4K: @MaxRunSeconds=0 raised unexpected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4K nvarchar(4000) = N'  FAIL 4K: @MaxRunSeconds=0 raised unexpected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4K, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -188,7 +188,7 @@ RAISERROR(N'================================================================', 1
 IF OBJECT_ID('dbo.CommandLog', 'U') IS NOT NULL
     RAISERROR(N'  PASS 4L: CommandLog exists, @LogToTable=Y should work.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 4L: CommandLog does not exist in HeapDoctorTest.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 4L: CommandLog does not exist in HeapDoctorTest.', 10, 1) WITH NOWAIT;
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
@@ -207,7 +207,7 @@ BEGIN TRY
     RAISERROR(N'  PASS 4M: @LogToTable=Y with missing CommandLog ran without fatal error (warning expected in output above).', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4M nvarchar(4000) = N'  *** FAIL 4M: @LogToTable=Y with missing CommandLog raised fatal error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4M nvarchar(4000) = N'  FAIL 4M: @LogToTable=Y with missing CommandLog raised fatal error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4M, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -223,7 +223,7 @@ BEGIN TRY
     RAISERROR(N'  PASS 4N: @LogToTable=''y'' (lowercase) accepted.', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4N nvarchar(4000) = N'  *** FAIL 4N: @LogToTable=''y'' raised error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4N nvarchar(4000) = N'  FAIL 4N: @LogToTable=''y'' raised error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4N, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -239,7 +239,7 @@ BEGIN TRY
     RAISERROR(N'  PASS 4O: @CpuSource=''none'' (lowercase) accepted.', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4O nvarchar(4000) = N'  *** FAIL 4O: @CpuSource=''none'' raised error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4O nvarchar(4000) = N'  FAIL 4O: @CpuSource=''none'' raised error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4O, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -251,10 +251,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @LockTimeoutMs = -1, @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for negative LockTimeoutMs ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4P: Should have raised error for negative LockTimeoutMs', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4P nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4P nvarchar(4000) = N'PASS 4P: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4P, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -266,10 +266,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @MaxRunSeconds = -1, @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for negative MaxRunSeconds ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4Q: Should have raised error for negative MaxRunSeconds', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4Q nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4Q nvarchar(4000) = N'PASS 4Q: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4Q, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -281,10 +281,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @EstimateLookbackDays = -1, @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for negative EstimateLookbackDays ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4R: Should have raised error for negative EstimateLookbackDays', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4R nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4R nvarchar(4000) = N'PASS 4R: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4R, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -296,10 +296,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @EstimateLookbackDays = 0, @PlanOnly = 1;
-    RAISERROR(N'*** FAIL: Should have raised error for zero EstimateLookbackDays ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4S: Should have raised error for zero EstimateLookbackDays', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4S nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4S nvarchar(4000) = N'PASS 4S: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4S, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -316,7 +316,7 @@ BEGIN TRY
     RAISERROR(N'  PASS 4T: @Execute=''Y'' accepted (equivalent to @PlanOnly=0).', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4T nvarchar(4000) = N'  *** FAIL 4T: @Execute=''Y'' raised unexpected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4T nvarchar(4000) = N'  FAIL 4T: @Execute=''Y'' raised unexpected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4T, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -332,7 +332,7 @@ BEGIN TRY
     RAISERROR(N'  PASS 4U: @Execute=''N'' accepted (equivalent to @PlanOnly=1).', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4U nvarchar(4000) = N'  *** FAIL 4U: @Execute=''N'' raised unexpected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4U nvarchar(4000) = N'  FAIL 4U: @Execute=''N'' raised unexpected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4U, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -344,10 +344,10 @@ RAISERROR(N'================================================================', 1
 
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @Execute = N'X', @CpuSource = 'NONE';
-    RAISERROR(N'*** FAIL: Should have raised error for invalid @Execute ***', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 4V: Should have raised error for invalid @Execute', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4V nvarchar(4000) = N'PASS: Got expected error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4V nvarchar(4000) = N'PASS 4V: Got expected error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4V, 10, 1) WITH NOWAIT;
 END CATCH
 GO
@@ -363,11 +363,11 @@ BEGIN TRY
     RAISERROR(N'  PASS 4W: @Execute=''y'' (lowercase) accepted.', 10, 1) WITH NOWAIT;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg4W nvarchar(4000) = N'  *** FAIL 4W: @Execute=''y'' raised error: ' + ERROR_MESSAGE();
+    DECLARE @Msg4W nvarchar(4000) = N'  FAIL 4W: @Execute=''y'' raised error: ' + ERROR_MESSAGE();
     RAISERROR(@Msg4W, 10, 1) WITH NOWAIT;
 END CATCH
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;
-RAISERROR(N'Negative tests complete. Review PASS/FAIL results above.', 10, 1) WITH NOWAIT;
+RAISERROR(N'Negative tests complete. Review results above.', 10, 1) WITH NOWAIT;
 GO

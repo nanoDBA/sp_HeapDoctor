@@ -28,66 +28,8 @@ GO
 -- Reusable capture table
 ------------------------------------------------------------------------
 IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
-CREATE TABLE #Results
-(
-    version                nvarchar(20)  NULL,
-    target_id              int           NOT NULL,
-    sort_order             int           NOT NULL,
-    database_name          sysname       NOT NULL,
-    schema_name            sysname       NOT NULL,
-    table_name             sysname       NOT NULL,
-    page_count             bigint        NOT NULL,
-    record_count           bigint        NULL,
-    forwarded_record_count bigint        NOT NULL,
-    forwarded_pct          decimal(6,2)  NOT NULL,
-    forwarded_fetch_count  bigint        NULL,
-    avg_page_space_pct     decimal(5,2)  NULL,
-    avg_frag_pct           decimal(5,2)  NULL,
-    ghost_record_count     bigint        NULL,
-    total_cpu_ms           bigint        NULL,
-    ranking_basis          varchar(20)   NOT NULL,
-    nci_count              int           NOT NULL,
-    key_source_index       sysname       NULL,
-    action_chosen          varchar(32)   NOT NULL,
-    est_pages_per_sec      float         NULL,
-    est_seconds            int           NULL,
-    est_duration           nvarchar(20)  NULL,
-    qs_snapshot_time_utc   datetime2(3)  NULL,
-    qs_total_logical_reads bigint        NULL,
-    qs_total_physical_reads bigint       NULL,
-    qs_total_duration_ms   bigint        NULL,
-    qs_total_executions    bigint        NULL,
-    qs_plan_count          int           NULL,
-    qs_query_count         int           NULL,
-    usage_hint             varchar(30)   NULL,
-    ranking_score          decimal(8,4)  NULL,
-    ranking_algo_version   nvarchar(10)  NULL,
-    heap_compression       varchar(4)    NULL,
-    replication_hint       varchar(20)   NULL,
-    lock_escalation        varchar(10)   NULL,
-    partition_count        int           NULL,
-    has_schema_bound_views int           NULL,
-    has_indexed_views      int           NULL,
-    has_fk_references      int           NULL,
-    fk_ref_count           int           NULL,
-    filegroup_name         sysname       NULL,
-    command_text           nvarchar(max) NULL,
-    ci_drop_command        nvarchar(max) NULL,
-    verify_command         nvarchar(max) NULL,
-    prev_forwarded_pct     decimal(6,2)  NULL,
-    rebuilds_in_90d        int           NULL,
-    size_mb                decimal(18,2) NULL,
-    est_space_savings_mb   decimal(18,2) NULL,
-    est_ci_swap_overhead_mb decimal(18,2) NULL,
-    est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL,
-    sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL,
-    page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL,
-    is_temporal_history    bit           NULL,
-    recommended_action     nvarchar(50)  NULL
-);
+/* #190: the column list lives once, in dbo.ResultsTemplate (see 01_setup_test_data.sql) */
+SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
 IF OBJECT_ID('tempdb..#TestCounts') IS NOT NULL DROP TABLE #TestCounts;
@@ -159,12 +101,12 @@ IF EXISTS (
       AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%<Version>%'
 )
 BEGIN
-    RAISERROR(N'  PASS: 9C - Version found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 9C: Version found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 9C - Version not found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 9C: Version not found in per-rebuild ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 
@@ -176,12 +118,12 @@ IF EXISTS (
       AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%<Version>%'
 )
 BEGIN
-    RAISERROR(N'  PASS: 9C2 - Version found in END/Summary ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 9C2: Version found in END/Summary ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 9C2 - Version not found in END/Summary ExtendedInfo.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 9C2: Version not found in END/Summary ExtendedInfo.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -240,12 +182,12 @@ EXEC dbo.sp_HeapDoctor
 -- At least one target should have rebuilds_in_90d > 0 (from test execution above)
 IF EXISTS (SELECT 1 FROM #Results WHERE rebuilds_in_90d > 0)
 BEGIN
-    RAISERROR(N'  PASS: 9L - rebuilds_in_90d populated from CommandLog.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 9L: rebuilds_in_90d populated from CommandLog.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 9L - No targets have rebuilds_in_90d > 0 (expected from prior test executions).', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 9L: No targets have rebuilds_in_90d > 0 (expected from prior test executions).', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -263,11 +205,11 @@ with @Help=1 without error.
 */
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @Help = 1;
-    RAISERROR(N'  PASS: 9M - @Help executed without error.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 9M: @Help executed without error.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 9M - @Help error: ' + LEFT(ERROR_MESSAGE(), 500);
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 9M: @Help error: ' + LEFT(ERROR_MESSAGE(), 500);
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END CATCH
@@ -292,11 +234,11 @@ BEGIN TRY
         @CpuSource = 'NONE',
         @PlanOnly = 1;
 
-    RAISERROR(N'  PASS: 9D - Large @Databases list parsed without MAXRECURSION error.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 9D: Large @Databases list parsed without MAXRECURSION error.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END TRY
 BEGIN CATCH
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 9D - Error: ' + LEFT(ERROR_MESSAGE(), 500);
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 9D: Error: ' + LEFT(ERROR_MESSAGE(), 500);
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END CATCH
@@ -317,14 +259,14 @@ EXEC dbo.sp_HeapDoctor
 
 IF EXISTS (SELECT 1 FROM #Results WHERE version LIKE '2026.%')
 BEGIN
-    RAISERROR(N'  PASS: 9V - Version starts with 2026.x.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 9V: Version starts with 2026.x.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @v9 nvarchar(20);
     SELECT TOP 1 @v9 = version FROM #Results;
-    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL: 9V - Expected version 2026.x, got: ' + ISNULL(@v9, N'NULL');
+    DECLARE @Msg nvarchar(4000); SET @Msg =N'  FAIL 9V: Expected version 2026.x, got: ' + ISNULL(@v9, N'NULL');
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END

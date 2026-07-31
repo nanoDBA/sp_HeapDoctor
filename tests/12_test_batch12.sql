@@ -103,7 +103,7 @@ IF @12a_version = N'2026.07.31.1'
     RAISERROR(N'  PASS 12A: Version is 2026.07.31.1.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @12a_msg nvarchar(200) = N'  *** FAIL 12A: Expected version 2026.07.31.1, got ' + ISNULL(@12a_version, N'NULL');
+    DECLARE @12a_msg nvarchar(200) = N'  FAIL 12A: Expected version 2026.07.31.1, got ' + ISNULL(@12a_version, N'NULL');
     RAISERROR(@12a_msg, 16, 1) WITH NOWAIT;
 END
 GO
@@ -132,7 +132,7 @@ BEGIN
 END
 ELSE
 BEGIN
-    DECLARE @12b_fail nvarchar(200) = N'  *** FAIL 12B: DurationMs in ' + CAST(@12b_has_duration AS nvarchar(10)) + N'/' + CAST(@12b_total AS nvarchar(10)) + N' entries.';
+    DECLARE @12b_fail nvarchar(200) = N'  FAIL 12B: DurationMs in ' + CAST(@12b_has_duration AS nvarchar(10)) + N'/' + CAST(@12b_total AS nvarchar(10)) + N' entries.';
     RAISERROR(@12b_fail, 16, 1) WITH NOWAIT;
 END
 GO
@@ -155,7 +155,7 @@ BEGIN
     RAISERROR(@12c_msg, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 12C: ActualPagesPerSec not populated in any entry.', 16, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 12C: ActualPagesPerSec not populated in any entry.', 16, 1) WITH NOWAIT;
 GO
 
 -- 12D: DurationMs populated in failure ExtendedInfo
@@ -190,7 +190,7 @@ BEGIN
     IF @12d_has_duration = @12d_fail_count
         RAISERROR(N'  PASS 12D: DurationMs populated in all failure entries.', 10, 1) WITH NOWAIT;
     ELSE
-        RAISERROR(N'  *** FAIL 12D: DurationMs missing in some failure entries.', 16, 1) WITH NOWAIT;
+        RAISERROR(N'  FAIL 12D: DurationMs missing in some failure entries.', 16, 1) WITH NOWAIT;
 END
 GO
 
@@ -210,7 +210,7 @@ BEGIN
     RAISERROR(@12e_msg, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 12E: TotalPagesRebuilt is NULL or 0 in HEAP_REBUILD_END. Should always be tracked.', 16, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 12E: TotalPagesRebuilt is NULL or 0 in HEAP_REBUILD_END. Should always be tracked.', 16, 1) WITH NOWAIT;
 GO
 
 -- 12F: Summary AvgPagesPerSec always populated
@@ -229,7 +229,7 @@ BEGIN
     RAISERROR(@12f_msg, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 12F: AvgPagesPerSec is NULL or 0 in HEAP_REBUILD_END. Should always be tracked.', 16, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 12F: AvgPagesPerSec is NULL or 0 in HEAP_REBUILD_END. Should always be tracked.', 16, 1) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------
@@ -344,7 +344,7 @@ BEGIN
     RAISERROR(@12g_msg, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  *** FAIL 12G: est_pages_per_sec not populated. Historical estimation failed.', 16, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 12G: est_pages_per_sec not populated. Historical estimation failed.', 16, 1) WITH NOWAIT;
 
 DROP TABLE #EstResults;
 GO
@@ -374,7 +374,7 @@ BEGIN
 END
 ELSE
 BEGIN
-    DECLARE @12h_fail nvarchar(200) = N'  *** FAIL 12H: ActualPagesPerSec range [' + ISNULL(CAST(@12h_min_pps AS nvarchar(20)), N'NULL') + N' - ' + ISNULL(CAST(@12h_max_pps AS nvarchar(20)), N'NULL') + N'] seems wrong.';
+    DECLARE @12h_fail nvarchar(200) = N'  FAIL 12H: ActualPagesPerSec range [' + ISNULL(CAST(@12h_min_pps AS nvarchar(20)), N'NULL') + N' - ' + ISNULL(CAST(@12h_max_pps AS nvarchar(20)), N'NULL') + N'] seems wrong.';
     RAISERROR(@12h_fail, 16, 1) WITH NOWAIT;
 END
 GO

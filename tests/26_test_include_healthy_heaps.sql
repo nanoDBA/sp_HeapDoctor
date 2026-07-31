@@ -43,75 +43,17 @@ SET @msg = N'HeapHealthy state: pages=' + CONVERT(nvarchar(20), @pages) + N', fo
 RAISERROR(@msg, 10, 1) WITH NOWAIT;
 
 IF @fwd <> 0
-    RAISERROR(N'  *** SETUP FAIL: HeapHealthy unexpectedly has forwarded records.', 16, 1);
+    RAISERROR(N'  FAIL 26-SETUP: HeapHealthy unexpectedly has forwarded records.', 16, 1);
 IF @pages < 1000
-    RAISERROR(N'  *** SETUP FAIL: HeapHealthy must have >= 1000 pages for @MinPages=1000 baseline.', 16, 1);
+    RAISERROR(N'  FAIL 26-SETUP: HeapHealthy must have >= 1000 pages for @MinPages=1000 baseline.', 16, 1);
 GO
 
 ------------------------------------------------------------------------
 -- Capture table (matches sp_HeapDoctor first result set)
 ------------------------------------------------------------------------
 IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
-CREATE TABLE #Results
-(
-    version                nvarchar(20)  NULL,
-    target_id              int           NOT NULL,
-    sort_order             int           NOT NULL,
-    database_name          sysname       NOT NULL,
-    schema_name            sysname       NOT NULL,
-    table_name             sysname       NOT NULL,
-    page_count             bigint        NOT NULL,
-    record_count           bigint        NULL,
-    forwarded_record_count bigint        NOT NULL,
-    forwarded_pct          decimal(6,2)  NOT NULL,
-    forwarded_fetch_count  bigint        NULL,
-    avg_page_space_pct     decimal(5,2)  NULL,
-    avg_frag_pct           decimal(5,2)  NULL,
-    ghost_record_count     bigint        NULL,
-    total_cpu_ms           bigint        NULL,
-    ranking_basis          varchar(20)   NOT NULL,
-    nci_count              int           NOT NULL,
-    key_source_index       sysname       NULL,
-    action_chosen          varchar(32)   NOT NULL,
-    est_pages_per_sec      float         NULL,
-    est_seconds            int           NULL,
-    est_duration           nvarchar(20)  NULL,
-    qs_snapshot_time_utc   datetime2(3)  NULL,
-    qs_total_logical_reads bigint        NULL,
-    qs_total_physical_reads bigint       NULL,
-    qs_total_duration_ms   bigint        NULL,
-    qs_total_executions    bigint        NULL,
-    qs_plan_count          int           NULL,
-    qs_query_count         int           NULL,
-    usage_hint             varchar(30)   NULL,
-    ranking_score          decimal(8,4)  NULL,
-    ranking_algo_version   nvarchar(10)  NULL,
-    heap_compression       varchar(4)    NULL,
-    replication_hint       varchar(20)   NULL,
-    lock_escalation        varchar(10)   NULL,
-    partition_count        int           NULL,
-    has_schema_bound_views int           NULL,
-    has_indexed_views      int           NULL,
-    has_fk_references      int           NULL,
-    fk_ref_count           int           NULL,
-    filegroup_name         sysname       NULL,
-    command_text           nvarchar(max) NULL,
-    ci_drop_command        nvarchar(max) NULL,
-    verify_command         nvarchar(max) NULL,
-    prev_forwarded_pct     decimal(6,2)  NULL,
-    rebuilds_in_90d        int           NULL,
-    size_mb                decimal(18,2) NULL,
-    est_space_savings_mb   decimal(18,2) NULL,
-    est_ci_swap_overhead_mb decimal(18,2) NULL,
-    est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL,
-    sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL,
-    page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL,
-    is_temporal_history    bit           NULL,
-    recommended_action     nvarchar(50)  NULL
-);
+/* #190: the column list lives once, in dbo.ResultsTemplate (see 01_setup_test_data.sql) */
+SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
 ------------------------------------------------------------------------
@@ -129,7 +71,7 @@ EXEC dbo.sp_HeapDoctor
 IF NOT EXISTS (SELECT 1 FROM #Results WHERE table_name = N'HeapHealthy')
     RAISERROR(N'  PASS 26A-1: HeapHealthy correctly excluded by default.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 26A-1: HeapHealthy should not appear when @IncludeHealthyHeaps=0.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 26A-1: HeapHealthy should not appear when @IncludeHealthyHeaps=0.', 10, 1) WITH NOWAIT;
 
 /* Sanity: HeapA/B/C should still appear (regression check on existing filter). */
 DECLARE @forwarded_count int = (SELECT COUNT_BIG(*) FROM #Results WHERE table_name IN (N'HeapA', N'HeapB', N'HeapC'));
@@ -137,7 +79,7 @@ IF @forwarded_count = 3
     RAISERROR(N'  PASS 26A-2: HeapA/B/C still discovered (existing filter intact).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @msg26a2 nvarchar(200) = N'  *** FAIL 26A-2: Expected 3 forwarded heaps, found ' + CONVERT(nvarchar(10), @forwarded_count);
+    DECLARE @msg26a2 nvarchar(200) = N'  FAIL 26A-2: Expected 3 forwarded heaps, found ' + CONVERT(nvarchar(10), @forwarded_count);
     RAISERROR(@msg26a2, 10, 1) WITH NOWAIT;
 END
 GO
@@ -158,14 +100,14 @@ EXEC dbo.sp_HeapDoctor
 IF EXISTS (SELECT 1 FROM #Results WHERE table_name = N'HeapHealthy' AND forwarded_record_count = 0)
     RAISERROR(N'  PASS 26B-1: HeapHealthy appears with @IncludeHealthyHeaps=1 (zero forwarded records).', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 26B-1: HeapHealthy missing when @IncludeHealthyHeaps=1.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 26B-1: HeapHealthy missing when @IncludeHealthyHeaps=1.', 10, 1) WITH NOWAIT;
 
 /* HeapD is tiny (~50 rows, well under 1000 pages) and must still be filtered by @MinPages,
    proving @IncludeHealthyHeaps bypasses ONLY the forwarded-record filters. */
 IF NOT EXISTS (SELECT 1 FROM #Results WHERE table_name = N'HeapD')
     RAISERROR(N'  PASS 26B-2: HeapD still filtered by @MinPages (bypass is targeted, not global).', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  *** FAIL 26B-2: HeapD should still be excluded by @MinPages even with @IncludeHealthyHeaps=1.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 26B-2: HeapD should still be excluded by @MinPages even with @IncludeHealthyHeaps=1.', 10, 1) WITH NOWAIT;
 
 /* Ranking sanity: HeapHealthy has 0 forwarded -> forwarded_pct term is 0, fetch_rate term is 0.
    With CpuSource=NONE, cpu_ms term is 0 too. Score should be ~0 (or NULL-safe small value). */
@@ -174,7 +116,7 @@ IF @score IS NOT NULL AND @score < 0.5
     RAISERROR(N'  PASS 26B-3: ranking_score collapses near 0 for healthy heap (as expected).', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @scoreMsg nvarchar(200) = N'  *** FAIL 26B-3: Expected ranking_score < 0.5 for healthy heap, got '
+    DECLARE @scoreMsg nvarchar(200) = N'  FAIL 26B-3: Expected ranking_score < 0.5 for healthy heap, got '
         + ISNULL(CONVERT(nvarchar(20), @score), N'NULL');
     RAISERROR(@scoreMsg, 10, 1) WITH NOWAIT;
 END
@@ -200,7 +142,7 @@ IF (SELECT COUNT_BIG(*) FROM #Results) = 1
 ELSE
 BEGIN
     DECLARE @cnt int = (SELECT COUNT_BIG(*) FROM #Results);
-    DECLARE @cntMsg nvarchar(200) = N'  *** FAIL 26C-1: Expected 1 row (HeapHealthy), got ' + CONVERT(nvarchar(10), @cnt);
+    DECLARE @cntMsg nvarchar(200) = N'  FAIL 26C-1: Expected 1 row (HeapHealthy), got ' + CONVERT(nvarchar(10), @cnt);
     RAISERROR(@cntMsg, 10, 1) WITH NOWAIT;
 END
 GO
@@ -230,7 +172,7 @@ IF @latest_cmd LIKE N'%@IncludeHealthyHeaps = 1%'
     RAISERROR(N'  PASS 26D-1: @invocation_command includes "@IncludeHealthyHeaps = 1".', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @cmdMsg nvarchar(2000) = N'  *** FAIL 26D-1: Command did not log @IncludeHealthyHeaps. Got: '
+    DECLARE @cmdMsg nvarchar(2000) = N'  FAIL 26D-1: Command did not log @IncludeHealthyHeaps. Got: '
         + ISNULL(LEFT(@latest_cmd, 1500), N'NULL');
     RAISERROR(@cmdMsg, 10, 1) WITH NOWAIT;
 END

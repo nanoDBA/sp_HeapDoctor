@@ -116,6 +116,97 @@ END
 GO
 
 ------------------------------------------------------------------------
+-- 2c) dbo.ResultsTemplate - THE single definition of sp_HeapDoctor's first
+--     result set (#190).
+--
+--     Test files used to each declare this column list in their own
+--     #Results DDL. With 25 files x 58 columns, adding one result-set column
+--     meant editing 25 files, and missing one failed at runtime with
+--     Msg 213 only when that file ran.
+--
+--     Tests now do:  SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
+--
+--     Why a template table rather than generating from metadata:
+--     sys.dm_exec_describe_first_result_set cannot describe sp_HeapDoctor --
+--     it returns error 11529 ("every code path results in an error")
+--     because the procedure references dbo.QueueHeapRebuild, which only
+--     exists at runtime in parallel mode. Verified, not assumed.
+--
+--     WHEN THE RESULT SET CHANGES, EDIT THIS TABLE. Nothing else.
+------------------------------------------------------------------------
+IF OBJECT_ID(N'dbo.ResultsTemplate', N'U') IS NOT NULL DROP TABLE dbo.ResultsTemplate;
+CREATE TABLE dbo.ResultsTemplate
+(
+
+    version                 nvarchar(20)   NULL,
+    target_id               integer        NOT NULL,
+    sort_order              integer        NOT NULL,
+    database_name           sysname        NOT NULL,
+    schema_name             sysname        NOT NULL,
+    table_name              sysname        NOT NULL,
+    page_count              bigint         NOT NULL,
+    record_count            bigint         NULL,
+    forwarded_record_count  bigint         NOT NULL,
+    forwarded_pct           decimal(6,2)   NOT NULL,
+    forwarded_fetch_count   bigint         NULL,
+    avg_page_space_pct      decimal(5,2)   NULL,
+    avg_frag_pct            decimal(5,2)   NULL,
+    ghost_record_count      bigint         NULL,
+    total_cpu_ms            bigint         NULL,
+    ranking_basis           varchar(20)    NOT NULL,
+    nci_count               integer        NOT NULL,
+    key_source_index        sysname        NULL,
+    action_chosen           varchar(32)    NOT NULL,
+    est_pages_per_sec       float          NULL,
+    est_seconds             integer        NULL,
+    est_duration            nvarchar(20)   NULL,
+    qs_snapshot_time_utc    datetime2(3)   NULL,
+    qs_total_logical_reads  bigint         NULL,
+    qs_total_physical_reads bigint         NULL,
+    qs_total_duration_ms    bigint         NULL,
+    qs_total_executions     bigint         NULL,
+    qs_plan_count           integer        NULL,
+    qs_query_count          integer        NULL,
+    usage_hint              varchar(30)    NULL,
+    ranking_score           decimal(8,4)   NULL,
+    ranking_algo_version    nvarchar(10)   NULL,
+    heap_compression        varchar(4)     NULL,
+    replication_hint        varchar(20)    NULL,
+    lock_escalation         varchar(10)    NULL,
+    partition_count         integer        NULL,
+    has_schema_bound_views  integer        NULL,
+    has_indexed_views       integer        NULL,
+    has_fk_references       integer        NULL,
+    fk_ref_count            integer        NULL,
+    filegroup_name          sysname        NULL,
+    command_text            nvarchar(max)  NULL,
+    ci_drop_command         nvarchar(max)  NULL,
+    verify_command          nvarchar(max)  NULL,
+    prev_forwarded_pct      decimal(6,2)   NULL,
+    rebuilds_in_90d         integer        NULL,
+    size_mb                 decimal(18,2)  NULL,
+    est_space_savings_mb    decimal(18,2)  NULL,
+    est_ci_swap_overhead_mb decimal(18,2)  NULL,
+    est_log_mb              decimal(18,2)  NULL,
+    days_since_last_rebuild integer        NULL,
+    sqlserver_start_time    datetime       NULL,
+    uptime_hours            decimal(10,1)  NULL,
+    page_io_latch_wait_count bigint        NULL,
+    page_io_latch_wait_ms   bigint         NULL,
+    is_temporal_history     bit            NULL,
+    recommended_action      nvarchar(50)   NULL
+);
+/*
+Clustered on purpose: a HEAP here would be discovered by sp_HeapDoctor as a
+scan candidate and shift the heap counts that several tests assert on
+("Found all 3 expected heaps"). Discovery filters sys.indexes WHERE type = 0,
+so a clustered table is invisible to it. The clustering is irrelevant to
+consumers, which only ever do SELECT ... INTO ... WHERE 1 = 0 for the shape.
+*/
+CREATE CLUSTERED INDEX CX_ResultsTemplate ON dbo.ResultsTemplate(target_id);
+GO
+
+------------------------------------------------------------------------
 -- 3) Create test heaps
 ------------------------------------------------------------------------
 

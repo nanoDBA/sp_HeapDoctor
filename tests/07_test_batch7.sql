@@ -23,66 +23,8 @@ GO
 -- Reusable capture table (matches first result set of sp_HeapDoctor)
 ------------------------------------------------------------------------
 IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
-CREATE TABLE #Results
-(
-    version                nvarchar(20)  NULL,
-    target_id              int           NOT NULL,
-    sort_order             int           NOT NULL,
-    database_name          sysname       NOT NULL,
-    schema_name            sysname       NOT NULL,
-    table_name             sysname       NOT NULL,
-    page_count             bigint        NOT NULL,
-    record_count           bigint        NULL,
-    forwarded_record_count bigint        NOT NULL,
-    forwarded_pct          decimal(6,2)  NOT NULL,
-    forwarded_fetch_count  bigint        NULL,
-    avg_page_space_pct     decimal(5,2)  NULL,
-    avg_frag_pct           decimal(5,2)  NULL,
-    ghost_record_count     bigint        NULL,
-    total_cpu_ms           bigint        NULL,
-    ranking_basis          varchar(20)   NOT NULL,
-    nci_count              int           NOT NULL,
-    key_source_index       sysname       NULL,
-    action_chosen          varchar(32)   NOT NULL,
-    est_pages_per_sec      float         NULL,
-    est_seconds            int           NULL,
-    est_duration           nvarchar(20)  NULL,
-    qs_snapshot_time_utc   datetime2(3)  NULL,
-    qs_total_logical_reads bigint        NULL,
-    qs_total_physical_reads bigint       NULL,
-    qs_total_duration_ms   bigint        NULL,
-    qs_total_executions    bigint        NULL,
-    qs_plan_count          int           NULL,
-    qs_query_count         int           NULL,
-    usage_hint             varchar(30)   NULL,
-    ranking_score          decimal(8,4)  NULL,
-    ranking_algo_version   nvarchar(10)  NULL,
-    heap_compression       varchar(4)    NULL,
-    replication_hint       varchar(20)   NULL,
-    lock_escalation        varchar(10)   NULL,
-    partition_count        int           NULL,
-    has_schema_bound_views int           NULL,
-    has_indexed_views      int           NULL,
-    has_fk_references      int           NULL,
-    fk_ref_count           int           NULL,
-    filegroup_name         sysname       NULL,
-    command_text           nvarchar(max) NULL,
-    ci_drop_command        nvarchar(max) NULL,
-    verify_command         nvarchar(max) NULL,
-    prev_forwarded_pct     decimal(6,2)  NULL,
-    rebuilds_in_90d        int           NULL,
-    size_mb                decimal(18,2) NULL,
-    est_space_savings_mb   decimal(18,2) NULL,
-    est_ci_swap_overhead_mb decimal(18,2) NULL,
-    est_log_mb             decimal(18,2) NULL,
-    days_since_last_rebuild int           NULL,
-    sqlserver_start_time   datetime      NULL,
-    uptime_hours           decimal(10,1) NULL,
-    page_io_latch_wait_count bigint      NULL,
-    page_io_latch_wait_ms  bigint        NULL,
-    is_temporal_history    bit           NULL,
-    recommended_action     nvarchar(50)  NULL
-);
+/* #190: the column list lives once, in dbo.ResultsTemplate (see 01_setup_test_data.sql) */
+SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
 IF OBJECT_ID('tempdb..#TestCounts') IS NOT NULL DROP TABLE #TestCounts;
@@ -147,12 +89,12 @@ EXEC dbo.sp_HeapDoctor
 -- All test heaps should have NULL replication_hint (not replicated)
 IF NOT EXISTS (SELECT 1 FROM #Results WHERE replication_hint IS NOT NULL)
 BEGIN
-    RAISERROR(N'  PASS: 7A - replication_hint is NULL for all non-replicated heaps.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7A: replication_hint is NULL for all non-replicated heaps.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7A - replication_hint is unexpectedly non-NULL.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7A: replication_hint is unexpectedly non-NULL.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -176,12 +118,12 @@ EXEC dbo.sp_HeapDoctor
 IF EXISTS (SELECT 1 FROM #Results WHERE lock_escalation = 'TABLE')
    AND NOT EXISTS (SELECT 1 FROM #Results WHERE lock_escalation NOT IN ('TABLE', 'AUTO', 'DISABLE'))
 BEGIN
-    RAISERROR(N'  PASS: 7B - lock_escalation column populated with valid values.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7B: lock_escalation column populated with valid values.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7B - lock_escalation column has unexpected values.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7B: lock_escalation column has unexpected values.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -206,12 +148,12 @@ EXEC dbo.sp_HeapDoctor
 
 IF EXISTS (SELECT 1 FROM #Results WHERE table_name = 'HeapA' AND lock_escalation = 'AUTO')
 BEGIN
-    RAISERROR(N'  PASS: 7B2 - HeapA shows lock_escalation = AUTO.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7B2: HeapA shows lock_escalation = AUTO.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7B2 - HeapA does not show lock_escalation = AUTO.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7B2: HeapA does not show lock_escalation = AUTO.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 
@@ -249,12 +191,12 @@ IF EXISTS (SELECT 1 FROM #Results
            WHERE table_name = 'HeapB'
              AND command_text LIKE '%DROP INDEX%CX__Temp__HeapB%CREATE CLUSTERED INDEX%')
 BEGIN
-    RAISERROR(N'  PASS: 7C - Leftover temp CI detected; command includes DROP+CREATE.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7C: Leftover temp CI detected; command includes DROP+CREATE.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7C - Leftover temp CI not detected or command missing DROP prefix.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7C: Leftover temp CI not detected or command missing DROP prefix.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 
@@ -285,12 +227,12 @@ IF EXISTS (SELECT 1 FROM #Results
              AND action_chosen = 'CI_SWAP_ONLINE'
              AND command_text NOT LIKE '%DROP INDEX%')
 BEGIN
-    RAISERROR(N'  PASS: 7C2 - No leftover CI; command is CREATE only (no DROP prefix).', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7C2: No leftover CI; command is CREATE only (no DROP prefix).', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7C2 - Command unexpectedly has DROP prefix or HeapB not found.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7C2: Command unexpectedly has DROP prefix or HeapB not found.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -319,12 +261,12 @@ EXEC dbo.sp_HeapDoctor
 -- Verify proc ran and returned results (the RCSI warning is message-based)
 IF EXISTS (SELECT 1 FROM #Results)
 BEGIN
-    RAISERROR(N'  PASS: 7E - Proc runs successfully with RCSI enabled.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7E: Proc runs successfully with RCSI enabled.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7E - No results returned with RCSI enabled.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7E: No results returned with RCSI enabled.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 
@@ -344,18 +286,18 @@ Test that @ScanThrottleMs rejects invalid values.
 -- Test negative value
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @ScanThrottleMs = -1, @PlanOnly = 1;
-    RAISERROR(N'  FAIL: 7G1 - Negative @ScanThrottleMs was not rejected.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7G1: Negative @ScanThrottleMs was not rejected.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END TRY
 BEGIN CATCH
     IF ERROR_MESSAGE() LIKE '%ScanThrottleMs%'
     BEGIN
-        RAISERROR(N'  PASS: 7G1 - Negative @ScanThrottleMs correctly rejected.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  PASS 7G1: Negative @ScanThrottleMs correctly rejected.', 10, 1) WITH NOWAIT;
         UPDATE #TestCounts SET PassCount += 1;
     END
     ELSE
     BEGIN
-        RAISERROR(N'  FAIL: 7G1 - Wrong error for negative @ScanThrottleMs.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  FAIL 7G1: Wrong error for negative @ScanThrottleMs.', 10, 1) WITH NOWAIT;
         UPDATE #TestCounts SET FailCount += 1;
     END
 END CATCH
@@ -363,18 +305,18 @@ END CATCH
 -- Test value > 60000
 BEGIN TRY
     EXEC dbo.sp_HeapDoctor @ScanThrottleMs = 99999, @PlanOnly = 1;
-    RAISERROR(N'  FAIL: 7G2 - @ScanThrottleMs > 60000 was not rejected.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7G2: @ScanThrottleMs > 60000 was not rejected.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END TRY
 BEGIN CATCH
     IF ERROR_MESSAGE() LIKE '%ScanThrottleMs%'
     BEGIN
-        RAISERROR(N'  PASS: 7G2 - @ScanThrottleMs > 60000 correctly rejected.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  PASS 7G2: @ScanThrottleMs > 60000 correctly rejected.', 10, 1) WITH NOWAIT;
         UPDATE #TestCounts SET PassCount += 1;
     END
     ELSE
     BEGIN
-        RAISERROR(N'  FAIL: 7G2 - Wrong error for @ScanThrottleMs > 60000.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  FAIL 7G2: Wrong error for @ScanThrottleMs > 60000.', 10, 1) WITH NOWAIT;
         UPDATE #TestCounts SET FailCount += 1;
     END
 END CATCH
@@ -395,12 +337,12 @@ EXEC dbo.sp_HeapDoctor
 
 IF EXISTS (SELECT 1 FROM #Results)
 BEGIN
-    RAISERROR(N'  PASS: 7G3 - @ScanThrottleMs = 0 runs without error.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7G3: @ScanThrottleMs = 0 runs without error.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7G3 - No results returned with @ScanThrottleMs = 0.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7G3: No results returned with @ScanThrottleMs = 0.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
@@ -419,14 +361,14 @@ EXEC dbo.sp_HeapDoctor
 
 IF EXISTS (SELECT 1 FROM #Results WHERE version LIKE '2026.%')
 BEGIN
-    RAISERROR(N'  PASS: 7H - Version format valid.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7H: Version format valid.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @actual_version nvarchar(20);
     SELECT TOP 1 @actual_version = version FROM #Results;
-    DECLARE @Msg7H nvarchar(200) = N'  FAIL: 7H - Expected version 2026.x, got: ' + ISNULL(@actual_version, N'NULL');
+    DECLARE @Msg7H nvarchar(200) = N'  FAIL 7H: Expected version 2026.x, got: ' + ISNULL(@actual_version, N'NULL');
     RAISERROR(@Msg7H, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
@@ -473,12 +415,12 @@ IF EXISTS (
       AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%<LockEscalation>%'
 )
 BEGIN
-    RAISERROR(N'  PASS: 7I - ExtendedInfo contains LockEscalation element.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 7I: ExtendedInfo contains LockEscalation element.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL: 7I - ExtendedInfo missing LockEscalation element.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 7I: ExtendedInfo missing LockEscalation element.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO
