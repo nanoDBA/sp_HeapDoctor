@@ -125,7 +125,7 @@ ELSE
 DECLARE @3a_rebuild_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
 );
 IF @3a_rebuild_count >= 3
 BEGIN
@@ -152,7 +152,7 @@ END
 DECLARE @3a_post_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ExtendedInfo IS NOT NULL
       AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%PostRebuildForwardedRecords%'
 );
@@ -168,7 +168,7 @@ END
 DECLARE @3a_size_zero int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ExtendedInfo IS NOT NULL
       AND ExtendedInfo.value('(/ExtendedInfo/SizeMB)[1]', 'decimal(18,2)') = 0
 );
@@ -200,7 +200,7 @@ ELSE
 DECLARE @3a_missing_names int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND (DatabaseName IS NULL OR SchemaName IS NULL OR ObjectName IS NULL)
 );
 IF @3a_missing_names = 0
@@ -218,8 +218,8 @@ DECLARE @3a_order_bad int = (
     INNER JOIN dbo.CommandLog cl2
         ON cl1.ID < cl2.ID
        AND cl1.StartTime > cl2.StartTime
-    WHERE cl1.CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
-      AND cl2.CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE cl1.CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
+      AND cl2.CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
 );
 IF @3a_order_bad = 0
     RAISERROR(N'  PASS 3A-10: CommandLog entries in chronological order.', 10, 1) WITH NOWAIT;
@@ -233,7 +233,7 @@ END
 DECLARE @3a_bad_cmds int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND Command NOT LIKE 'ALTER TABLE%'
       AND Command NOT LIKE 'CREATE CLUSTERED INDEX%'
 );
@@ -249,7 +249,7 @@ END
 DECLARE @3a_qs_present int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
       AND ExtendedInfo.exist('(/ExtendedInfo/QsTotalLogicalReads)[1]') = 1
 );
@@ -265,7 +265,7 @@ END
 DECLARE @3a_ffc_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
       AND ExtendedInfo.exist('(/ExtendedInfo/ForwardedFetchCount)[1]') = 1
 );
@@ -283,7 +283,7 @@ ELSE
 DECLARE @3a_idx_bad int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND (IndexType IS NULL OR IndexType <> 0)
 );
 IF @3a_idx_bad = 0
@@ -529,7 +529,7 @@ ELSE
 DECLARE @3d_rebuilt int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ErrorMessage NOT LIKE '%SKIPPED%'
 );
 
@@ -771,13 +771,13 @@ GO
 DECLARE @3f_rebuild_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
 );
 DECLARE @3f_qs_reads_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
       AND ExtendedInfo.exist('(/ExtendedInfo/QsTotalLogicalReads)[1]') = 1
 );
@@ -798,7 +798,7 @@ ELSE
 DECLARE @3f_qs_hashes_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
       AND ExtendedInfo.exist('(/ExtendedInfo/QsQueryHashes)[1]') = 1
       AND LEN(ExtendedInfo.value('(/ExtendedInfo/QsQueryHashes)[1]', 'nvarchar(max)')) > 0
@@ -818,7 +818,7 @@ ELSE
 DECLARE @3f_qs_snap_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
       AND ExtendedInfo.exist('(/ExtendedInfo/QsSnapshotTimeUtc)[1]') = 1
 );
@@ -839,7 +839,7 @@ SELECT ID, CommandType, ObjectName,
     ExtendedInfo.value('(/ExtendedInfo/QsQueryHashes)[1]', 'nvarchar(max)') AS QsQueryHashes,
     ExtendedInfo.value('(/ExtendedInfo/QsSnapshotTimeUtc)[1]', 'nvarchar(50)') AS QsSnapshotTimeUtc
 FROM dbo.CommandLog
-WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
 ORDER BY ID;
 GO
 
@@ -854,14 +854,14 @@ RAISERROR(N'================================================================', 1
 DECLARE @3g_score_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
       AND ExtendedInfo.exist('(/ExtendedInfo/RankingScore)[1]') = 1
 );
 DECLARE @3g_rebuild_count int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
 );
 
@@ -880,7 +880,7 @@ END
 DECLARE @3g_positive int = (
     SELECT COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) = 0
       AND ExtendedInfo.value('(/ExtendedInfo/RankingScore)[1]', 'decimal(8,4)') > 0
 );

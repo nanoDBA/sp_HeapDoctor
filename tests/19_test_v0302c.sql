@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.2: Batch A+C features
+sp_HeapDoctor Test Harness - v2026.07.31.3: Batch A+C features
 
 Tests:
   -- Issue #68: SQL 2017 version check --
@@ -25,7 +25,7 @@ Tests:
   19J - @AllowReplicationRebuild=1 appears in invocation_command
 
   -- Version --
-  19V - Version is 2026.07.31.2
+  19V - Version is 2026.07.31.3
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 19_test_v0302c.sql
@@ -44,7 +44,7 @@ IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
 SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
-RAISERROR(N'=== Batch 19: v2026.07.31.2 (#68, #18, #75, #78, #63, #89) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 19: v2026.07.31.3 (#68, #18, #75, #78, #63, #89) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 19A: #68 - SQL 2017 version check code exists in proc definition
@@ -364,10 +364,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver19 nvarchar(20);
 SELECT TOP 1 @ver19 = version FROM #Results;
 
-IF @ver19 = N'2026.07.31.2'
-    RAISERROR(N'  PASS 19V: Version is 2026.07.31.2.', 10, 1) WITH NOWAIT;
+IF @ver19 = N'2026.07.31.3'
+    RAISERROR(N'  PASS 19V: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 19V: Version is %s (expected 2026.07.31.2).', 10, 1, @ver19) WITH NOWAIT;
+    RAISERROR(N'  FAIL 19V: Version is %s (expected 2026.07.31.3).', 10, 1, @ver19) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

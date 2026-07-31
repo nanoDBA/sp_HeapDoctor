@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.2: Batch I resumable + temporal
+sp_HeapDoctor Test Harness - v2026.07.31.3: Batch I resumable + temporal
 
 Tests:
   -- Issue #85: Resumable index for CI swap --
@@ -17,7 +17,7 @@ Tests:
   25J - @IncludeTemporalHistory in invocation_command
 
   -- Version --
-  25V - Version is 2026.07.31.2
+  25V - Version is 2026.07.31.3
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 25_test_v0302i.sql
@@ -33,7 +33,7 @@ IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
 SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
-RAISERROR(N'=== Batch 25: v2026.07.31.2 (#85, #84) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 25: v2026.07.31.3 (#85, #84) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 25A: #85 - @UseResumable=1 accepted (default)
@@ -340,10 +340,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver25 nvarchar(20);
 SELECT TOP 1 @ver25 = version FROM #Results;
 
-IF @ver25 = N'2026.07.31.2'
-    RAISERROR(N'  PASS 25V: Version is 2026.07.31.2.', 10, 1) WITH NOWAIT;
+IF @ver25 = N'2026.07.31.3'
+    RAISERROR(N'  PASS 25V: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 25V: Version is %s (expected 2026.07.31.2).', 10, 1, @ver25) WITH NOWAIT;
+    RAISERROR(N'  FAIL 25V: Version is %s (expected 2026.07.31.3).', 10, 1, @ver25) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

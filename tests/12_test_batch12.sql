@@ -3,7 +3,7 @@ sp_HeapDoctor Test Harness - Batch 12: Throughput/ETA Improvements
 
 Tests:
   -- Smoke Tests --
-  12A - Version is 2026.07.31.2
+  12A - Version is 2026.07.31.3
   12B - DurationMs populated in per-rebuild success ExtendedInfo
   12C - ActualPagesPerSec populated in per-rebuild success ExtendedInfo
 
@@ -95,15 +95,15 @@ RAISERROR(N'Checking version...', 10, 1) WITH NOWAIT;
 DECLARE @12a_version nvarchar(50);
 SELECT TOP (1) @12a_version = ExtendedInfo.value('(/ExtendedInfo/Version)[1]', 'nvarchar(50)')
 FROM dbo.CommandLog
-WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY')
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY', 'HEAP_TARGET_EVENT')
   AND ISNULL(ErrorNumber, 0) = 0
 ORDER BY ID;
 
-IF @12a_version = N'2026.07.31.2'
-    RAISERROR(N'  PASS 12A: Version is 2026.07.31.2.', 10, 1) WITH NOWAIT;
+IF @12a_version = N'2026.07.31.3'
+    RAISERROR(N'  PASS 12A: Version is 2026.07.31.3.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
-    DECLARE @12a_msg nvarchar(200) = N'  FAIL 12A: Expected version 2026.07.31.2, got ' + ISNULL(@12a_version, N'NULL');
+    DECLARE @12a_msg nvarchar(200) = N'  FAIL 12A: Expected version 2026.07.31.3, got ' + ISNULL(@12a_version, N'NULL');
     RAISERROR(@12a_msg, 16, 1) WITH NOWAIT;
 END
 GO
@@ -115,14 +115,14 @@ RAISERROR(N'Checking DurationMs in success ExtendedInfo...', 10, 1) WITH NOWAIT;
 DECLARE @12b_has_duration int;
 SELECT @12b_has_duration = COUNT(*)
 FROM dbo.CommandLog
-WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY')
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY', 'HEAP_TARGET_EVENT')
   AND ISNULL(ErrorNumber, 0) = 0
   AND ExtendedInfo.value('(/ExtendedInfo/DurationMs)[1]', 'int') IS NOT NULL;
 
 DECLARE @12b_total int;
 SELECT @12b_total = COUNT(*)
 FROM dbo.CommandLog
-WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY')
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY', 'HEAP_TARGET_EVENT')
   AND ISNULL(ErrorNumber, 0) = 0;
 
 IF @12b_has_duration = @12b_total AND @12b_total > 0
@@ -144,7 +144,7 @@ RAISERROR(N'Checking ActualPagesPerSec in success ExtendedInfo...', 10, 1) WITH 
 DECLARE @12c_has_pps int;
 SELECT @12c_has_pps = COUNT(*)
 FROM dbo.CommandLog
-WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY')
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY', 'HEAP_TARGET_EVENT')
   AND ISNULL(ErrorNumber, 0) = 0
   AND ExtendedInfo.value('(/ExtendedInfo/ActualPagesPerSec)[1]', 'int') IS NOT NULL;
 
@@ -170,7 +170,7 @@ RAISERROR(N'Checking DurationMs in failure ExtendedInfo...', 10, 1) WITH NOWAIT;
 DECLARE @12d_fail_count int;
 SELECT @12d_fail_count = COUNT(*)
 FROM dbo.CommandLog
-WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY')
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY', 'HEAP_TARGET_EVENT')
   AND ISNULL(ErrorNumber, 0) <> 0;
 
 IF @12d_fail_count = 0
@@ -183,7 +183,7 @@ BEGIN
     DECLARE @12d_has_duration int;
     SELECT @12d_has_duration = COUNT(*)
     FROM dbo.CommandLog
-    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY')
+    WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY', 'HEAP_TARGET_EVENT')
       AND ISNULL(ErrorNumber, 0) <> 0
       AND ExtendedInfo.value('(/ExtendedInfo/DurationMs)[1]', 'int') IS NOT NULL;
 
@@ -363,7 +363,7 @@ SELECT
     @12h_min_pps = MIN(ExtendedInfo.value('(/ExtendedInfo/ActualPagesPerSec)[1]', 'int')),
     @12h_max_pps = MAX(ExtendedInfo.value('(/ExtendedInfo/ActualPagesPerSec)[1]', 'int'))
 FROM dbo.CommandLog
-WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY')
+WHERE CommandType NOT IN ('HEAP_REBUILD_START', 'HEAP_REBUILD_END', 'HEAP_SCAN_SUMMARY', 'HEAP_TARGET_EVENT')
   AND ISNULL(ErrorNumber, 0) = 0
   AND ExtendedInfo.value('(/ExtendedInfo/ActualPagesPerSec)[1]', 'int') IS NOT NULL;
 

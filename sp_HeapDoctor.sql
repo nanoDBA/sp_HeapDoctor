@@ -51,9 +51,33 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.31.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.31.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.31.2 - #189: Reject @ScanMode = 'LIMITED' instead of failing inside discovery
+History:    2026.07.31.3 - #187: Durable per-target disposition stream
+                          - New CommandType 'HEAP_TARGET_EVENT': one durable event per disposed
+                            target, keyed by RunID + TargetId at a FIXED ExtendedInfo path in
+                            every row, with branch-specific facts confined under <Detail>.
+                          - Emitted once, after the execution loop, from #ExecLog rather than at
+                            each disposition branch. #ExecLog already holds exactly one row per
+                            disposed target, so "exactly one terminal event" is structural, and
+                            all six early-CONTINUE skip paths are covered without touching the
+                            loop's control flow.
+                          - #ExecLog gains recovery_required. A CI swap whose DROP failed leaves
+                            the table CLUSTERED and needing manual remediation, yet the success
+                            counter still advances -- that outcome was previously indistinguishable
+                            from a clean success. It now emits RECOVERY_REQUIRED.
+                          - ACTION_CHANGED (non-terminal) records where the executed action differs
+                            from the action chosen at discovery, which the durable discovery row
+                            cannot express.
+                          - Gated on @LogToTable and the CommandLog schema check; wrapped in
+                            TRY/CATCH so the stream can never break an otherwise successful run.
+                            Names come from #ExecLog, so obfuscation is inherited.
+                          - tools/sp_HeapDoctor_TargetEvents.sql shreds the stream into a view.
+                            Not created automatically -- the procedure does not install objects in
+                            the user's database uninvited.
+                          - HEAP_REBUILD_END remains the authoritative run summary.
+                          - New test file: 35_test_v0731c.sql
+            2026.07.31.2 - #189: Reject @ScanMode = 'LIMITED' instead of failing inside discovery
                           - LIMITED passed validation and then failed with error 515 (NOT NULL
                             violation on #Heaps.forwarded_record_count), surfacing as a
                             per-database scan error plus an empty target list -- easy to misread
@@ -724,7 +748,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.07.31.2';
+    DECLARE @Version nvarchar(20) = N'2026.07.31.3';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -2278,7 +2302,13 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         end_time      datetime2(3)  NULL,
         succeeded     bit           NULL,
         error_number  integer           NULL,
-        error_message nvarchar(4000) NULL
+        error_message nvarchar(4000) NULL,
+        /*
+        #187: a CI swap whose DROP failed leaves the table CLUSTERED and needing
+        manual remediation, yet the success counter still advances. Without this
+        flag that outcome is indistinguishable from a clean success.
+        */
+        recovery_required bit          NOT NULL DEFAULT 0
     );
 
 /*#endregion 09-TEMP-TABLES */
@@ -6476,6 +6506,18 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END CATCH
                 END
 
+                /*
+                #187: record RECOVERY_REQUIRED here, not on the success UPDATE.
+                That UPDATE runs BEFORE the CI swap DROP is attempted, so reading
+                @ci_drop_failed there would always see 0 and the outcome could
+                never be emitted. The flag is only meaningful once the DROP has
+                been tried.
+                */
+                IF @ci_drop_failed = 1
+                    UPDATE #ExecLog
+                      SET recovery_required = 1
+                    WHERE target_id = @tid;
+
                 SET @succeeded_cnt += 1;
 
                 /*
@@ -7055,6 +7097,122 @@ DEALLOCATE fk_child_cursor;';
                   AND qhr.SchemaName   = @schema
                   AND qhr.TableName    = @tbl;
             END
+        END
+
+        /*
+        #187: durable per-target disposition stream.
+
+        Emitted here, once, from #ExecLog -- deliberately NOT at each disposition
+        branch. #ExecLog already holds exactly one row per disposed target (skip
+        branches insert a terminal row; the rebuild path inserts a started row and
+        updates it), so driving the stream from it makes "exactly one terminal
+        event per target" structural rather than something tests must police, and
+        it covers every early-CONTINUE path for free.
+
+        CommandLog has no target_id column, so identity lives in ExtendedInfo. That
+        is only acceptable if the shape is rigid: RunID and TargetId sit at the SAME
+        fixed path in EVERY event row, with branch-specific detail confined under
+        <Detail> so it can never collide with the fixed fields.
+        tools/sp_HeapDoctor_TargetEvents.sql shreds these into a relational view.
+
+        Names come from #ExecLog, which already stores pseudonymised values when
+        @ObfuscateKey is set, so the stream inherits obfuscation.
+
+        Outcome mapping:
+            succeeded = 1 AND recovery_required = 1 -> RECOVERY_REQUIRED
+            succeeded = 1                           -> SUCCEEDED
+            succeeded = 0                           -> FAILED
+            succeeded IS NULL                       -> SKIPPED
+        */
+        IF @LogToTable = N'Y' AND @commandlog_exists = 1 AND EXISTS (SELECT 1 FROM #ExecLog)
+        BEGIN
+            BEGIN TRY
+                INSERT INTO dbo.CommandLog
+                    (DatabaseName, SchemaName, ObjectName, ObjectType, IndexType,
+                     Command, CommandType, StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+                SELECT
+                    el.database_name,
+                    /* #187: identify the object like every other durable row does */
+                    CASE WHEN @obfuscate = 1 THEN t.pseudo_schema_name ELSE t.schema_name END,
+                    CASE WHEN @obfuscate = 1 THEN t.pseudo_table_name  ELSE t.table_name  END,
+                    N'U',
+                    0,
+                    N'Target disposition for target_id ' + CONVERT(nvarchar(20), el.target_id),
+                    N'HEAP_TARGET_EVENT',
+                    el.start_time,
+                    ISNULL(el.end_time, el.start_time),
+                    el.error_number,
+                    el.error_message,
+                    (
+                        SELECT
+                            @Version                           AS Version,
+                            @RunID                             AS RunID,
+                            el.target_id                       AS TargetId,
+                            ISNULL(el.end_time, el.start_time) AS EventTime,
+                            N'TARGET_DISPOSITION'              AS EventCode,
+                            CONVERT(bit, 1)                    AS IsTerminalEvent,
+                            CASE WHEN el.succeeded IS NULL     THEN N'SKIPPED'
+                                 WHEN el.succeeded = 0         THEN N'FAILED'
+                                 WHEN el.recovery_required = 1 THEN N'RECOVERY_REQUIRED'
+                                 ELSE N'SUCCEEDED' END         AS OutcomeCode,
+                            ISNULL(el.error_message, N'')      AS MessageText,
+                            @@SPID                             AS SessionId,
+                            (
+                                SELECT
+                                    el.action            AS ActionExecuted,
+                                    el.error_number      AS ErrorNumber,
+                                    el.recovery_required AS RecoveryRequired
+                                FOR XML PATH(N'Detail'), TYPE
+                            )
+                        FOR XML PATH(N'TargetEvent'), TYPE
+                    )
+                FROM #ExecLog AS el
+                LEFT JOIN #Targets AS t ON t.target_id = el.target_id;
+
+                /*
+                Non-terminal event: the action actually executed differs from the
+                action chosen at discovery (a LOB column appeared, or the key-source
+                NCI was disabled). The durable discovery row still records the
+                original, so without this the change is unrecoverable.
+                */
+                INSERT INTO dbo.CommandLog
+                    (DatabaseName, SchemaName, ObjectName, ObjectType, IndexType,
+                     Command, CommandType, StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+                SELECT
+                    el.database_name,
+                    CASE WHEN @obfuscate = 1 THEN t.pseudo_schema_name ELSE t.schema_name END,
+                    CASE WHEN @obfuscate = 1 THEN t.pseudo_table_name  ELSE t.table_name  END,
+                    N'U', 0,
+                    N'Action changed for target_id ' + CONVERT(nvarchar(20), el.target_id),
+                    N'HEAP_TARGET_EVENT',
+                    el.start_time, ISNULL(el.end_time, el.start_time), NULL, NULL,
+                    (
+                        SELECT
+                            @Version          AS Version,
+                            @RunID            AS RunID,
+                            el.target_id      AS TargetId,
+                            el.start_time     AS EventTime,
+                            N'ACTION_CHANGED' AS EventCode,
+                            CONVERT(bit, 0)   AS IsTerminalEvent,
+                            N'ACTION_CHANGED' AS OutcomeCode,
+                            N'Action changed after discovery.' AS MessageText,
+                            @@SPID            AS SessionId,
+                            (
+                                SELECT t.action_chosen AS ActionAtDiscovery,
+                                       el.action       AS ActionExecuted
+                                FOR XML PATH(N'Detail'), TYPE
+                            )
+                        FOR XML PATH(N'TargetEvent'), TYPE
+                    )
+                FROM #ExecLog AS el
+                JOIN #Targets AS t ON t.target_id = el.target_id
+                WHERE t.action_chosen <> el.action;
+            END TRY
+            BEGIN CATCH
+                /* Never let the event stream break a run that otherwise succeeded. */
+                SET @Msg = N'WARNING: Could not write target disposition events: ' + LEFT(ERROR_MESSAGE(), 400);
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END CATCH
         END
 
         /*
