@@ -51,9 +51,27 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.08.01.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.08.01.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.08.01.1 - #195/#196/#197/#198: make partial results legible, and test the
+History:    2026.08.01.3 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
+                          - Output parameter contract: the zero-target exit left @TargetsFound,
+                            @Succeeded, @Failed and @Skipped NULL, so a caller testing
+                            "IF @TargetsFound = 0" never matched and "nothing to do" was
+                            indistinguishable from "never ran". Now set to zero. 38 other exit
+                            paths remain unset and are tracked as #204
+                          - Text formatting: em dashes removed from the procedure and README per
+                            that project's rule (they break PowerShell 5.1 parsing in double-quoted
+                            strings, and it is the house style)
+            2026.08.01.2 - #199: @LockTimeoutMs now covers the discovery scan, not just the rebuild
+                          - dm_db_index_physical_stats needs a shared lock, so an exclusively locked
+                            heap stalled DISCOVERY and the run never reached the phase the timeout
+                            governed. Measured: a 2s cap produced a 41s run reporting total success
+                          - The scan now gives up and the database is reported BLOCKED, with a
+                            separate "DISCOVERY WAS PARTIAL" warning so a short target list is never
+                            read as a clean bill of health
+                          - @LockTimeoutMs defaults to NULL, so a pre-scan advisory names any
+                            exclusively locked heaps and says the wait is unbounded
+            2026.08.01.1 - #195/#196/#197/#198: make partial results legible, and test the
                             paths that only fail when something else is holding a lock
                           - #198: @MinForwardedPct excluded heaps inside the discovery WHERE
                             clause, so "no heaps qualify" and "everything was filtered" looked
@@ -298,11 +316,11 @@ History:    2026.08.01.1 - #195/#196/#197/#198: make partial results legible, an
                           - @GenerateScript: RAISERROR uses %s format to handle % in object names (#122)
                           - Stale stats note: factually accurate message about modification counter (#93)
                           - CI swap guard: add XML index (type 3) and spatial (type 4) to exclusion (#105)
-                          - Docs: @Help CI SWAP RESTRICTIONS block — partitioned heap and temporal history
+                          - Docs: @Help CI SWAP RESTRICTIONS block -- partitioned heap and temporal history
                             table CI swap blocks now explicitly documented with rationale (#137, #140)
-                          - Fix: @GenerateScript @Help note — corrected to reflect automatic
+                          - Fix: @GenerateScript @Help note -- corrected to reflect automatic
                             SYSTEM_VERSIONING wrapper generation for temporal targets (#119)
-                          - Docs: CommandLog START ExtendedInfo comment — clarifies included vs. omitted
+                          - Docs: CommandLog START ExtendedInfo comment -- clarifies included vs. omitted
                             params for future maintainers (#107)
                           - 19 BY_DESIGN GitHub issues closed with explanations
             1.0.2026.0302i - Resumable CI swap + temporal history (#85, #84)
@@ -795,7 +813,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.08.01.1';
+    DECLARE @Version nvarchar(20) = N'2026.08.01.3';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -2656,7 +2674,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         @CurrentDatabaseName sysname,
         @CurrentDatabaseID   integer,
         @discovery_sql       nvarchar(max),
-        @discovery_errors    integer = 0;
+        @discovery_errors    integer = 0,
+        @discovery_blocked   integer = 0;   /* #199: scans that timed out waiting for a lock */
 
     /* Per-database scan stats (for HEAP_SCAN_SUMMARY XML) */
     DECLARE @DbScanStats TABLE (
@@ -2699,6 +2718,29 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         */
         SET @discovery_sql = N'
 USE ' + QUOTENAME(@CurrentDatabaseName) + N';
+'
+        /*
+        #199: bound the DISCOVERY wait, not just the rebuild.
+
+        dm_db_index_physical_stats takes a shared lock in SAMPLED/DETAILED mode,
+        so any session holding an exclusive lock on a heap blocks the scan. The
+        rebuild-side SET LOCK_TIMEOUT (region 21) never got a chance to apply:
+        the procedure stalled here instead. Measured before this fix -- a 40s
+        exclusive blocker against @LockTimeoutMs = 2000 produced a 41-second run
+        that reported total success.
+
+        Concatenated rather than parameterised because SET LOCK_TIMEOUT does not
+        accept a variable. @LockTimeoutMs is an integer parameter, so there is
+        nothing to inject; region 21 builds its prefix the same way.
+
+        A timeout raises 1222, which the per-database CATCH below turns into a
+        named "scan blocked" error and continues to the next database.
+        */
+        + CASE WHEN @LockTimeoutMs IS NOT NULL
+               THEN N'SET LOCK_TIMEOUT ' + CONVERT(nvarchar(20), @LockTimeoutMs) + N';
+'
+               ELSE N'' END
+        + N'
 
 /* Per-database temp tables (scoped to this sp_executesql call) */
 CREATE TABLE #Heaps
@@ -2808,6 +2850,38 @@ SET @Msg_inner = N''  '' + CONVERT(nvarchar(10), @HeapTableCount) + N'' heap tab
 IF @MemOptCount > 0
     SET @Msg_inner = @Msg_inner + N'' ('' + CONVERT(nvarchar(10), @MemOptCount) + N'' memory-optimized table(s) excluded)'';
 RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+
+/*
+#199: warn BEFORE the scan when a heap is exclusively locked.
+
+Bounding the wait needs @LockTimeoutMs, which defaults to NULL -- so by default
+the scan below still waits indefinitely, and a blocked run looks exactly like a
+slow one. This check costs one cheap DMV read and makes the difference visible
+either way: it names the tables that will block and says the scan may stall.
+
+Restricted to the heaps actually being scanned, so unrelated locks elsewhere in
+the database do not produce noise.
+*/
+DECLARE @blocking_locks integer;
+SELECT @blocking_locks = COUNT_BIG(DISTINCT l.resource_associated_entity_id)
+FROM sys.dm_tran_locks l
+JOIN #HeapObjects ho ON ho.object_id = l.resource_associated_entity_id
+WHERE l.resource_type = ''OBJECT''
+  AND l.resource_database_id = DB_ID()
+  AND l.request_mode IN (''X'', ''Sch-M'')
+  AND l.request_status = ''GRANT''
+  AND l.request_session_id <> @@SPID;
+
+IF @blocking_locks > 0
+BEGIN
+    SET @Msg_inner = N''  WARNING: '' + CONVERT(nvarchar(10), @blocking_locks)
+        + N'' heap(s) here are exclusively locked by another session. The scan reads''
+        + N'' dm_db_index_physical_stats, which needs a shared lock, so it may block.''
+        + CASE WHEN @LockTimeoutMs_param IS NULL
+               THEN N'' @LockTimeoutMs is not set, so it will wait indefinitely.''
+               ELSE N'' It will give up after @LockTimeoutMs and skip this database.'' END;
+    RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+END
 
 SET ANSI_WARNINGS OFF; /* suppress "Null value is eliminated by an aggregate" from DMV aggregation */
 
@@ -3669,7 +3743,7 @@ END
                   @AllowCiSwap_param bit, @PreferCiSwap_param bit, @Online_param bit,
                   @Maxdop_param integer, @FillFactor_param tinyint, @CpuSource_param varchar(20), @UptimeHours_param float,
                   @UseResumable_param bit, @IncludeTemporalHistory_param bit,
-                  @ScanMode_param nvarchar(20)',
+                  @ScanMode_param nvarchar(20), @LockTimeoutMs_param integer',
                 @MinPages_param = @MinPages,
                 @MaxPages_param = @MaxPages,
                 @MinForwardedPct_param = @MinForwardedPct,
@@ -3685,13 +3759,34 @@ END
                 @UptimeHours_param = @UptimeHours,
                 @UseResumable_param = @UseResumable,
                 @IncludeTemporalHistory_param = @IncludeTemporalHistory,
-                @ScanMode_param = @ScanMode;
+                @ScanMode_param = @ScanMode,
+                @LockTimeoutMs_param = @LockTimeoutMs;
         END TRY
         BEGIN CATCH
             SET @discovery_errors += 1;
-            SET @Msg = N'  ERROR scanning ' + @CurrentDatabaseName + N': '
-                     + CONVERT(nvarchar(10), ERROR_NUMBER()) + N' - ' + LEFT(ERROR_MESSAGE(), 1000);
-            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+
+            /*
+            #199: 1222 here means the scan could not get its shared lock, not
+            that the database is broken. Naming it matters: the generic wording
+            sent operators looking for corruption when the real answer is
+            "something else holds an exclusive lock on a heap".
+            */
+            IF ERROR_NUMBER() = 1222
+            BEGIN
+                SET @discovery_blocked += 1;
+                SET @Msg = N'  BLOCKED scanning ' + @CurrentDatabaseName
+                         + N': could not acquire a shared lock within @LockTimeoutMs = '
+                         + CONVERT(nvarchar(20), @LockTimeoutMs) + N' ms.'
+                         + N' Another session holds an exclusive lock on a heap here.'
+                         + N' This database was NOT scanned; its heaps are missing from the results.';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
+            ELSE
+            BEGIN
+                SET @Msg = N'  ERROR scanning ' + @CurrentDatabaseName + N': '
+                         + CONVERT(nvarchar(10), ERROR_NUMBER()) + N' - ' + LEFT(ERROR_MESSAGE(), 1000);
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            END
         END CATCH;
 
         /* Set sort_order = target_id for newly inserted rows */
@@ -4081,6 +4176,21 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     END
 
+    /*
+    #199: a blocked scan makes the target list INCOMPLETE, which is a different
+    claim from "some database errored". Said separately and in those words, so
+    an empty or short result set is never read as "nothing needs rebuilding".
+    */
+    IF @resume_loaded = 0 AND @parallel_worker = 0 AND @discovery_blocked > 0
+    BEGIN
+        SET @Msg = N'WARNING: DISCOVERY WAS PARTIAL. '
+                 + CONVERT(nvarchar(10), @discovery_blocked)
+                 + N' database(s) could not be scanned because another session held an exclusive lock.'
+                 + N' Heaps in those databases are absent from these results -- this is not a clean bill of health.'
+                 + N' Re-run when the lock clears, or raise @LockTimeoutMs to wait longer.';
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+    END
+
     /* 8A: Usage_hint uptime warning */
     /* If SQL Server restarted recently, dm_db_index_usage_stats hasn't accumulated enough data */
     /* for reliable WRITE_HEAVY/WRITE_ONLY classification. */
@@ -4463,6 +4573,27 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 )
             );
         END
+
+        /*
+        Output parameter contract: set them on this exit path too, not only on
+        normal completion. This return previously left all four NULL, so a
+        caller doing
+
+            EXECUTE dbo.sp_HeapDoctor @TargetsFound = @t OUTPUT ...
+            IF @t = 0 ...
+
+        got NULL, the comparison was never true, and "nothing needed rebuilding"
+        was indistinguishable from "the procedure never ran". Zero is the honest
+        answer: discovery completed and qualified nothing.
+
+        Convention adopted from sp_StatUpdate (CONSISTENCY_GUIDELINES.md,
+        "Output Parameter Contract"), which sets OUTPUT parameters on both its
+        early-return and main-summary paths for exactly this reason.
+        */
+        SET @TargetsFound = 0;
+        SET @Succeeded    = 0;
+        SET @Failed       = 0;
+        SET @Skipped      = 0;
 
         IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
         RETURN;

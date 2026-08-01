@@ -549,7 +549,7 @@ of `CI_SWAP_ONLINE`.  Any one of them floors the target at `CAUTIONARY`.
 
 **Footprint escalates, but never de-escalates.**  A large footprint (`size_mb`, `est_log_mb`,
 or `est_ci_swap_overhead_mb` above 1024 MB) raises a structurally delicate target to `SEVERE`.
-A large footprint on its own — no structural signal — is only `INFORMATIONAL`, because size
+A large footprint on its own -- no structural signal -- is only `INFORMATIONAL`, because size
 alone makes a rebuild slow, not risky.
 
 | Value | Meaning |
@@ -1162,12 +1162,12 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 - **`@PlanCountWarnThreshold integer = 50`** (#179). Emits a per-target advisory when a heap's `qs_plan_count` reaches the threshold, because `ALTER TABLE ... REBUILD` invalidates cached plans and a heap with many plans can trigger a recompile storm. Logged to the invocation command when non-default.
 - **Write-heavy NOTE during execution** (#182). When a target's `usage_hint` is `WRITE_HEAVY` or `WRITE_ONLY` and `@SkipWriteHeavy = 0`, the execution loop now says so per target. Defaults are unchanged; `@SkipWriteHeavy = 1` still excludes those heaps entirely.
 - **`@LockTimeoutMs` documentation corrected** (#181). It is a *lock acquisition wait*, not a cap on how long the rebuild holds its locks. Clarified in the parameter comment, `@Help`, and the runtime message. Documentation only.
-- **#180, #183, #184 closed as `stale-source`.** All three reported that the post-rebuild statistics message was factually wrong and that `@UpdateStatsAfterRebuild` did not exist. Both claims were true of an older snapshot only: the parameter has existed since v1.0.2026.0302e and the message had already been corrected. No code change. (The *filtered-index* branch of that same message was a separate, still-live defect — see #186 in v2026.07.29.1.)
+- **#180, #183, #184 closed as `stale-source`.** All three reported that the post-rebuild statistics message was factually wrong and that `@UpdateStatsAfterRebuild` did not exist. Both claims were true of an older snapshot only: the parameter has existed since v1.0.2026.0302e and the message had already been corrected. No code change. (The *filtered-index* branch of that same message was a separate, still-live defect -- see #186 in v2026.07.29.1.)
 
 ### v2026.05.11.7
 
-- **Test suite now public.** The `tests/` folder is no longer fully gitignored; the 29 `.sql` test files (`01_setup_test_data.sql` through `28_test_parallel_phase_a.sql` plus `99_*.sql`) are now in the repo. They use generic placeholders (`YourServer`, `YourPassword`) and contain no credentials, hostnames, or environment-specific identifiers. Run individually against any test SQL Server with `sqlcmd -S <host> -U <user> -P <password> -i tests/<file>.sql`. The local-only `README_TESTING.md` and shell test runner stay gitignored — they contain environment defaults.
-- **Identify the actual applock holder when the re-entrancy guard fails.** When `sp_getapplock` returns < 0 inside `sp_HeapDoctor`, the proc now queries `sys.dm_tran_locks` joined to `sys.dm_exec_sessions` to find the holder and includes that in the error message — SPID, login, program, host, status, open-transaction count, and how long the session has been idle. If the holder is sleeping with no open transaction (the common "leftover SSMS query window" case), the error message recommends `KILL <spid>;` as the resolution. Otherwise it warns the session looks active and suggests verifying before passing `@Force = 1`.
+- **Test suite now public.** The `tests/` folder is no longer fully gitignored; the 29 `.sql` test files (`01_setup_test_data.sql` through `28_test_parallel_phase_a.sql` plus `99_*.sql`) are now in the repo. They use generic placeholders (`YourServer`, `YourPassword`) and contain no credentials, hostnames, or environment-specific identifiers. Run individually against any test SQL Server with `sqlcmd -S <host> -U <user> -P <password> -i tests/<file>.sql`. The local-only `README_TESTING.md` and shell test runner stay gitignored -- they contain environment defaults.
+- **Identify the actual applock holder when the re-entrancy guard fails.** When `sp_getapplock` returns < 0 inside `sp_HeapDoctor`, the proc now queries `sys.dm_tran_locks` joined to `sys.dm_exec_sessions` to find the holder and includes that in the error message -- SPID, login, program, host, status, open-transaction count, and how long the session has been idle. If the holder is sleeping with no open transaction (the common "leftover SSMS query window" case), the error message recommends `KILL <spid>;` as the resolution. Otherwise it warns the session looks active and suggests verifying before passing `@Force = 1`.
 
 ### v2026.05.11.4
 
@@ -1177,13 +1177,13 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ### v2026.05.11.3
 
-- **Fix:** Parallel mode workers (`@HeapsInParallel = N'Y'` not the leader) raced ahead of the leader's discovery, found an empty `dbo.QueueHeapRebuild`, and exited without claiming. Only the leader ever did work — so v2026.05.11.2 ran with multiple sessions but didn't actually parallelize. Now: the leader acquires an Exclusive `sp_getapplock` on `'sp_HeapDoctor_Discovery'` inside its leader-election transaction and holds it until the queue is populated; workers attempt a Shared lock on the same resource, which blocks behind the leader's Exclusive until release. Once the leader finishes populating, workers proceed into the consumer loop in lockstep.
-- Workers also no longer hit the "zero targets, nothing to do" early-exit in region 15 — they intentionally have an empty `#Targets` (they skipped discovery), and need to fall through to the execution loop to claim from the queue.
+- **Fix:** Parallel mode workers (`@HeapsInParallel = N'Y'` not the leader) raced ahead of the leader's discovery, found an empty `dbo.QueueHeapRebuild`, and exited without claiming. Only the leader ever did work -- so v2026.05.11.2 ran with multiple sessions but didn't actually parallelize. Now: the leader acquires an Exclusive `sp_getapplock` on `'sp_HeapDoctor_Discovery'` inside its leader-election transaction and holds it until the queue is populated; workers attempt a Shared lock on the same resource, which blocks behind the leader's Exclusive until release. Once the leader finishes populating, workers proceed into the consumer loop in lockstep.
+- Workers also no longer hit the "zero targets, nothing to do" early-exit in region 15 -- they intentionally have an empty `#Targets` (they skipped discovery), and need to fall through to the execution loop to claim from the queue.
 - **Verified concurrent claim with 4 sessions + 50 demo heaps:** three distinct `SessionID`s on `dbo.QueueHeapRebuild` (36 + 15 + 4 = 55 rows), proving actual rebuild-time overlap across sessions.
 
 ### v2026.05.11.2
 
-- **New:** `@HeapsInParallel nvarchar(1) = N'N'` — queue-based parallel rebuild (Phase A). When set to `'Y'`, sp_HeapDoctor uses Ola Hallengren's `dbo.Queue` parent table plus an auto-created `dbo.QueueHeapRebuild` child to coordinate work across multiple sessions. Run the same `EXEC` from N SQL Agent steps (or any N sessions); the first session to insert into `dbo.Queue` becomes the leader (runs discovery + populates the queue), subsequent sessions are workers (skip discovery and consume). All sessions then drain the queue concurrently via atomic `UPDATE ... OUTPUT` claims (`ROWLOCK, READPAST`) so contention skips rather than blocks.
+- **New:** `@HeapsInParallel nvarchar(1) = N'N'` -- queue-based parallel rebuild (Phase A). When set to `'Y'`, sp_HeapDoctor uses Ola Hallengren's `dbo.Queue` parent table plus an auto-created `dbo.QueueHeapRebuild` child to coordinate work across multiple sessions. Run the same `EXEC` from N SQL Agent steps (or any N sessions); the first session to insert into `dbo.Queue` becomes the leader (runs discovery + populates the queue), subsequent sessions are workers (skip discovery and consume). All sessions then drain the queue concurrently via atomic `UPDATE ... OUTPUT` claims (`ROWLOCK, READPAST`) so contention skips rather than blocks.
 
   ```sql
   -- SQL Agent: identical step, run N times in parallel
@@ -1197,7 +1197,7 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
   Phase A intentionally defers dead-worker recovery, mop-up discovery, parameter fingerprint conflict detection, and orphan-row sweep. Requires Ola's `Queue.sql` to be installed in the target database (https://ola.hallengren.com/scripts/Queue.sql). `@PlanOnly = 1` is rejected with parallel mode.
 
-- The `@invocation_command` written to `dbo.CommandLog` records `@HeapsInParallel = N'Y'` when set, and it is the exact string used as the `dbo.Queue.Parameters` key — so two sessions invoking the same `EXEC` deterministically share a `QueueID`.
+- The `@invocation_command` written to `dbo.CommandLog` records `@HeapsInParallel = N'Y'` when set, and it is the exact string used as the `dbo.Queue.Parameters` key -- so two sessions invoking the same `EXEC` deterministically share a `QueueID`.
 
 - `@Help` ADVANCED PARAMETERS block split into four RAISERROR sub-blocks (it had silently been truncating earlier ADVANCED entries on Linux `sqlcmd`).
 

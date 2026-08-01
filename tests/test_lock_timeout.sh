@@ -160,6 +160,63 @@ else
     bad "197D" "no lock-timeout diagnostic in the output; a blocked rebuild should say why it failed"
 fi
 
+# --- Phase 2 (#199): an EXCLUSIVE lock must not stall discovery ---------------
+#
+# Before #199, @LockTimeoutMs wrapped only the rebuild. dm_db_index_physical_stats
+# needs a shared lock, so an exclusive lock stalled the SCAN and the run never
+# reached the phase the timeout governed: a 40s blocker against a 2s cap produced
+# a 41-second run that reported TOTAL SUCCESS. That is why phase 1 uses a shared
+# lock. This phase asserts the exclusive case is now bounded and reported.
+
+# Let phase 1's blocker finish before taking a new lock.
+wait "${BLOCKER_PID:-}" 2>/dev/null
+BLOCKER_PID=""
+
+eval "$SQLCMD" -d HeapDoctorTest -Q \
+  "\"BEGIN TRAN; SELECT TOP 1 * FROM dbo.HeapA WITH (TABLOCKX, HOLDLOCK); WAITFOR DELAY '00:00:${BLOCK_SECONDS}'; ROLLBACK;\"" \
+  > "$BLOCKER_LOG" 2>&1 &
+BLOCKER_PID=$!
+
+xheld=0
+for _ in $(seq 1 20); do
+    n=$(eval "$SQLCMD" -d HeapDoctorTest -h-1 -W -Q \
+        "\"SET NOCOUNT ON; SELECT COUNT(*) FROM sys.dm_tran_locks WHERE resource_associated_entity_id = OBJECT_ID('dbo.HeapA') AND request_mode = 'X';\"" \
+        2>/dev/null | tr -d '[:space:]')
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    if [ "$n" -ge 1 ]; then xheld=1; break; fi
+    sleep 1
+done
+
+if [ "$xheld" -eq 1 ]; then
+    ok "199A" "blocking session holds an EXCLUSIVE lock on dbo.HeapA"
+else
+    bad "199A" "could not establish the exclusive lock; the #199 assertions would be vacuous"
+fi
+
+if [ "$xheld" -eq 1 ]; then
+    xstart=$(date +%s)
+    XOUT=$(eval "$SQLCMD" -d HeapDoctorTest -Q \
+      "\"EXEC dbo.sp_HeapDoctor @Databases = N'HeapDoctorTest', @Tables = N'dbo.HeapA', @CpuSource = N'NONE', @PlanOnly = 1, @LockTimeoutMs = ${TIMEOUT_MS};\"" \
+      2>&1)
+    xend=$(date +%s)
+    xelapsed=$((xend - xstart))
+    echo "  (discovery elapsed ${xelapsed}s against a ${BLOCK_SECONDS}s exclusive blocker)"
+
+    # 199B: the SCAN must give up, not wait out the blocker.
+    if [ "$xelapsed" -lt "$GIVE_UP_CEILING" ]; then
+        ok "199B" "discovery gave up after ${xelapsed}s instead of stalling for ${BLOCK_SECONDS}s"
+    else
+        bad "199B" "discovery took ${xelapsed}s: @LockTimeoutMs still does not cover the scan"
+    fi
+
+    # 199C: and it must SAY the results are incomplete, not return a short list quietly.
+    if printf '%s\n' "$XOUT" | grep -aqiE "DISCOVERY WAS PARTIAL|BLOCKED scanning"; then
+        ok "199C" "blocked scan reported as partial rather than returning a quietly short list"
+    else
+        bad "199C" "no partial-discovery warning; a blocked scan is indistinguishable from a clean one"
+    fi
+fi
+
 echo "results: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
 exit 0
