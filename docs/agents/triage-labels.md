@@ -52,8 +52,36 @@ Orthogonal to state and category; apply at most one.
 | `p3-nice-to-have`  | Real but tolerable; usually hygiene or an untested-but-correct path |
 | `p4-deferred`      | Acknowledged, deliberately not scheduled                            |
 
-**Note:** `bd github sync` does **not** read these. Every issue arrives in beads as `P2`
-regardless of the label. If you order work by beads priority, it is not reflecting GitHub.
+**`bd github sync` does not read these, and it OVERWRITES what you set.** It imports the
+labels but resets every issue to `P2` on *every* pull -- not just on first import.
+
+Measured here: 116 beads carried a p1-p4 label and 73 had the wrong priority, including 24
+marked `p1-critical` sitting at `P2`. After reconciling all 73 and confirming a clean
+state, a single `bd github sync --pull-only` put **all 73 back to `P2`**.
+
+That is why reconciliation cannot be a one-time cleanup. It has to run after every sync.
+
+**So do not call `bd github sync` directly.** Use:
+
+```bash
+bash tools/bd-github-sync.sh
+```
+
+which pulls from GitHub and then reconciles priority from the labels. The reconcile is part
+of sync rather than a second command to remember: since every pull flattens priorities
+again, "remember to run the other thing" would fail the first time anyone forgot. `tools/bd-sync-priorities.sh` can also be
+run alone, and is a dry run unless given `--apply`.
+
+The mapping it applies:
+
+| Label | beads priority |
+| --- | --- |
+| `p1-critical` | `P1` |
+| `p2-important` | `P2` |
+| `p3-nice-to-have` | `P3` |
+| `p4-deferred` | `P4` |
+
+A bead with no priority label, or with more than one, is left alone rather than guessed at.
 
 ## Topical labels
 

@@ -46,6 +46,22 @@ When set to `yes`, PRs run through the same labels and states as issues, using t
 GitHub shares one number space across issues and PRs, so a bare `#42` may be either --
 resolve with `gh pr view 42` and fall back to `gh issue view 42`.
 
+## Syncing to beads
+
+Issue state is mirrored into the centralized beads server. **Use the wrapper, not `bd`
+directly:**
+
+```bash
+bash tools/bd-github-sync.sh
+```
+
+`bd github sync` alone imports labels but resets every issue to `P2` on **every** pull, not
+just the first -- verified by reconciling all 73 mismatches, syncing once, and finding all
+73 flattened again. See [`triage-labels.md`](./triage-labels.md).
+
+GitHub stays the source of truth: the wrapper pulls only, so a routine refresh can never
+push local beads up as real GitHub issues.
+
 ## When a skill says "publish to the issue tracker"
 
 Create a GitHub issue.

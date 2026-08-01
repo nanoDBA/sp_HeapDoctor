@@ -11,6 +11,9 @@
 !CONTRACTS.md
 !tools/
 !tools/*.sql
+# Workflow scripts. These take credentials from the environment and hardcode
+# none, so unlike the test-rig scripts they can be tracked.
+!tools/*.sh
 # Agent/tracker configuration read by the engineering skills.
 !docs/
 !docs/agents/
