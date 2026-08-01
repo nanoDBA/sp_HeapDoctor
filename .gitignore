@@ -17,6 +17,7 @@
 !tests/
 !tests/*.sql
 !tests/run_suite.sh
+!tests/test_lock_timeout.sh
 
 # Beads / Dolt files (added by bd init)
 .dolt/

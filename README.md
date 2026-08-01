@@ -475,7 +475,14 @@ The target list result set (returned in both plan-only and execute modes) contai
 | Column | Type | Description |
 |--------|------|-------------|
 | `total_cpu_ms` | bigint | Query Store CPU attributed to this heap (Table Scan operators only).  NULL when `@CpuSource = 'NONE'` |
-| `ranking_basis` | varchar(20) | How this target was ranked: `QS_CPU` (Query Store data available), `QS_NO_DATA` (QS active but no matching plans), `FWD_PCT` (CPU source is NONE) |
+| `ranking_basis` | varchar(20) | How this target was ranked: `QS_CPU` (Query Store data available), `QS_NO_DATA` (QS active but no matching plans), `QS_DISABLED` (Query Store not read-write), `FWD_PCT` (CPU source is NONE), `QUICKIE_OTHER_DB` (see below) |
+
+`QUICKIE_OTHER_DB` appears only with `@CpuSource = 'QUICKIESTORE'` across more than one
+database.  sp_QuickieStore reads the Query Store of the **current database only**, so
+targets elsewhere are ranked with `total_cpu_ms = 0` and sort below anything that has CPU
+data, regardless of their real impact.  Those rows are marked rather than left
+indistinguishable from genuinely low-CPU targets.  Use `@CpuSource = 'QUERY_STORE'` for
+CPU ranking across every database.
 
 ### CI Swap Info
 

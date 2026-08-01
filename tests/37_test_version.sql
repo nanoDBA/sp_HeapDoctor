@@ -89,7 +89,7 @@ DECLARE @hdr_ver nvarchar(40) = NULL;
 
 IF @hdr_pos > 0
 BEGIN
-    /* The header reads "Version:    2026.07.31.4 (CalVer: ...)", so trim the
+    /* The header reads "Version:    <CalVer> (CalVer: ...)", so trim the
        padding and take everything up to the next space. */
     DECLARE @tail nvarchar(200) = LTRIM(SUBSTRING(@def, @hdr_pos + LEN(N'Version:'), 60));
     SET @hdr_ver = LEFT(@tail, CHARINDEX(N' ', @tail + N' ') - 1);

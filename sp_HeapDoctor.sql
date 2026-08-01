@@ -51,9 +51,33 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.31.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.08.01.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.31.4 - #185: Structural churn signals decide whether to warn; footprint scales it
+History:    2026.08.01.1 - #195/#196/#197/#198: make partial results legible, and test the
+                            paths that only fail when something else is holding a lock
+                          - #198: @MinForwardedPct excluded heaps inside the discovery WHERE
+                            clause, so "no heaps qualify" and "everything was filtered" looked
+                            identical. Under SAMPLED the counts are estimates, so a borderline
+                            heap can be dropped by sampling error alone. The threshold is now
+                            applied after materialisation and the excluded count is reported
+                            per database. Costs nothing: the rows are already there
+                          - #195: sp_QuickieStore reads only the current database's Query Store,
+                            so targets elsewhere were ranked with cpu_ms = 0 and sorted below
+                            anything with CPU data. That was visible only as a startup WARNING
+                            naming no rows. They are now marked ranking_basis = QUICKIE_OTHER_DB
+                          - #196: @CheckPermissionsOnly was only ever tested as sysadmin, where
+                            HAS_PERMS_BY_NAME grants everything -- an always-granted
+                            implementation would have passed every assertion. Now exercised as a
+                            principal holding nothing (3 denied of 3), with the sysadmin case
+                            asserted too so always-denied cannot pass either
+                          - #197: no test ever blocked a rebuild, so the @LockTimeoutMs path
+                            never ran. tests/test_lock_timeout.sh holds a conflicting lock from a
+                            second session and asserts on elapsed time and disposition. Shown to
+                            fail when the timeout is long, so the assertion can actually fail
+                          - Found while testing #197 and filed as #199: @LockTimeoutMs wraps only
+                            the rebuild, so an exclusively-locked table stalls DISCOVERY
+                            indefinitely -- a 2s cap produced a 41s run that reported success
+            2026.07.31.4 - #185: Structural churn signals decide whether to warn; footprint scales it
                           - The first warning boundary was footprint-centric: a heap inside a
                             fragile plan ecosystem or a lock-sensitive concurrency surface stayed
                             silent purely because it was small. Size tells you what a rebuild
@@ -771,7 +795,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.07.31.4';
+    DECLARE @Version nvarchar(20) = N'2026.08.01.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -819,6 +843,9 @@ COMMON PARAMETERS:
 
         RAISERROR(N'  @MinPages          bigint  = 1000    Discovery filter: heaps below this page count are excluded.
   @MinForwardedPct   decimal = 2.00    Min forwarded %% (= forwarded_records / total_rows * 100).
+                                        Applied to a SAMPLED estimate by default, so a borderline heap
+                                        can be excluded by sampling error. Excluded counts are reported
+                                        per database; use @ScanMode = DETAILED to confirm one.
   @IncludeHealthyHeaps bit  = 0       1=bypass forwarded-record filters; include heaps with 0 forwarded
                                         records. Combine with @Tables to force-rebuild a specific heap.
   @SkipWriteHeavy    bit     = 0       1=exclude WRITE_HEAVY and WRITE_ONLY heaps entirely.
@@ -2905,11 +2932,48 @@ OUTER APPLY (
 ) fkr
 WHERE (@IncludeHealthyHeaps_param = 1 OR ips.forwarded_record_count > 0)
   AND ips.page_count >= @MinPages_param
-  AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param)
-  AND (@IncludeHealthyHeaps_param = 1
-       OR (100.0 * ips.forwarded_record_count / NULLIF(ips.record_count,0)) >= @MinForwardedPct_param);
+  AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param);
 
 SET ANSI_WARNINGS ON;
+
+/*
+#198: @MinForwardedPct is applied HERE rather than in the WHERE above, so the
+sub-threshold heaps can be counted before they are discarded.
+
+Why it matters: under the default SAMPLED scan mode, forwarded_record_count is
+extrapolated from a page sample, so a heap whose true percentage sits near the
+threshold can be dropped by sampling error alone. Filtering silently made "no
+heaps qualify" indistinguishable from "everything was filtered out".
+
+Counting here costs nothing extra -- the rows are already materialised. Doing it
+by re-querying dm_db_index_physical_stats would double the expensive scan.
+*/
+IF @IncludeHealthyHeaps_param = 0
+BEGIN
+    DECLARE @below_threshold integer;
+
+    /* NOT (pct >= @Min) rather than (pct < @Min): record_count = 0 yields NULL
+       through NULLIF, and the original predicate excluded those rows too. */
+    SELECT @below_threshold = COUNT_BIG(*)
+    FROM #Heaps
+    WHERE NOT ((100.0 * forwarded_record_count / NULLIF(record_count, 0)) >= @MinForwardedPct_param);
+
+    DELETE FROM #Heaps
+    WHERE NOT ((100.0 * forwarded_record_count / NULLIF(record_count, 0)) >= @MinForwardedPct_param);
+
+    IF @below_threshold > 0
+    BEGIN
+        /* No literal "%" anywhere in this message: it becomes the RAISERROR
+           format string, which interprets % as a specifier even with no args. */
+        SET @Msg_inner = N''  '' + CONVERT(nvarchar(10), @below_threshold)
+                       + N'' heap(s) excluded: forwarded pct below @MinForwardedPct = ''
+                       + CONVERT(nvarchar(20), @MinForwardedPct_param)
+                       + CASE WHEN @ScanMode_param = N''SAMPLED''
+                              THEN N''. Counts are SAMPLED estimates; use @ScanMode = DETAILED to confirm a borderline heap.''
+                              ELSE N''.'' END;
+        RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+    END
+END
 
 /* #84: Populate temporal parent info for history table heaps */
 IF @IncludeTemporalHistory_param = 1
@@ -3726,7 +3790,7 @@ END
 
         IF @DatabaseCount > 1
         BEGIN
-            RAISERROR(N'WARNING: QUICKIESTORE CPU source only applies to the current database context. Multi-database CPU ranking not available.', 10, 1) WITH NOWAIT;
+            RAISERROR(N'WARNING: QUICKIESTORE CPU source only applies to the current database context. Targets in other databases are ranked without CPU data and are marked ranking_basis = QUICKIE_OTHER_DB in the result set (#195).', 10, 1) WITH NOWAIT;
         END
 
         /*
@@ -3956,6 +4020,32 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 ELSE 1.0
             END
         );
+
+        /*
+        #195: sp_QuickieStore reads the Query Store of the CURRENT database only,
+        so targets in any other database were never eligible for CPU enrichment.
+        They keep total_cpu_ms = 0 and therefore sort below anything that did get
+        CPU data, regardless of real impact.
+
+        That was previously visible only as one startup WARNING, which is easy to
+        miss in a long run and says nothing about WHICH rows are affected. Marking
+        the rows makes the partial ranking legible per target.
+        */
+        UPDATE #Targets
+        SET ranking_basis = 'QUICKIE_OTHER_DB'
+        WHERE database_name <> DB_NAME()
+          AND ranking_basis <> 'QS_CPU';
+
+        DECLARE @quickie_unranked bigint = ROWCOUNT_BIG();
+
+        IF @quickie_unranked > 0
+        BEGIN
+            SET @Msg = N'  ' + CONVERT(nvarchar(10), @quickie_unranked)
+                     + N' target(s) outside ' + QUOTENAME(DB_NAME())
+                     + N' ranked without CPU data (ranking_basis = QUICKIE_OTHER_DB).'
+                     + N' sp_QuickieStore only reads the current database''s Query Store.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
 
         ;WITH Reranked AS
         (
