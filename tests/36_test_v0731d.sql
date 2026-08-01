@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.4: structural severity tiers (#185)
+sp_HeapDoctor Test Harness - structural severity tiers (#185)
 
 Tests:
   36A - No structural signal, modest footprint            -> NONE
@@ -12,7 +12,7 @@ Tests:
   36H - Advisories stay at RAISERROR severity 10 (never 16)
 
   -- Version --
-  36V - Version is 2026.07.31.4
+  36V - Version matches dbo.ExpectedVersion
 
 FIXTURE NOTE: every other heap defaults to LOCK_ESCALATION = TABLE, which is
 itself a structural signal, so they all qualify and cannot isolate anything.
@@ -32,7 +32,7 @@ SET QUOTED_IDENTIFIER ON;
 USE [HeapDoctorTest];
 GO
 
-RAISERROR(N'=== Batch 36: v2026.07.31.4 (#185 structural severity tiers) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 36: (#185 structural severity tiers) ===', 10, 1) WITH NOWAIT;
 
 /*#region 36A*/
 RAISERROR(N'Test 36A: no structural signal -> NONE (#185)...', 10, 1) WITH NOWAIT;
@@ -257,10 +257,10 @@ INSERT INTO #R36v
 EXEC dbo.sp_HeapDoctor @Databases = N'HeapDoctorTest', @CpuSource = N'NONE', @PlanOnly = 1;
 
 DECLARE @ver36 nvarchar(20) = (SELECT TOP (1) version FROM #R36v);
-IF @ver36 = N'2026.07.31.4'
-    RAISERROR(N'  PASS 36V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
+IF @ver36 = (SELECT version FROM dbo.ExpectedVersion)
+    RAISERROR(N'  PASS 36V: Version matches dbo.ExpectedVersion.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 36V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver36) WITH NOWAIT;
+    RAISERROR(N'  FAIL 36V: Version is %s and does not match dbo.ExpectedVersion.', 10, 1, @ver36) WITH NOWAIT;
 
 IF OBJECT_ID('tempdb..#R36v') IS NOT NULL DROP TABLE #R36v;
 GO

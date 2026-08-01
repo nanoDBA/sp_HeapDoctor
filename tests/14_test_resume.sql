@@ -248,6 +248,12 @@ RAISERROR(N'================================================================', 1
 -- Insert a mock obfuscated HEAP_SCAN_SUMMARY directly into CommandLog.
 -- (Running a real obfuscated plan-only after 14B is unreliable because the heaps were rebuilt.)
 DECLARE @ObfuRunID uniqueidentifier = NEWID();
+/* #191: this <Version> is a FUNCTIONAL INPUT, not an assertion. The resume
+   loader rejects a scan summary whose version does not match the procedure, so
+   a stale literal here made test 14E fail the version check and never reach the
+   obfuscation guard it is named for -- a vacuous pass. Read it from the
+   deployed procedure so it can never drift. */
+DECLARE @ExpectedVer nvarchar(20) = (SELECT version FROM dbo.ExpectedVersion);
 INSERT INTO dbo.CommandLog
     (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType,
      StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
@@ -258,7 +264,7 @@ VALUES
     N'HEAP_SCAN_SUMMARY',
     SYSDATETIME(), SYSDATETIME(), 0, NULL,
     CAST(N'<ScanSummary>
-        <Version>2026.07.31.4</Version>
+        <Version>' + @ExpectedVer + N'</Version>
         <RunID>' + CAST(@ObfuRunID AS nvarchar(36)) + N'</RunID>
         <TargetCount>1</TargetCount>
         <ObfuscatedMappingHex>DEADBEEF0123456789</ObfuscatedMappingHex>
@@ -276,6 +282,7 @@ VALUES
 );
 
 DECLARE @14e_err int = 0;
+DECLARE @14e_msg nvarchar(4000) = NULL;
 IF @ObfuRunID IS NOT NULL
 BEGIN
     BEGIN TRY
@@ -285,10 +292,21 @@ BEGIN
     END TRY
     BEGIN CATCH
         SET @14e_err = ERROR_NUMBER();
+        SET @14e_msg = ERROR_MESSAGE();
     END CATCH
 
-    IF @14e_err > 0
-        RAISERROR(N'  PASS 14E-1: Obfuscated plan resume blocked (error %d).', 10, 1, @14e_err) WITH NOWAIT;
+    /* #191: assert WHICH guard rejected the resume, not merely that something
+       did. Any error used to pass here, so when the embedded <Version> went
+       stale the resume was rejected by the version check and this test reported
+       PASS without ever reaching the obfuscation guard it is named for. */
+    IF @14e_err > 0 AND @14e_msg LIKE N'%obfuscated%'
+        RAISERROR(N'  PASS 14E-1: Obfuscated plan resume blocked by the obfuscation guard (error %d).', 10, 1, @14e_err) WITH NOWAIT;
+    ELSE IF @14e_err > 0
+    BEGIN
+        DECLARE @14e_wrong nvarchar(600) = N'  FAIL 14E-1: resume was blocked, but not by the obfuscation guard: '
+            + ISNULL(@14e_msg, N'(no message)');
+        RAISERROR(@14e_wrong, 10, 1) WITH NOWAIT;
+    END
     ELSE
         RAISERROR(N'  FAIL 14E-1: Obfuscated plan resume was not blocked.', 10, 1) WITH NOWAIT;
 END

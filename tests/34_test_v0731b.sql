@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.4: @ScanMode = LIMITED rejected (#189)
+sp_HeapDoctor Test Harness - @ScanMode = LIMITED rejected (#189)
 
 Tests:
   34A - @ScanMode = LIMITED is rejected at validation
@@ -10,7 +10,7 @@ Tests:
   34F - @Help no longer offers LIMITED as a choice
 
   -- Version --
-  34V - Version is 2026.07.31.4
+  34V - Version matches dbo.ExpectedVersion
 
 WHY REJECT RATHER THAN SUPPORT: verified directly against
 sys.dm_db_index_physical_stats -- in LIMITED mode record_count,
@@ -30,7 +30,7 @@ SET QUOTED_IDENTIFIER ON;
 USE [HeapDoctorTest];
 GO
 
-RAISERROR(N'=== Batch 34: v2026.07.31.4 (#189 LIMITED scan mode) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 34: (#189 LIMITED scan mode) ===', 10, 1) WITH NOWAIT;
 
 /*#region 34A*/
 ------------------------------------------------------------------------
@@ -138,10 +138,10 @@ EXEC dbo.sp_HeapDoctor @Databases = N'HeapDoctorTest', @CpuSource = N'NONE', @Pl
 DECLARE @ver34 nvarchar(20);
 SELECT TOP (1) @ver34 = version FROM #Results;
 
-IF @ver34 = N'2026.07.31.4'
-    RAISERROR(N'  PASS 34V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
+IF @ver34 = (SELECT version FROM dbo.ExpectedVersion)
+    RAISERROR(N'  PASS 34V: Version matches dbo.ExpectedVersion.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 34V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver34) WITH NOWAIT;
+    RAISERROR(N'  FAIL 34V: Version is %s and does not match dbo.ExpectedVersion.', 10, 1, @ver34) WITH NOWAIT;
 
 IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
 GO

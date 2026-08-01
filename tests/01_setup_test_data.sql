@@ -208,6 +208,72 @@ CREATE CLUSTERED INDEX CX_ResultsTemplate ON dbo.ResultsTemplate(target_id);
 GO
 
 ------------------------------------------------------------------------
+-- 2b) dbo.ExpectedVersion - the suite's single source of version truth (#191)
+--
+--     Nineteen test files used to hardcode the version string and assert
+--     equality against it, so every release meant sweeping all of them. That
+--     lapsed twice: eleven files sat on 2026.03.11.1 for two releases, and
+--     14_test_resume's embedded <Version> is a FUNCTIONAL INPUT, not an
+--     assertion -- when it went stale, test 14E's resume was rejected for
+--     version mismatch and never reached the obfuscation guard it names. It
+--     passed for the wrong reason, invisibly.
+--
+--     The version is now READ FROM THE DEPLOYED PROCEDURE, so a release edits
+--     zero files. Extracted from sys.sql_modules rather than by running the
+--     procedure, so it is available before any test executes and costs nothing.
+------------------------------------------------------------------------
+RAISERROR(N'Creating dbo.ExpectedVersion (derived from the deployed procedure)...', 10, 1) WITH NOWAIT;
+GO
+
+CREATE TABLE dbo.ExpectedVersion
+(
+    version nvarchar(20) NOT NULL
+);
+GO
+
+DECLARE @proc_def nvarchar(max),
+        @anchor   nvarchar(50) = N'DECLARE @Version nvarchar(20) = N''',
+        @pos      integer,
+        @tail     nvarchar(100),
+        @ver      nvarchar(20);
+
+/* sp_ prefixed procedures resolve to master from any database, which is where
+   the suite deploys sp_HeapDoctor. Fall back to the current database so a
+   locally-deployed copy still works. */
+SELECT @proc_def = definition
+FROM   master.sys.sql_modules
+WHERE  object_id = OBJECT_ID(N'master.dbo.sp_HeapDoctor');
+
+IF @proc_def IS NULL
+    SELECT @proc_def = definition
+    FROM   sys.sql_modules
+    WHERE  object_id = OBJECT_ID(N'dbo.sp_HeapDoctor');
+
+SET @pos = CHARINDEX(@anchor, ISNULL(@proc_def, N''));
+
+IF @pos > 0
+BEGIN
+    /* @pos is 1-based and the anchor ends with the opening quote, so the first
+       character of the version sits at exactly @pos + LEN(@anchor). */
+    SET @tail = SUBSTRING(@proc_def, @pos + LEN(@anchor), 40);
+    SET @ver  = LEFT(@tail, CHARINDEX(N'''', @tail) - 1);
+END
+
+IF @ver IS NULL OR @ver = N''
+BEGIN
+    /* Loud, not silent: every version assertion in the suite reads this table,
+       and an empty value would turn all of them into vacuous passes. */
+    RAISERROR(N'SETUP FAILURE: could not read the version from the deployed sp_HeapDoctor. Deploy the procedure before running the suite.', 16, 1);
+END
+ELSE
+BEGIN
+    INSERT INTO dbo.ExpectedVersion (version) VALUES (@ver);
+    DECLARE @ver_msg nvarchar(200) = N'  Expected version: ' + @ver;
+    RAISERROR(@ver_msg, 10, 1) WITH NOWAIT;
+END
+GO
+
+------------------------------------------------------------------------
 -- 3) Create test heaps
 ------------------------------------------------------------------------
 

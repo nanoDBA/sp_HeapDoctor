@@ -16,7 +16,7 @@ Tests:
   18G - Tempdb check does not error on normal CI swap targets
 
   -- Version --
-  18V - Version is 2026.07.31.4
+  18V - Version matches dbo.ExpectedVersion
 
 Requires: 01_setup_test_data.sql (HeapDoctorTest database)
 Must run BEFORE execution tests (03+).
@@ -229,10 +229,10 @@ GO
 DECLARE @ver18 nvarchar(20);
 SELECT TOP (1) @ver18 = version FROM #Results;
 
-IF @ver18 = N'2026.07.31.4'
-    RAISERROR(N'  PASS 18V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
+IF @ver18 = (SELECT version FROM dbo.ExpectedVersion)
+    RAISERROR(N'  PASS 18V: Version matches dbo.ExpectedVersion.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 18V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver18) WITH NOWAIT;
+    RAISERROR(N'  FAIL 18V: Version is %s and does not match dbo.ExpectedVersion.', 10, 1, @ver18) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

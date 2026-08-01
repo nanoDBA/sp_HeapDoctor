@@ -1,5 +1,5 @@
 /*
-sp_HeapDoctor Test Harness - v2026.07.31.4: Batch D quick wins
+sp_HeapDoctor Test Harness - Batch D quick wins
 
 Tests:
   -- Issue #24: Hardware context in debug banner --
@@ -18,7 +18,7 @@ Tests:
   20G - @MinDaysSinceRebuild already exists (closes #21)
 
   -- Version --
-  20V - Version is 2026.07.31.4
+  20V - Version matches dbo.ExpectedVersion
 
 Prerequisites: Run 01_setup_test_data.sql first.
 Run with: sqlcmd -S YourServer -d HeapDoctorTest -i 20_test_v0302d.sql
@@ -37,7 +37,7 @@ IF OBJECT_ID('tempdb..#Results') IS NOT NULL DROP TABLE #Results;
 SELECT * INTO #Results FROM dbo.ResultsTemplate WHERE 1 = 0;
 GO
 
-RAISERROR(N'=== Batch 20: v2026.07.31.4 (#24, #77, #70, #21) ===', 10, 1) WITH NOWAIT;
+RAISERROR(N'=== Batch 20: (#24, #77, #70, #21) ===', 10, 1) WITH NOWAIT;
 
 ------------------------------------------------------------------------
 -- 20A: #24 - @Debug=1 shows hardware context
@@ -219,10 +219,10 @@ EXEC dbo.sp_HeapDoctor
 DECLARE @ver20 nvarchar(20);
 SELECT TOP 1 @ver20 = version FROM #Results;
 
-IF @ver20 = N'2026.07.31.4'
-    RAISERROR(N'  PASS 20V: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
+IF @ver20 = (SELECT version FROM dbo.ExpectedVersion)
+    RAISERROR(N'  PASS 20V: Version matches dbo.ExpectedVersion.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 20V: Version is %s (expected 2026.07.31.4).', 10, 1, @ver20) WITH NOWAIT;
+    RAISERROR(N'  FAIL 20V: Version is %s and does not match dbo.ExpectedVersion.', 10, 1, @ver20) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------

@@ -4,7 +4,7 @@ sp_HeapDoctor Test Harness - Batch 11: Enhanced Logging & Impact Projections
 Tests Batch 11 additions:
   -- Smoke Tests --
   11A - size_mb column populated and correct (page_count / 128)
-  11B - Version is 2026.07.31.4
+  11B - Version matches dbo.ExpectedVersion
 
   -- Unit Tests (deterministic) --
   11C - size_mb = page_count / 128.0 for all targets (arithmetic check)
@@ -110,20 +110,21 @@ END
 GO
 
 ------------------------------------------------------------------------
--- 11B: Smoke test - Version is 2026.07.31.4
+-- 11B: Smoke test - Version matches dbo.ExpectedVersion
 ------------------------------------------------------------------------
 RAISERROR(N'--- 11B: Version check ---', 10, 1) WITH NOWAIT;
 
-IF EXISTS (SELECT 1 FROM #Results WHERE version = N'2026.07.31.4')
+IF EXISTS (SELECT 1 FROM #Results r JOIN dbo.ExpectedVersion e ON r.version = e.version)
 BEGIN
-    RAISERROR(N'  PASS 11B: Version is 2026.07.31.4.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 11B: Version matches dbo.ExpectedVersion.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
     DECLARE @actual_ver nvarchar(20);
     SELECT TOP 1 @actual_ver = version FROM #Results;
-    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version 2026.07.31.4, got ' + ISNULL(@actual_ver, N'NULL');
+    DECLARE @ver_msg nvarchar(200) = N'  FAIL 11B: Expected version '
+        + (SELECT version FROM dbo.ExpectedVersion) + N', got ' + ISNULL(@actual_ver, N'NULL');
     RAISERROR(@ver_msg, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
