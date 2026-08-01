@@ -11,6 +11,10 @@
 !CONTRACTS.md
 !tools/
 !tools/*.sql
+# Agent/tracker configuration read by the engineering skills.
+!docs/
+!docs/agents/
+!docs/agents/*.md
 # Tests: *.sql files, plus the suite runner. Other shell scripts and
 # README_TESTING.md contain environment-specific defaults like hostnames and
 # credentials, so they stay local. run_suite.sh takes its connection details
