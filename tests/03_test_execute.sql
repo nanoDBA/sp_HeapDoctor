@@ -190,7 +190,9 @@ IF @3a_stop_reason = 'SUCCESS'
     RAISERROR(N'  PASS 3A-8: HEAP_REBUILD_END StopReason = SUCCESS.', 10, 1) WITH NOWAIT;
 ELSE IF @3a_stop_reason IS NOT NULL
 BEGIN
-    DECLARE @3a_msg7 nvarchar(200) = N'  INFO 3A-8: HEAP_REBUILD_END StopReason = ' + @3a_stop_reason + N' (may be expected).';
+    /* #202: SKIP, not INFO. A non-SUCCESS StopReason can be legitimate here
+       (skips on fast hardware), but the outcome must be countable. */
+    DECLARE @3a_msg7 nvarchar(200) = N'  SKIP 3A-8: HEAP_REBUILD_END StopReason = ' + @3a_stop_reason + N'; not SUCCESS, which can be legitimate for this run.';
     RAISERROR(@3a_msg7, 10, 1) WITH NOWAIT;
 END
 ELSE
@@ -351,7 +353,10 @@ IF @3b_idx_type = 0
 ELSE IF @3b_idx_type = 1
     RAISERROR(N'  FAIL 3B-1: Clustered index left behind on HeapB.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  INFO 3B-1: HeapB index type is unexpected. Check sys.indexes.', 10, 1) WITH NOWAIT;
+    /* #202: an unexpected index type is a real failure, not a note. The heap is
+       neither a heap (0) nor clustered (1), so the CI swap left it in a state
+       this test does not recognise. */
+    RAISERROR(N'  FAIL 3B-1: HeapB index type is neither heap nor clustered. Check sys.indexes.', 10, 1) WITH NOWAIT;
 
 -- 3B-2: Forwarded records eliminated
 DECLARE @3b_fwd bigint;
@@ -464,7 +469,7 @@ ELSE
 
 -- Note: On fast hardware, all 3 rebuilds may complete in < 1 second. That's OK.
 -- The test validates the code path runs without error.
-RAISERROR(N'  INFO 3C: On fast hardware, no targets may be skipped. That is expected.', 10, 1) WITH NOWAIT;
+RAISERROR(N'  NOTE (3C): On fast hardware, no targets may be skipped. That is expected. The assertion is 3C-1.', 10, 1) WITH NOWAIT;
 GO
 
 RAISERROR(N'', 10, 1) WITH NOWAIT;

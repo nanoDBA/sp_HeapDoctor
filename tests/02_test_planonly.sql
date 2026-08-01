@@ -276,9 +276,27 @@ BEGIN
     RAISERROR(@2f_msg, 10, 1) WITH NOWAIT;
 END
 
--- Note: MAXDOP in command_text cannot be verified from the target list result set.
--- Inspect the commands result set in the output above for "MAXDOP = 2".
-RAISERROR(N'  INFO 2F-2: Verify "MAXDOP = 2" in the commands output above (manual check).', 10, 1) WITH NOWAIT;
+-- 2F-2: MAXDOP must actually reach the generated command (#202).
+--
+-- This was an INFO line telling a human to eyeball the output, on the premise
+-- that "MAXDOP in command_text cannot be verified from the target list result
+-- set". That premise was wrong: command_text IS a result-set column and is
+-- captured by dbo.ResultsTemplate, so nobody ever performed the check and
+-- @Maxdop emission was untested.
+DECLARE @2f_cmds int = (SELECT COUNT(*) FROM #Results WHERE command_text IS NOT NULL);
+DECLARE @2f_maxdop int = (SELECT COUNT(*) FROM #Results WHERE command_text LIKE '%MAXDOP = 2%');
+
+IF @2f_cmds > 0 AND @2f_maxdop = @2f_cmds
+BEGIN
+    DECLARE @2f_msg2 nvarchar(200) = N'  PASS 2F-2: MAXDOP = 2 present in all ' + CAST(@2f_maxdop AS nvarchar(10)) + N' generated command(s).';
+    RAISERROR(@2f_msg2, 10, 1) WITH NOWAIT;
+END
+ELSE
+BEGIN
+    DECLARE @2f_msg2f nvarchar(300) = N'  FAIL 2F-2: MAXDOP = 2 in ' + CAST(@2f_maxdop AS nvarchar(10))
+        + N' of ' + CAST(@2f_cmds AS nvarchar(10)) + N' command(s); @Maxdop did not reach the generated SQL.';
+    RAISERROR(@2f_msg2f, 10, 1) WITH NOWAIT;
+END
 GO
 
 ------------------------------------------------------------------------
@@ -509,7 +527,10 @@ BEGIN
     RAISERROR(@2l_msg2, 10, 1) WITH NOWAIT;
 END
 ELSE
-    RAISERROR(N'  INFO 2L-2: forwarded_fetch_count = 0 for all targets (no table scans hit forwarded records during test setup).', 10, 1) WITH NOWAIT;
+    /* #202: SKIP, not INFO. Whether the engine recorded fetches during setup is
+       not deterministic, so this legitimately may not apply -- but the outcome
+       must still be countable, or the assertion silently stops asserting. */
+    RAISERROR(N'  SKIP 2L-2: forwarded_fetch_count = 0 for all targets; no table scan hit a forwarded record during setup.', 10, 1) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------
@@ -530,7 +551,9 @@ BEGIN
 END
 ELSE
 BEGIN
-    DECLARE @2m_msg1 nvarchar(200) = N'  INFO 2M-1: usage_hint populated for ' + CAST(@2m_hinted AS nvarchar(10)) + N' target(s). Expected NULL for read-heavy test heaps.';
+    /* #202: SKIP, not INFO -- see 2L-2. usage_hint depends on what
+       dm_db_index_usage_stats accumulated, which the test cannot force. */
+    DECLARE @2m_msg1 nvarchar(200) = N'  SKIP 2M-1: usage_hint populated for ' + CAST(@2m_hinted AS nvarchar(10)) + N' target(s); read/write mix was not what the fixture assumes.';
     RAISERROR(@2m_msg1, 10, 1) WITH NOWAIT;
 END
 GO

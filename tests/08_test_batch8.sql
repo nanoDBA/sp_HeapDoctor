@@ -175,15 +175,23 @@ BEGIN
     UPDATE #TestCounts SET FailCount += 1;
 END
 
--- @Succeeded/@Failed/@Skipped should be NULL in PlanOnly mode
-IF @s IS NULL AND @f IS NULL AND @sk IS NULL
+-- @Succeeded/@Failed/@Skipped are ZERO in PlanOnly mode, not NULL (#204).
+--
+-- This test used to assert NULL, encoding the behaviour #204 identifies as the
+-- bug: NULL made "planned, executed nothing" indistinguishable from "never ran",
+-- and `IF @Succeeded = 0` never matched. Nothing executed, so zero is the honest
+-- answer. See CONTRACTS.md section 2.
+IF @s = 0 AND @f = 0 AND @sk = 0
 BEGIN
-    RAISERROR(N'  PASS 8K2: Execution output params NULL in PlanOnly mode.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 8K2: Execution output params are 0 (not NULL) in PlanOnly mode.', 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET PassCount += 1;
 END
 ELSE
 BEGIN
-    RAISERROR(N'  FAIL 8K2: Execution output params should be NULL in PlanOnly mode.', 10, 1) WITH NOWAIT;
+    DECLARE @msg8k2 nvarchar(300) = N'  FAIL 8K2: expected 0 for all three in PlanOnly mode, got Succeeded='
+        + ISNULL(CONVERT(nvarchar(10), @s), N'NULL') + N' Failed=' + ISNULL(CONVERT(nvarchar(10), @f), N'NULL')
+        + N' Skipped=' + ISNULL(CONVERT(nvarchar(10), @sk), N'NULL') + N'.';
+    RAISERROR(@msg8k2, 10, 1) WITH NOWAIT;
     UPDATE #TestCounts SET FailCount += 1;
 END
 GO

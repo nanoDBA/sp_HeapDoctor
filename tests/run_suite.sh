@@ -17,18 +17,22 @@
 # manifest -- a manifest would go stale on every release, which is the same
 # maintenance trap as the hardcoded version strings in #191.
 #
-# The derivation counts an assertion id only when the file contains BOTH a
-# "PASS <id>:" and a "FAIL <id>:" literal. That deliberately excludes:
+# The derivation counts an assertion id when the file gives it BOTH a success
+# branch and a non-success branch: "PASS <id>:" plus either "FAIL <id>:" or
+# "SKIP <id>:". Such an id always emits something countable.
 #
-#   * guard-only ids such as 26-SETUP, which raise at severity 16 on failure
-#     and emit nothing at all on the happy path; and
-#   * environment-dependent ids such as 2L-2 and 2M-1, whose else-branch emits
-#     "INFO", so whether they emit a countable assertion depends on the data
-#     the engine happens to produce.
+# Guard-only ids that raise at severity 16 and emit nothing on the happy path are
+# excluded, but as of #202 none remain: 26-SETUP, the last one, now emits PASS
+# when its fixture is sound. The exclusion stays as a safety net for any new one.
 #
-# Because of that second class, the derived figure is a MINIMUM, and the
-# comparison is ">=", never "==". An equality check would fire spuriously on a
-# perfectly good run -- the false alarm the issue explicitly rules out.
+# SKIP exists because some assertions genuinely do not apply on a given engine
+# or data shape (#202). Previously those emitted "INFO", which the counter could
+# not see -- so an assertion that quietly stopped asserting was invisible. SKIP
+# records that it was reached and deliberately not asserted.
+#
+# The figure is still a MINIMUM and the comparison is ">=", never "==": a file
+# may emit extra PASS lines beyond the ids counted here. An equality check would
+# fire spuriously on a perfectly good run.
 #
 # Usage:
 #   bash tests/run_suite.sh -S <server> [-U <user> -P <password>] [-t <file>]
@@ -72,14 +76,23 @@ done
 ID_RE='[0-9]+[A-Z]?[0-9]*(-[0-9]+)?(-SETUP)?'
 PASS_RE="^[[:space:]]*PASS ${ID_RE}:"
 FAIL_RE="^[[:space:]]*FAIL ${ID_RE}:"
+# SKIP is a countable outcome, not silence (#202). Some assertions genuinely do
+# not apply on a given engine or data shape; emitting SKIP records that they were
+# reached and deliberately not asserted, which an INFO line could not do.
+SKIP_RE="^[[:space:]]*SKIP ${ID_RE}:"
 
-# Minimum assertions a file must emit: ids carrying both a PASS and a FAIL
-# literal. See the header for why this is a minimum and not an exact count.
+# Minimum assertions a file must emit: ids that have BOTH a success branch and a
+# non-success branch, so they always emit something countable. That is
+# PASS+FAIL (an ordinary assertion) or PASS+SKIP (#202: one that can legitimately
+# not apply). An id with only a PASS literal has no other branch to take and is
+# excluded -- see the header.
 expected_for() {
-    local f="$1" p_ids f_ids
+    local f="$1" p_ids f_ids s_ids other
     p_ids=$(grep -oE "PASS ${ID_RE}:" "$f" 2>/dev/null | sed -E 's/^PASS //; s/:$//' | sort -u)
     f_ids=$(grep -oE "FAIL ${ID_RE}:" "$f" 2>/dev/null | sed -E 's/^FAIL //; s/:$//' | sort -u)
-    comm -12 <(printf '%s\n' "$p_ids") <(printf '%s\n' "$f_ids") | grep -c '[^[:space:]]'
+    s_ids=$(grep -oE "SKIP ${ID_RE}:" "$f" 2>/dev/null | sed -E 's/^SKIP //; s/:$//' | sort -u)
+    other=$(printf '%s\n%s\n' "$f_ids" "$s_ids" | grep -v '^$' | sort -u)
+    comm -12 <(printf '%s\n' "$p_ids") <(printf '%s\n' "$other") | grep -c '[^[:space:]]'
 }
 
 # Test files are every tests/*.sql except the shared setup (01_) and the
@@ -171,7 +184,7 @@ fi
 
 echo "=== sp_HeapDoctor test suite: ${#TEST_FILES[@]} file(s) ==="
 
-fail_total=0; pass_total=0; msg_total=0; expected_total=0
+fail_total=0; pass_total=0; skip_total=0; msg_total=0; expected_total=0
 problems=()
 
 for t in "${TEST_FILES[@]}"; do
@@ -203,24 +216,26 @@ for t in "${TEST_FILES[@]}"; do
     body=$(printf '%s\n' "$out" | grep -av 'PASS/FAIL')
     p=$(printf '%s\n' "$body" | grep -acE "$PASS_RE")
     f=$(printf '%s\n' "$body" | grep -acE "$FAIL_RE")
+    k=$(printf '%s\n' "$body" | grep -acE "$SKIP_RE")
     m=$(printf '%s\n' "$body" | grep -acE '^Msg [0-9]+')
 
-    pass_total=$((pass_total + p)); fail_total=$((fail_total + f)); msg_total=$((msg_total + m))
+    pass_total=$((pass_total + p)); fail_total=$((fail_total + f))
+    skip_total=$((skip_total + k)); msg_total=$((msg_total + m))
 
     status="ok"
     # Check 2: silence is not success.
-    if [ "$((p + f))" -eq 0 ]; then
+    if [ "$((p + f + k))" -eq 0 ]; then
         status="NO ASSERTIONS"; problems+=("$t: emitted no assertions at all (expected >= $expected)")
     # Check 1: a short run is an incomplete run.
-    elif [ "$((p + f))" -lt "$expected" ]; then
-        status="SHORT"; problems+=("$t: emitted $((p + f)) assertions, expected >= $expected")
+    elif [ "$((p + f + k))" -lt "$expected" ]; then
+        status="SHORT"; problems+=("$t: emitted $((p + f + k)) assertions, expected >= $expected")
     fi
     [ "$f" -gt 0 ] && problems+=("$t: $f assertion(s) FAILED")
     # Check 3: an unhandled engine error means the file did not run as written.
     [ "$m" -gt 0 ] && problems+=("$t: $m unhandled Msg error(s)")
 
-    printf '%-40s PASS=%-4d FAIL=%-3d Msg=%-3d expected>=%-4d %s\n' \
-        "$t" "$p" "$f" "$m" "$expected" "$status"
+    printf '%-40s PASS=%-4d FAIL=%-3d SKIP=%-3d Msg=%-3d expected>=%-4d %s\n' \
+        "$t" "$p" "$f" "$k" "$m" "$expected" "$status"
 
     if [ "$f" -gt 0 ] || [ "$m" -gt 0 ]; then
         printf '%s\n' "$body" | grep -aE "$FAIL_RE|^Msg [0-9]+" | sed 's/^/    /' | head -20
@@ -228,7 +243,7 @@ for t in "${TEST_FILES[@]}"; do
 done
 
 echo
-echo "=== totals: PASS=$pass_total FAIL=$fail_total Msg=$msg_total (expected >= $expected_total) ==="
+echo "=== totals: PASS=$pass_total FAIL=$fail_total SKIP=$skip_total Msg=$msg_total (expected >= $expected_total) ==="
 
 # Check 4b: the instance must have survived the run. A suite whose target
 # vanished mid-run otherwise reports zero failures, which is indistinguishable
@@ -240,8 +255,8 @@ else
     problems+=("the SQL instance became unreachable during the run; results are incomplete")
 fi
 
-if [ "$pass_total" -lt "$expected_total" ]; then
-    problems+=("suite total $pass_total is below the expected minimum $expected_total")
+if [ "$((pass_total + skip_total))" -lt "$expected_total" ]; then
+    problems+=("suite total $((pass_total + skip_total)) is below the expected minimum $expected_total")
 fi
 
 if [ "${#problems[@]}" -gt 0 ]; then

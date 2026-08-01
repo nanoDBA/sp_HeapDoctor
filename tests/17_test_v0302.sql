@@ -150,10 +150,13 @@ ORDER BY ID DESC;
 
 SELECT @plan_action17 = action_chosen FROM #Results WHERE table_name = N'HeapLobTest';
 
+/* #202: both branches used to emit INFO, so 17D never asserted anything. The
+   else-branch matters: without a CI_SWAP plan the LOB-fallback path below is
+   never exercised, and the test would pass vacuously. SKIP records that. */
 IF @plan_action17 = 'CI_SWAP_ONLINE'
-    RAISERROR(N'  INFO 17D: Initial plan chose CI_SWAP_ONLINE (as expected).', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 17D-0: initial plan chose CI_SWAP_ONLINE, so the LOB fallback below is exercised.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  INFO 17D: Initial plan chose %s (CI swap not eligible; test may not exercise LOB fallback).', 10, 1, @plan_action17) WITH NOWAIT;
+    RAISERROR(N'  SKIP 17D-0: initial plan chose %s; CI swap not eligible, so the LOB fallback is not exercised.', 10, 1, @plan_action17) WITH NOWAIT;
 
 -- Step 2: Add a LOB column (schema change after discovery)
 ALTER TABLE dbo.HeapLobTest ADD LobCol nvarchar(max) NULL;

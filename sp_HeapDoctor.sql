@@ -51,9 +51,9 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.08.01.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.08.01.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.08.01.3 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
+History:    2026.08.01.4 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
                             @Succeeded, @Failed and @Skipped NULL, so a caller testing
                             "IF @TargetsFound = 0" never matched and "nothing to do" was
@@ -803,7 +803,20 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     @IncludeTemporalHistory  bit            = 0, /* #84: include temporal history heaps in discovery */
 
     /* Resumable */
-    @UseResumable            bit            = 1 /* #85: use RESUMABLE = ON for CI swap (SQL 2019+, default ON) */
+    @UseResumable            bit            = 1, /* #85: use RESUMABLE = ON for CI swap (SQL 2019+, default ON) */
+
+    /*
+    #203: a machine-readable verdict. @Failed alone is not one -- a run can be
+    incomplete while @Failed = 0: discovery blocked (#199), heaps filtered out
+    (#198), or a CI swap whose DROP left a table clustered (#187, which even
+    advances the success count). Priority: ERROR > WARNING > SUCCESS.
+
+    Appended at the END of the parameter list on purpose. Inserting them beside
+    the other OUTPUT parameters would shift every positional argument after that
+    point and silently break callers that pass arguments by position.
+    */
+    @Status                  varchar(10)    = NULL OUTPUT, /* SUCCESS | WARNING | ERROR */
+    @StatusMessage           nvarchar(1000) = NULL OUTPUT  /* names the most severe condition, with counts */
 )
 /*#endregion 00-HEADER */
 
@@ -813,7 +826,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.08.01.3';
+    DECLARE @Version nvarchar(20) = N'2026.08.01.4';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -1041,6 +1054,18 @@ PERMISSIONS:  VIEW DATABASE STATE, ALTER on target tables, INSERT on dbo.Command
               ALTER TRACE (optional, for sp_trace_generateevent observability).
 TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETIME).
 ', 10, 1) WITH NOWAIT;
+        /*
+        #204: informational modes return cleanly without doing work, so the
+        OUTPUT parameters must say "nothing", not NULL. Left NULL, a scripted
+        caller cannot tell this from a run that never happened.
+        */
+        SET @TargetsFound = 0;
+        SET @Succeeded    = 0;
+        SET @Failed       = 0;
+        SET @Skipped      = 0;
+        SET @Status       = 'SUCCESS';
+        SET @StatusMessage = N'Informational mode: no scan or rebuild was performed.';
+
         RETURN;
     END
 
@@ -1159,6 +1184,18 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             t.c.value(N'(real_name)[1]',   N'sysname')       AS real_name
         FROM @mapping_xml.nodes(N'/ObfuscatedMapping/Object') AS t(c)
         ORDER BY object_type, pseudonym;
+
+        /*
+        #204: informational modes return cleanly without doing work, so the
+        OUTPUT parameters must say "nothing", not NULL. Left NULL, a scripted
+        caller cannot tell this from a run that never happened.
+        */
+        SET @TargetsFound = 0;
+        SET @Succeeded    = 0;
+        SET @Failed       = 0;
+        SET @Skipped      = 0;
+        SET @Status       = 'SUCCESS';
+        SET @StatusMessage = N'Informational mode: no scan or rebuild was performed.';
 
         RETURN;
     END
@@ -1418,6 +1455,18 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             RAISERROR(N'All required permissions granted.', 10, 1) WITH NOWAIT;
 
         DROP TABLE #PermCheck;
+        /*
+        #204: informational modes return cleanly without doing work, so the
+        OUTPUT parameters must say "nothing", not NULL. Left NULL, a scripted
+        caller cannot tell this from a run that never happened.
+        */
+        SET @TargetsFound = 0;
+        SET @Succeeded    = 0;
+        SET @Failed       = 0;
+        SET @Skipped      = 0;
+        SET @Status       = 'SUCCESS';
+        SET @StatusMessage = N'Informational mode: no scan or rebuild was performed.';
+
         RETURN;
     END
 
@@ -2675,7 +2724,12 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         @CurrentDatabaseID   integer,
         @discovery_sql       nvarchar(max),
         @discovery_errors    integer = 0,
-        @discovery_blocked   integer = 0;   /* #199: scans that timed out waiting for a lock */
+        @discovery_blocked   integer = 0,   /* #199: scans that timed out waiting for a lock */
+        @heaps_filtered      integer = 0,   /* #198/#203: heaps dropped by @MinForwardedPct, all databases */
+        @heaps_filtered_db   integer = 0,   /* per-database, reset before each scan */
+        @scan_truncated_db   bit     = 0,   /* #200: this database's scan hit @MaxRunSeconds */
+        @scans_truncated     integer = 0,   /* #200: databases scanned only partially */
+        @scan_phase_start    datetime2(3) = SYSDATETIME();
 
     /* Per-database scan stats (for HEAP_SCAN_SUMMARY XML) */
     DECLARE @DbScanStats TABLE (
@@ -2700,6 +2754,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
         SET @db_scan_start = SYSDATETIME();
+        SET @heaps_filtered_db = 0;   /* #198: reset so a failed scan cannot carry a stale count */
+        SET @scan_truncated_db = 0;   /* #200: likewise for the truncation flag */
         SET @db_pre_target_count = (SELECT COUNT_BIG(*) FROM #Targets);
 
         /*
@@ -2807,9 +2863,10 @@ DECLARE @Msg_inner nvarchar(4000);
 
 CREATE TABLE #HeapObjects
 (
-    object_id   integer     NOT NULL PRIMARY KEY,
+    object_id   integer NOT NULL PRIMARY KEY,
     schema_name sysname NOT NULL,
-    table_name  sysname NOT NULL
+    table_name  sysname NOT NULL,
+    scanned     bit     NOT NULL DEFAULT 0   /* #200: chunked scan progress */
 );
 
 INSERT INTO #HeapObjects (object_id, schema_name, table_name)
@@ -2885,6 +2942,43 @@ END
 
 SET ANSI_WARNINGS OFF; /* suppress "Null value is eliminated by an aggregate" from DMV aggregation */
 
+/*
+#200: scan in batches so @MaxRunSeconds can actually bound discovery.
+
+The limit used to be checked only BETWEEN databases and BETWEEN targets, never
+inside either. One database whose scan outran the budget could not be
+interrupted -- and in single-database mode there is no between-database boundary
+at all, so the check never fired even once.
+
+dm_db_index_physical_stats is the expensive part, so the batch is the unit of
+work: after each one the elapsed time is checked and the scan can stop. A
+truncated scan sets @ScanTruncated_param, which the caller reports the same way
+as a blocked scan (#199) -- the target list is a subset either way.
+
+Batch size is a balance: too small and the per-statement overhead dominates, too
+large and the time check is coarse. 200 heaps keeps the check responsive on the
+kind of database that motivated this.
+*/
+DECLARE @scan_batch integer = 200;
+DECLARE @scan_more bit = 1;
+
+WHILE @scan_more = 1
+BEGIN
+    IF OBJECT_ID(N''tempdb..#ScanBatch'') IS NOT NULL DROP TABLE #ScanBatch;
+    CREATE TABLE #ScanBatch (object_id integer NOT NULL PRIMARY KEY);
+
+    INSERT INTO #ScanBatch (object_id)
+    SELECT TOP (@scan_batch) ho.object_id
+    FROM   #HeapObjects AS ho
+    WHERE  ho.scanned = 0
+    ORDER BY ho.object_id;
+
+    IF NOT EXISTS (SELECT 1 FROM #ScanBatch)
+    BEGIN
+        SET @scan_more = 0;
+        BREAK;
+    END
+
 INSERT INTO #Heaps (object_id, schema_name, table_name, page_count, record_count, forwarded_record_count, forwarded_pct, avg_page_space_pct, avg_frag_pct, ghost_record_count, forwarded_fetch_count, user_seeks, user_scans, user_lookups, user_updates, heap_compression, replication_hint, lock_escalation, partition_count, has_schema_bound_views, has_indexed_views, data_space_name, has_fk_references, fk_ref_count, page_io_latch_wait_count, page_io_latch_wait_ms)
 SELECT
     ho.object_id,
@@ -2928,6 +3022,7 @@ SELECT
     os.page_io_latch_wait_count,
     os.page_io_latch_wait_in_ms
 FROM #HeapObjects ho
+JOIN #ScanBatch sb ON sb.object_id = ho.object_id   /* #200: this batch only */
 CROSS APPLY (
     /* Aggregate per-partition rows for partitioned heaps. */
     /* dm_db_index_physical_stats returns one row per partition when partition_number=NULL. */
@@ -3008,6 +3103,37 @@ WHERE (@IncludeHealthyHeaps_param = 1 OR ips.forwarded_record_count > 0)
   AND ips.page_count >= @MinPages_param
   AND (@MaxPages_param IS NULL OR ips.page_count <= @MaxPages_param);
 
+    UPDATE ho
+    SET    ho.scanned = 1
+    FROM   #HeapObjects AS ho
+    JOIN   #ScanBatch   AS sb ON sb.object_id = ho.object_id;
+
+    /*
+    #200: the time check that makes @MaxRunSeconds mean something during
+    discovery. Stopping here leaves the target list a SUBSET, so it is reported
+    rather than returned quietly -- same contract as a blocked scan (#199).
+    */
+    IF @MaxRunSeconds_param IS NOT NULL
+       AND DATEDIFF(SECOND, @RunStart_param, SYSDATETIME()) >= @MaxRunSeconds_param
+    BEGIN
+        DECLARE @unscanned integer = (SELECT COUNT_BIG(*) FROM #HeapObjects AS ho2 WHERE ho2.scanned = 0);
+
+        IF @unscanned > 0
+        BEGIN
+            SET @ScanTruncated_param = 1;
+            SET @Msg_inner = N''  SCAN TRUNCATED: @MaxRunSeconds reached with ''
+                + CONVERT(nvarchar(10), @unscanned)
+                + N'' heap(s) not yet scanned in this database. The target list is a subset.'';
+            RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
+        END
+
+        SET @scan_more = 0;
+        BREAK;
+    END
+END
+
+IF OBJECT_ID(N''tempdb..#ScanBatch'') IS NOT NULL DROP TABLE #ScanBatch;
+
 SET ANSI_WARNINGS ON;
 
 /*
@@ -3034,6 +3160,8 @@ BEGIN
 
     DELETE FROM #Heaps
     WHERE NOT ((100.0 * forwarded_record_count / NULLIF(record_count, 0)) >= @MinForwardedPct_param);
+
+    SET @BelowThreshold_param = @below_threshold;
 
     IF @below_threshold > 0
     BEGIN
@@ -3743,7 +3871,10 @@ END
                   @AllowCiSwap_param bit, @PreferCiSwap_param bit, @Online_param bit,
                   @Maxdop_param integer, @FillFactor_param tinyint, @CpuSource_param varchar(20), @UptimeHours_param float,
                   @UseResumable_param bit, @IncludeTemporalHistory_param bit,
-                  @ScanMode_param nvarchar(20), @LockTimeoutMs_param integer',
+                  @ScanMode_param nvarchar(20), @LockTimeoutMs_param integer,
+                  @BelowThreshold_param integer OUTPUT,
+                  @MaxRunSeconds_param integer, @RunStart_param datetime2(3),
+                  @ScanTruncated_param bit OUTPUT',
                 @MinPages_param = @MinPages,
                 @MaxPages_param = @MaxPages,
                 @MinForwardedPct_param = @MinForwardedPct,
@@ -3760,7 +3891,11 @@ END
                 @UseResumable_param = @UseResumable,
                 @IncludeTemporalHistory_param = @IncludeTemporalHistory,
                 @ScanMode_param = @ScanMode,
-                @LockTimeoutMs_param = @LockTimeoutMs;
+                @LockTimeoutMs_param = @LockTimeoutMs,
+                @BelowThreshold_param = @heaps_filtered_db OUTPUT,
+                @MaxRunSeconds_param = @MaxRunSeconds,
+                @RunStart_param = @scan_phase_start,
+                @ScanTruncated_param = @scan_truncated_db OUTPUT;
         END TRY
         BEGIN CATCH
             SET @discovery_errors += 1;
@@ -3788,6 +3923,9 @@ END
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
         END CATCH;
+
+        SET @heaps_filtered += ISNULL(@heaps_filtered_db, 0);
+        IF ISNULL(@scan_truncated_db, 0) = 1 SET @scans_truncated += 1;
 
         /* Set sort_order = target_id for newly inserted rows */
         UPDATE #Targets SET sort_order = target_id WHERE sort_order = 0;
@@ -4594,6 +4732,47 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         SET @Succeeded    = 0;
         SET @Failed       = 0;
         SET @Skipped      = 0;
+
+        /*
+        #203: this path returns before the cleanup region, so the verdict is
+        decided here as well. "No targets" is NOT automatically SUCCESS: if the
+        scan was blocked or heaps were filtered out, an empty list is a subset,
+        not a clean bill of health.
+        */
+        IF @discovery_blocked > 0 OR @discovery_errors > 0 OR @heaps_filtered > 0 OR @scans_truncated > 0
+        BEGIN
+            SET @Status = 'WARNING';
+            SET @StatusMessage = N'No targets, but the scan was incomplete: '
+                + CASE
+                      WHEN @discovery_blocked > 0
+                          THEN CONVERT(nvarchar(10), @discovery_blocked) + N' database(s) not scanned (locked); '
+                      ELSE N''
+                  END
+                + CASE
+                      WHEN @discovery_errors > @discovery_blocked
+                          THEN CONVERT(nvarchar(10), @discovery_errors - @discovery_blocked) + N' database(s) errored; '
+                      ELSE N''
+                  END
+                + CASE
+                      WHEN @heaps_filtered > 0
+                          THEN CONVERT(nvarchar(10), @heaps_filtered) + N' heap(s) below @MinForwardedPct; '
+                      ELSE N''
+                  END
+                + CASE
+                      WHEN @scans_truncated > 0
+                          THEN CONVERT(nvarchar(10), @scans_truncated) + N' database(s) scanned only partially (@MaxRunSeconds); '
+                      ELSE N''
+                  END
+                + N'absence of targets does not mean absence of problems.';
+        END
+        ELSE
+        BEGIN
+            SET @Status = 'SUCCESS';
+            SET @StatusMessage = N'No heaps met the thresholds. Nothing to do.';
+        END
+
+        SET @Msg = N'Status: ' + @Status + N' - ' + @StatusMessage;
+        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
         IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
         RETURN;
@@ -5746,6 +5925,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @start          datetime2(3),
             @end            datetime2(3),
             @RunStart       datetime2(3) = SYSDATETIME(),
+            @stranded_reclaimed integer = 0,   /* #201: queue rows recovered from dead workers */
             @succeeded_cnt  integer = 0,
             @failed_cnt     integer = 0,
             @skipped_cnt    integer = 0,
@@ -5978,6 +6158,75 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                  AND qhr.DatabaseName = nu.DatabaseName
                  AND qhr.SchemaName   = nu.SchemaName
                  AND qhr.TableName    = nu.TableName;
+
+                /*
+                #201: dead-worker recovery.
+
+                A worker killed mid-rebuild leaves TableStartTime set and
+                TableEndTime NULL. READPAST skips locked rows and nothing looked
+                at claimed-but-unfinished ones, so that row was never picked up
+                again -- by any worker, on any later run. The run still reported
+                success, because a heap that was never rebuilt simply is not
+                mentioned.
+
+                The liveness test pairs SessionID with ClaimLoginTime. session_id
+                alone is not enough: SPIDs are reused, so a live unrelated session
+                could make a genuinely dead claim look alive. login_time pins the
+                claim to one specific session, which is exactly why the column was
+                added in Phase A.
+
+                Only reached when nothing unclaimed remains, so a live worker's
+                row is never stolen while ordinary work is still available.
+                */
+                IF NOT EXISTS (SELECT 1 FROM @ClaimedTarget)
+                BEGIN
+                    ;WITH Stranded AS
+                    (
+                        SELECT TOP (1) qhr.QueueID, qhr.DatabaseName, qhr.SchemaName, qhr.TableName
+                        FROM dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
+                        WHERE qhr.QueueID = @queue_id
+                          AND qhr.TableStartTime IS NOT NULL
+                          AND qhr.TableEndTime IS NULL
+                          AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM sys.dm_exec_sessions AS des
+                                  WHERE des.session_id = qhr.SessionID
+                                    AND des.login_time = qhr.ClaimLoginTime
+                              )
+                        ORDER BY qhr.SortOrder
+                    )
+                    UPDATE qhr
+                    SET qhr.TableStartTime = SYSDATETIME(),
+                        qhr.SessionID      = @@SPID,
+                        qhr.ClaimLoginTime = @claim_login_time,
+                        qhr.Status         = NULL,
+                        qhr.ErrorMessage   = NULL
+                    OUTPUT inserted.DatabaseName, inserted.SchemaName, inserted.TableName,
+                           inserted.ObjectID, inserted.SortOrder, inserted.ActionChosen,
+                           inserted.PageCount, inserted.RecordCount, inserted.ForwardedRecordCount,
+                           inserted.ForwardedPct, inserted.EstLogMB, inserted.HeapCompression,
+                           inserted.ReplicationHint, inserted.LockEscalation,
+                           inserted.HasFkReferences, inserted.FkRefCount,
+                           inserted.IsTemporalHistory, inserted.TemporalParentSchema, inserted.TemporalParentTable,
+                           inserted.CommandText, inserted.CiDropCommand, inserted.VerifyCommand
+                    INTO @ClaimedTarget
+                    FROM Stranded AS st
+                    JOIN dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
+                      ON qhr.QueueID      = st.QueueID
+                     AND qhr.DatabaseName = st.DatabaseName
+                     AND qhr.SchemaName   = st.SchemaName
+                     AND qhr.TableName    = st.TableName;
+
+                    IF EXISTS (SELECT 1 FROM @ClaimedTarget)
+                    BEGIN
+                        SET @stranded_reclaimed += 1;
+                        SELECT TOP (1) @Msg = N'  RECLAIMED a queue row abandoned by a dead worker: '
+                                            + QUOTENAME(DatabaseName) + N'.' + QUOTENAME(SchemaName) + N'.' + QUOTENAME(TableName)
+                                            + N'. Its claiming session no longer exists.'
+                        FROM @ClaimedTarget;
+                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                    END
+                END
 
                 IF NOT EXISTS (SELECT 1 FROM @ClaimedTarget) BREAK;
 
@@ -7631,10 +7880,24 @@ DEALLOCATE fk_child_cursor;';
                         @discovery_errors AS ScanErrors,
                         @TargetCount AS TotalTargets,
                         DATEDIFF(SECOND, @RunStart, SYSDATETIME()) AS ElapsedSeconds,
+                        /*
+                        #203: StopReason enum. DISCOVERY_BLOCKED is evaluated
+                        before the generic scan-error value because a blocked
+                        scan means the target list is a SUBSET -- a different
+                        claim from "a database errored", and the one a consumer
+                        must not read as a complete run.
+                        */
                         CASE
-                            WHEN @failed_cnt > 0 THEN N'COMPLETED_WITH_ERRORS'
-                            WHEN @discovery_errors > 0 THEN N'COMPLETED_WITH_SCAN_ERRORS'
-                            WHEN @skipped_cnt > 0 THEN N'COMPLETED_WITH_SKIPS'
+                            WHEN @failed_cnt > 0
+                                THEN N'COMPLETED_WITH_ERRORS'
+                            WHEN @discovery_blocked > 0
+                                THEN N'DISCOVERY_BLOCKED'
+                            WHEN @discovery_errors > 0
+                                THEN N'COMPLETED_WITH_SCAN_ERRORS'
+                            WHEN @heaps_filtered > 0
+                                THEN N'COMPLETED_WITH_FILTERED_HEAPS'
+                            WHEN @skipped_cnt > 0
+                                THEN N'COMPLETED_WITH_SKIPS'
                             ELSE N'SUCCESS'
                         END AS StopReason,
                         @live_pages_rebuilt AS TotalPagesRebuilt,
@@ -7659,6 +7922,132 @@ DEALLOCATE fk_child_cursor;';
         SET @Failed = @failed_cnt;
         SET @Skipped = @skipped_cnt;
     END
+    ELSE
+    BEGIN
+        /*
+        #204: plan-only runs used to leave these three NULL. Nothing executed, so
+        zero is the honest answer; NULL made "planned, executed nothing" look the
+        same as "never ran".
+        */
+        SET @Succeeded = 0;
+        SET @Failed    = 0;
+        SET @Skipped   = 0;
+
+        /*
+        The counters themselves are DECLAREd inside the IF @PlanOnly = 0 block.
+        T-SQL scopes DECLARE to the batch but runs the initialiser only when the
+        block executes, so in plan-only they are NULL here -- and NULL > 0 is
+        UNKNOWN, which would silently disable the WARNING arm of the verdict.
+        */
+        SET @succeeded_cnt = 0;
+        SET @failed_cnt    = 0;
+        SET @skipped_cnt   = 0;
+    END
+
+    /*
+    #201: report dead-worker recovery, and anything still stranded.
+
+    Reclaiming silently would trade one invisible failure for another: the
+    operator would never learn that a worker died. A row still stranded at the
+    end belongs to a session that was alive when we looked, so it is reported
+    rather than seized.
+    */
+    IF @HeapsInParallel = N'Y'
+    BEGIN
+        IF @stranded_reclaimed > 0
+        BEGIN
+            SET @Msg = N'NOTE: recovered ' + CONVERT(nvarchar(10), @stranded_reclaimed)
+                     + N' queue row(s) abandoned by dead worker(s). Investigate why those sessions ended.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+
+        DECLARE @still_stranded integer = 0;
+
+        SELECT @still_stranded = COUNT_BIG(*)
+        FROM   dbo.QueueHeapRebuild AS qhr
+        WHERE  qhr.QueueID = @queue_id
+          AND  qhr.TableStartTime IS NOT NULL
+          AND  qhr.TableEndTime IS NULL;
+
+        IF @still_stranded > 0
+        BEGIN
+            SET @Msg = N'WARNING: ' + CONVERT(nvarchar(10), @still_stranded)
+                     + N' queue row(s) are claimed but unfinished. Their sessions were alive when checked,'
+                     + N' so they were left alone. If a worker has since died, re-run to reclaim them.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+        END
+    END
+
+    /*
+    #203: the run verdict.
+
+    @Failed on its own is not a verdict. Every one of these leaves it at 0 while
+    the run is materially incomplete:
+
+      - discovery was blocked on a locked database (#199)
+      - heaps were dropped by @MinForwardedPct, so the target list is a subset (#198)
+      - a CI swap succeeded but its DROP failed, leaving a table CLUSTERED and
+        needing manual remediation (#187) -- which even advances the success count
+
+    Priority is ERROR > WARNING > SUCCESS, and the message names the most severe
+    condition rather than the first one found.
+    */
+    DECLARE @recovery_cnt bigint = 0;
+
+    IF OBJECT_ID(N'tempdb..#ExecLog') IS NOT NULL
+        SELECT @recovery_cnt = COUNT_BIG(*)
+        FROM   #ExecLog AS el
+        WHERE  el.recovery_required = 1;
+
+    IF @failed_cnt > 0 OR @recovery_cnt > 0
+    BEGIN
+        SET @Status = 'ERROR';
+        SET @StatusMessage = CASE WHEN @recovery_cnt > 0
+                                  THEN CONVERT(nvarchar(10), @recovery_cnt)
+                                     + N' target(s) need MANUAL RECOVERY (CI swap left the table clustered). '
+                                  ELSE N'' END
+                           + CONVERT(nvarchar(10), @failed_cnt) + N' rebuild(s) failed.';
+    END
+    ELSE IF @discovery_blocked > 0 OR @discovery_errors > 0 OR @skipped_cnt > 0 OR @heaps_filtered > 0 OR @scans_truncated > 0
+    BEGIN
+        SET @Status = 'WARNING';
+        SET @StatusMessage = N'Run incomplete: '
+            + CASE
+                  WHEN @discovery_blocked > 0
+                      THEN CONVERT(nvarchar(10), @discovery_blocked) + N' database(s) not scanned (locked); '
+                  ELSE N''
+              END
+            + CASE
+                  WHEN @discovery_errors > @discovery_blocked
+                      THEN CONVERT(nvarchar(10), @discovery_errors - @discovery_blocked) + N' database(s) errored; '
+                  ELSE N''
+              END
+            + CASE
+                  WHEN @skipped_cnt > 0
+                      THEN CONVERT(nvarchar(10), @skipped_cnt) + N' target(s) skipped; '
+                  ELSE N''
+              END
+            + CASE
+                  WHEN @heaps_filtered > 0
+                      THEN CONVERT(nvarchar(10), @heaps_filtered) + N' heap(s) below @MinForwardedPct; '
+                  ELSE N''
+              END
+            + CASE
+                  WHEN @scans_truncated > 0
+                      THEN CONVERT(nvarchar(10), @scans_truncated) + N' database(s) scanned only partially (@MaxRunSeconds); '
+                  ELSE N''
+              END
+            + N'results are a subset.';
+    END
+    ELSE
+    BEGIN
+        SET @Status = 'SUCCESS';
+        SET @StatusMessage = N'Completed. ' + CONVERT(nvarchar(10), @TargetCount) + N' target(s) found'
+            + CASE WHEN @PlanOnly = 0 THEN N', ' + CONVERT(nvarchar(10), @succeeded_cnt) + N' rebuilt.' ELSE N' (plan only).' END;
+    END
+
+    SET @Msg = N'Status: ' + @Status + N' - ' + @StatusMessage;
+    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
     /* Release re-entrancy guard */
     IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';

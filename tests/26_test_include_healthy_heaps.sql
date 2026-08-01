@@ -46,6 +46,17 @@ IF @fwd <> 0
     RAISERROR(N'  FAIL 26-SETUP: HeapHealthy unexpectedly has forwarded records.', 16, 1);
 IF @pages < 1000
     RAISERROR(N'  FAIL 26-SETUP: HeapHealthy must have >= 1000 pages for @MinPages=1000 baseline.', 16, 1);
+
+/* #202: emit the success case too. This guard used to raise at severity 16 on
+   failure and say NOTHING when the fixture was sound, so the id could complete
+   without a countable outcome -- the one exception that contradicted the rule in
+   CONTRACTS.md section 6. */
+IF @fwd = 0 AND @pages >= 1000
+BEGIN
+    DECLARE @msg_ok nvarchar(200) = N'  PASS 26-SETUP: HeapHealthy fixture is sound (pages='
+        + CONVERT(nvarchar(20), @pages) + N', forwarded_records=' + CONVERT(nvarchar(20), @fwd) + N').';
+    RAISERROR(@msg_ok, 10, 1) WITH NOWAIT;
+END
 GO
 
 ------------------------------------------------------------------------

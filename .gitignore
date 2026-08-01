@@ -8,6 +8,7 @@
 !LICENSE
 !sp_HeapDoctor.sql
 !STYLE_GUIDE.md
+!CONTRACTS.md
 !tools/
 !tools/*.sql
 # Tests: *.sql files, plus the suite runner. Other shell scripts and

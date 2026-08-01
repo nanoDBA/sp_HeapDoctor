@@ -173,7 +173,7 @@ SELECT @meta32e = SUM(ps.row_count)
 FROM sys.dm_db_partition_stats AS ps
 WHERE ps.object_id = OBJECT_ID(N'dbo.HeapC') AND ps.index_id IN (0, 1);
 
-DECLARE @m32e nvarchar(400) = N'  INFO 32E: exact=' + CONVERT(nvarchar(20), @exact32e)
+DECLARE @m32e nvarchar(400) = N'  NOTE (32E): exact=' + CONVERT(nvarchar(20), @exact32e)
     + N', partition_stats=' + ISNULL(CONVERT(nvarchar(20), @meta32e), N'NULL')
     + N', SAMPLED=' + ISNULL(CONVERT(nvarchar(20), @sampled32e), N'NULL') + N'.';
 RAISERROR(@m32e, 10, 1) WITH NOWAIT;
