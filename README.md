@@ -333,11 +333,15 @@ The proc detects Standard Edition automatically and falls back to offline with a
 |-----------|---------|-------------|
 | `@Databases` | `NULL` | `NULL` = current DB.  Supports `USER_DATABASES`, `ALL_DATABASES`, `SYSTEM_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%`), exclusions (`-`), comma-separated |
 | `@Tables` | `NULL` | `NULL` = all tables.  Filter by table name: `'dbo.Orders'`, `'Orders'` (any schema), `'dbo.%'` (wildcard), `'-dbo.Staging%'` (exclude).  Same syntax as `@Databases` |
+| `@ExcludeDatabases` | `NULL` | Comma-separated databases to exclude.  Wildcards allowed; no `-` prefix needed.  Merged into `@Databases` before parsing, so it composes with it |
+| `@ExcludeTables` | `NULL` | Comma-separated tables to exclude, same syntax.  Merged into `@Tables` the same way |
 | `@LookbackDays` | `7` | Query Store lookback window in days |
 | `@TopN` | `25` | Max targets per database |
 | `@MinPages` | `1000` | Skip heaps smaller than this (page count) |
 | `@MaxPages` | `NULL` | Skip heaps larger than this (`NULL` = no cap) |
-| `@MinForwardedPct` | `2.00` | Minimum forwarded record % to qualify |
+| `@MinForwardedPct` | `2.00` | Minimum forwarded record % to qualify.  Applied to a `SAMPLED` estimate by default, so a borderline heap can be excluded by sampling error; excluded counts are reported per database |
+| `@IncludeHealthyHeaps` | `0` | `1` = bypass **both** forwarded-record filters (the `> 0` requirement and `@MinForwardedPct`) so heaps with no forwarded records are returned.  `@MinPages`, `@TopN` and every safety guard still apply.  Mainly for force-rebuilding a specific heap alongside `@Tables` |
+| `@ScanMode` | `SAMPLED` | `dm_db_index_physical_stats` mode: `SAMPLED` (fast, estimates) or `DETAILED` (exact, slower).  `LIMITED` is rejected -- it returns NULL for `forwarded_record_count`, so the records this procedure exists to find are invisible to it |
 | `@SkipWriteHeavy` | `0` | `1` = completely exclude `WRITE_HEAVY` and `WRITE_ONLY` heaps.  Default ranking penalties still apply when `0` |
 | `@MinDaysSinceRebuild` | `NULL` | Skip heaps rebuilt fewer than N days ago (requires CommandLog for rebuild history).  `NULL` = no filtering |
 
@@ -378,6 +382,12 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@AllowReplicationRebuild` | `0` | Allow published heap rebuilds (shows estimated replication events).  Heaps with `replication_hint` are skipped by default |
 | `@CheckPermissionsOnly` | `0` | Check permissions (ALTER TRACE, VIEW DATABASE STATE, ALTER, CommandLog INSERT) and return without executing |
 
+| `@HeapsInParallel` | `'N'` | `'Y'` = queue-based parallel rebuilds across sessions.  Requires Ola Hallengren's `dbo.Queue`; `dbo.QueueHeapRebuild` is created automatically.  The first session becomes the leader and populates the queue, later sessions become workers and drain it.  Incompatible with `@PlanOnly = 1` |
+
+A worker killed mid-rebuild leaves its claimed queue row unfinished.  Later runs detect that
+its claiming session no longer exists and reclaim the row, so a dead worker no longer strands
+a heap permanently.  Rows still held by a live session are reported rather than seized.
+
 ### Estimation
 
 | Parameter | Default | Description |
@@ -414,15 +424,34 @@ The proc detects Standard Edition automatically and falls back to offline with a
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `@TargetsFound` | int OUTPUT | Number of targets discovered.  Populated in both plan-only and execute modes |
-| `@Succeeded` | int OUTPUT | Rebuilds completed successfully.  NULL in plan-only mode |
-| `@Failed` | int OUTPUT | Rebuilds that errored.  NULL in plan-only mode |
-| `@Skipped` | int OUTPUT | Targets skipped (time limit, TOCTOU, etc.).  NULL in plan-only mode |
+| `@TargetsFound` | integer OUTPUT | Number of targets discovered |
+| `@Succeeded` | integer OUTPUT | Rebuilds completed successfully.  `0` in plan-only mode |
+| `@Failed` | integer OUTPUT | Rebuilds that errored.  `0` in plan-only mode |
+| `@Skipped` | integer OUTPUT | Targets skipped (time limit, TOCTOU, etc.).  `0` in plan-only mode |
+| `@Status` | varchar(10) OUTPUT | The run verdict: `SUCCESS`, `WARNING` or `ERROR` |
+| `@StatusMessage` | nvarchar(1000) OUTPUT | Names the most severe condition, with counts |
 
-Useful for SQL Agent integration:
+All six are set on **every** exit that returns without raising, including `@Help`,
+`@CheckPermissionsOnly`, reveal mode, and a run that found no targets.  They are never left
+NULL, so `IF @TargetsFound = 0` behaves as you would expect.  (Earlier versions left them
+NULL on those paths, which made "did nothing" indistinguishable from "never ran".)
+
+### Check `@Status`, not `@Failed`
+
+`@Failed = 0` is not a clean bill of health.  A run can be materially incomplete while no
+rebuild failed:
+
+- discovery was blocked on a locked database, so the target list is a subset
+- heaps were excluded by `@MinForwardedPct`
+- a CI swap succeeded but its `DROP` failed, leaving the table **clustered** and needing
+  manual remediation -- which even advances the success count
+
+All of those leave `@Failed` at zero.  `@Status` accounts for them, with priority
+`ERROR > WARNING > SUCCESS`.
 
 ```sql
-DECLARE @found int, @succeeded int, @failed int, @skipped int;
+DECLARE @found integer, @succeeded integer, @failed integer, @skipped integer;
+DECLARE @status varchar(10), @status_message nvarchar(1000);
 
 EXEC dbo.sp_HeapDoctor
     @Databases     = 'USER_DATABASES',
@@ -431,11 +460,19 @@ EXEC dbo.sp_HeapDoctor
     @TargetsFound  = @found OUTPUT,
     @Succeeded     = @succeeded OUTPUT,
     @Failed        = @failed OUTPUT,
-    @Skipped       = @skipped OUTPUT;
+    @Skipped       = @skipped OUTPUT,
+    @Status        = @status OUTPUT,
+    @StatusMessage = @status_message OUTPUT;
 
-IF @failed > 0
-    RAISERROR(N'sp_HeapDoctor: %d rebuild(s) failed.', 16, 1, @failed);
+/* Fail the job step on ERROR; surface WARNING without failing it. */
+IF @status = 'ERROR'
+    RAISERROR(N'sp_HeapDoctor: %s', 16, 1, @status_message);
+ELSE IF @status = 'WARNING'
+    RAISERROR(N'sp_HeapDoctor: %s', 10, 1, @status_message) WITH NOWAIT;
 ```
+
+The procedure still returns a non-zero return code when any rebuild fails, so a SQL Agent
+step configured to fail on a non-zero exit keeps working unchanged.
 
 ## Result Set Columns
 
@@ -503,6 +540,7 @@ CPU ranking across every database.
 | Column | Type | Description |
 |--------|------|-------------|
 | `action_chosen` | varchar(32) | `HEAP_REBUILD_ONLINE`, `HEAP_REBUILD_OFFLINE`, or `CI_SWAP_ONLINE` |
+| `recommended_action` | varchar(50) | Coarse, machine-readable form of `action_chosen`: `CI_SWAP`, `REBUILD`, or `MONITOR`.  Use this when branching in a script; `action_chosen` carries the detail |
 | `command_text` | nvarchar(max) | The rebuild command (3-part name) |
 | `ci_drop_command` | nvarchar(max) | DROP INDEX command for CI swap cleanup.  NULL for heap rebuilds |
 | `verify_command` | nvarchar(max) | Paste-ready `dm_db_index_physical_stats` query to verify forwarded records after rebuild |
@@ -807,6 +845,27 @@ SELECT * FROM dbo.CommandLog
 WHERE CommandType LIKE 'HEAP_REBUILD%'
 ORDER BY StartTime DESC;
 ```
+
+### Per-target disposition: `HEAP_TARGET_EVENT`
+
+Each disposed target also writes one durable event under `CommandType = 'HEAP_TARGET_EVENT'`,
+keyed by `RunID` and `TargetId` at a fixed path in the `ExtendedInfo` XML.  It answers what
+was recommended, what actually ran, why it changed, and how the target ended, without
+parsing messages or correlating rows by name and time.
+
+Outcomes are explicit: `SUCCEEDED`, `FAILED`, `SKIPPED`, `RECOVERY_REQUIRED`.
+
+That last one matters.  A CI swap whose `DROP` fails leaves the table **clustered, not a
+heap**, needing manual remediation -- yet the run's success counter still advances.  It is
+reported as `RECOVERY_REQUIRED` rather than a clean success, and it drives `@Status` to
+`ERROR`.
+
+**`tools/sp_HeapDoctor_TargetEvents.sql`** shreds the stream into a relational view so
+consumers join on columns instead of writing XPath.  It is documented but **not** created
+automatically -- the procedure does not add objects to your database uninvited.
+
+If you have tooling that treats every non-`HEAP_REBUILD_START`/`END` row as a rebuild
+command row, scope it to the rebuild CommandTypes.
 
 ### Before/After Comparison
 
@@ -1121,6 +1180,8 @@ ORDER BY ID DESC;
 
 Online heap rebuilds (Enterprise/Developer/Azure SQL DB) acquire a Sch-M (schema modification) lock at the start and end of the operation.  `@LockTimeoutMs` applies to the entire `ALTER TABLE ... REBUILD` command, not separately to the Sch-M acquisition phase.  This means you cannot distinguish "timed out acquiring Sch-M at the start" from "timed out during the actual rebuild" in the error message.
 
+`@LockTimeoutMs` also bounds the **discovery scan**, not just the rebuild.  `dm_db_index_physical_stats` needs a shared lock, so an exclusively locked heap used to stall discovery indefinitely and the procedure never reached the phase the timeout governed.  A scan that gives up reports the database as `BLOCKED` and the run warns that discovery was partial -- the target list is a subset, which is not the same as a clean bill of health.  When `@LockTimeoutMs` is not set the scan still waits indefinitely, but a pre-scan advisory names any exclusively locked heaps first.
+
 The pre-flight lock check (`dm_tran_locks`) warns when other sessions hold locks on the target table before the rebuild attempt, which helps anticipate Sch-M contention.  However, the check is advisory only and does not prevent the rebuild.
 
 ### Online-to-offline fallback
@@ -1152,114 +1213,16 @@ The proc is pure T-SQL and works on Windows, Linux, and container deployments of
 
 ## Version History
 
-### v2026.07.29.1 *(current)*
+Release notes live on the [Releases page](https://github.com/nanoDBA/sp_HeapDoctor/releases),
+one entry per version, written at release time.
 
-- Removed the post-rebuild filtered-NCI statistics staleness warning (#186). It fired purely because a filtered index existed, contradicted the adjacent (correct) note that a rebuild leaves statistics unchanged, and recommended a table-wide `UPDATE STATISTICS ... WITH FULLSCAN` without evidence. Creating and dropping a clustered index each rebuild all rowstore nonclustered indexes, and a rowstore index create/rebuild refreshes that index's statistics by scanning all rows, so a CI swap leaves filtered statistics fresher rather than staler. Supersedes #163
-- `filtered_nci_count` is still discovered and reported; it no longer drives a runtime recommendation. No result-set columns changed
+They used to be duplicated here as well, and the copy went stale: it sat at
+`v2026.07.29.1` labelled *(current)* while the procedure had moved on six releases. A
+second copy that nobody is forced to update is a copy that lies, so this section is now a
+pointer rather than a transcript.
 
-### v2026.06.08.1
-
-- **`@PlanCountWarnThreshold integer = 50`** (#179). Emits a per-target advisory when a heap's `qs_plan_count` reaches the threshold, because `ALTER TABLE ... REBUILD` invalidates cached plans and a heap with many plans can trigger a recompile storm. Logged to the invocation command when non-default.
-- **Write-heavy NOTE during execution** (#182). When a target's `usage_hint` is `WRITE_HEAVY` or `WRITE_ONLY` and `@SkipWriteHeavy = 0`, the execution loop now says so per target. Defaults are unchanged; `@SkipWriteHeavy = 1` still excludes those heaps entirely.
-- **`@LockTimeoutMs` documentation corrected** (#181). It is a *lock acquisition wait*, not a cap on how long the rebuild holds its locks. Clarified in the parameter comment, `@Help`, and the runtime message. Documentation only.
-- **#180, #183, #184 closed as `stale-source`.** All three reported that the post-rebuild statistics message was factually wrong and that `@UpdateStatsAfterRebuild` did not exist. Both claims were true of an older snapshot only: the parameter has existed since v1.0.2026.0302e and the message had already been corrected. No code change. (The *filtered-index* branch of that same message was a separate, still-live defect -- see #186 in v2026.07.29.1.)
-
-### v2026.05.11.7
-
-- **Test suite now public.** The `tests/` folder is no longer fully gitignored; the 29 `.sql` test files (`01_setup_test_data.sql` through `28_test_parallel_phase_a.sql` plus `99_*.sql`) are now in the repo. They use generic placeholders (`YourServer`, `YourPassword`) and contain no credentials, hostnames, or environment-specific identifiers. Run individually against any test SQL Server with `sqlcmd -S <host> -U <user> -P <password> -i tests/<file>.sql`. The local-only `README_TESTING.md` and shell test runner stay gitignored -- they contain environment defaults.
-- **Identify the actual applock holder when the re-entrancy guard fails.** When `sp_getapplock` returns < 0 inside `sp_HeapDoctor`, the proc now queries `sys.dm_tran_locks` joined to `sys.dm_exec_sessions` to find the holder and includes that in the error message -- SPID, login, program, host, status, open-transaction count, and how long the session has been idle. If the holder is sleeping with no open transaction (the common "leftover SSMS query window" case), the error message recommends `KILL <spid>;` as the resolution. Otherwise it warns the session looks active and suggests verifying before passing `@Force = 1`.
-
-### v2026.05.11.4
-
-- **Polish:** workers in parallel mode no longer emit an empty result set in SSMS or write an empty `@OutputTable`. Region 19 (the `SELECT FROM #Targets` plus `@OutputTable` INSERT) is now gated on `@parallel_worker = 0`. Workers intentionally have an empty `#Targets` (they skipped discovery), so producing output from them was just noise.
-- **Docs:** `@Help` and the parallel-mode section above now explicitly warn that a `KILL`ed worker leaves its claimed queue row stuck. Phase B will add automatic dead-worker recovery; until then, operators need to clear stale `dbo.QueueHeapRebuild` rows manually after a worker crash.
-- **Test:** new `tests/29_test_parallel_concurrency.sh` launches N concurrent `sqlcmd` processes and asserts `COUNT(DISTINCT SessionID) >= 2` on `dbo.QueueHeapRebuild`. This is the assertion that would have caught the v2026.05.11.2 leader-only regression. PASS on SQL 2019, 2022, 2025 (3 / 4 / 3 distinct workers respectively).
-
-### v2026.05.11.3
-
-- **Fix:** Parallel mode workers (`@HeapsInParallel = N'Y'` not the leader) raced ahead of the leader's discovery, found an empty `dbo.QueueHeapRebuild`, and exited without claiming. Only the leader ever did work -- so v2026.05.11.2 ran with multiple sessions but didn't actually parallelize. Now: the leader acquires an Exclusive `sp_getapplock` on `'sp_HeapDoctor_Discovery'` inside its leader-election transaction and holds it until the queue is populated; workers attempt a Shared lock on the same resource, which blocks behind the leader's Exclusive until release. Once the leader finishes populating, workers proceed into the consumer loop in lockstep.
-- Workers also no longer hit the "zero targets, nothing to do" early-exit in region 15 -- they intentionally have an empty `#Targets` (they skipped discovery), and need to fall through to the execution loop to claim from the queue.
-- **Verified concurrent claim with 4 sessions + 50 demo heaps:** three distinct `SessionID`s on `dbo.QueueHeapRebuild` (36 + 15 + 4 = 55 rows), proving actual rebuild-time overlap across sessions.
-
-### v2026.05.11.2
-
-- **New:** `@HeapsInParallel nvarchar(1) = N'N'` -- queue-based parallel rebuild (Phase A). When set to `'Y'`, sp_HeapDoctor uses Ola Hallengren's `dbo.Queue` parent table plus an auto-created `dbo.QueueHeapRebuild` child to coordinate work across multiple sessions. Run the same `EXEC` from N SQL Agent steps (or any N sessions); the first session to insert into `dbo.Queue` becomes the leader (runs discovery + populates the queue), subsequent sessions are workers (skip discovery and consume). All sessions then drain the queue concurrently via atomic `UPDATE ... OUTPUT` claims (`ROWLOCK, READPAST`) so contention skips rather than blocks.
-
-  ```sql
-  -- SQL Agent: identical step, run N times in parallel
-  EXEC dbo.sp_HeapDoctor
-      @Databases       = N'USER_DATABASES',
-      @Execute         = N'Y',
-      @HeapsInParallel = N'Y';
-  ```
-
-  > **Operational warning (Phase A):** if a worker session is `KILL`ed (or its connection drops) mid-rebuild, its claimed queue row stays `TableStartTime IS NOT NULL, TableEndTime IS NULL` indefinitely. Other workers will *not* re-claim it. The forwarded records on that specific heap won't get rebuilt until you either manually clear the row (`UPDATE dbo.QueueHeapRebuild SET TableStartTime = NULL WHERE TableEndTime IS NULL AND SessionID = <dead_spid>;`) or `DROP TABLE dbo.QueueHeapRebuild` and re-run. Dead-worker recovery is on the Phase B roadmap.
-
-  Phase A intentionally defers dead-worker recovery, mop-up discovery, parameter fingerprint conflict detection, and orphan-row sweep. Requires Ola's `Queue.sql` to be installed in the target database (https://ola.hallengren.com/scripts/Queue.sql). `@PlanOnly = 1` is rejected with parallel mode.
-
-- The `@invocation_command` written to `dbo.CommandLog` records `@HeapsInParallel = N'Y'` when set, and it is the exact string used as the `dbo.Queue.Parameters` key -- so two sessions invoking the same `EXEC` deterministically share a `QueueID`.
-
-- `@Help` ADVANCED PARAMETERS block split into four RAISERROR sub-blocks (it had silently been truncating earlier ADVANCED entries on Linux `sqlcmd`).
-
-### v2026.05.11.1
-
-- **New:** `@ExcludeDatabases nvarchar(max) = NULL` and `@ExcludeTables nvarchar(max) = NULL` parameters. Dedicated comma-separated exclusion patterns; users no longer need to embed `-` prefixes inside `@Databases` / `@Tables`. Wildcards (`%`) and multiple comma-separated patterns are supported. NULL `@Databases` + `@ExcludeDatabases` set implies `USER_DATABASES`; NULL `@Tables` + `@ExcludeTables` set implies `%` (all tables). Example: `EXEC sp_HeapDoctor @ExcludeDatabases = N'master, model, msdb, tempdb', @ExcludeTables = N'dbo.Archive%, dbo.Staging%';`
-- Both new params are logged to `dbo.CommandLog` via `@invocation_command` so audit trails preserve the user's original (separate) input.
-- `@Help` COMMON PARAMETERS block split 3-way to fit the added params under the Linux `sqlcmd` ~970-char per-RAISERROR output truncation limit.
-
-### v2026.05.11
-
-- **New:** `@IncludeHealthyHeaps bit = 0` parameter bypasses both forwarded-record discovery filters (the implicit `forwarded_record_count > 0` check and `@MinForwardedPct`) so heaps with zero forwarded records are included in results. `@MinPages` / `@MaxPages` and all safety guards (memory-optimized, columnstore, temporal, CDC, etc.) still apply. Primary use case: force-rebuild a known heap by combining with `@Tables`, e.g. `EXEC sp_HeapDoctor @Tables = N'dbo.Orders', @IncludeHealthyHeaps = 1, @PlanOnly = 0`. Tested on SQL Server 2019, 2022, and 2025.
-- The `@invocation_command` written to CommandLog now includes `@IncludeHealthyHeaps = 1` when set, for audit traceability.
-- `@Help` COMMON PARAMETERS RAISERROR block split in two so the new parameter renders in full under the Linux `sqlcmd` ~970-char per-RAISERROR output limit.
-
-### v2026.03.23
-
-- **Fix:** `@QsRw` variable undeclared in discovery SQL when `CpuSource=NONE` or `QUICKIESTORE`, causing error 137 and zero targets returned
-
-### v2026.03.11.1
-
-- `ranking_basis` now distinguishes `QS_DISABLED` from `QS_NO_DATA` (#160)
-- Filtered NCI statistics warning fires for all rebuild paths, not just CI swap (#163)
-- FK child statistics update no longer gated on `ci_drop_failed` (#164)
-- LOG_SPACE_INSUFFICIENT message mentions autogrowth not considered (#153)
-- Pre-flight lock check distinguishes sleeping sessions with open transactions (#167)
-- VLF temp table bug fix: CREATE once before loop instead of per iteration (#168)
-
-### v2026.03.11
-
-- **Fix:** SYSTEM_VERSIONING re-enable failure now halts remaining targets in the database instead of silently continuing (#149)
-- Copy-pasteable `@ResumeRunID` EXEC statement emitted after plan-only runs (#159)
-- 24 persona-review issues triaged: 8 fixed, 12 BY_DESIGN, 4 WONTFIX
-
-### v2026.03.09
-
-- 19 remaining issues across 7 batches (v0302k-v0302q)
-
-### v2026.03.06
-
-- Apply Erik Darling T-SQL style guide (~850 changes across sp_HeapDoctor.sql)
-- `integer` not `int`, `COUNT_BIG()` not `COUNT()`, `CONVERT()` not `CAST()`, `/* */` comments only
-
-### v2026.03.04
-
-- Adopt CalVer versioning (YYYY.MM.DD); prior version: 1.0.2026.0302j
-- **Security:** `@OutputTable` PARSENAME+QUOTENAME validation prevents SQL injection (#131, #132)
-- **Fix:** `@UpdateStatsAfterRebuild` now uses `USE [db]` + 2-part name, fixing UPDATE STATISTICS cross-database (#143)
-- **Fix:** `@GenerateScript` RAISERROR uses `%s` format to handle `%` in object names (#122)
-- **Fix:** Stale stats note corrected -- factually accurate message about modification counter (#93)
-- **Fix:** CI swap guard: XML indexes (type 3) and spatial indexes (type 4) added to exclusion list (#105)
-- **Docs:** `@Help` CI SWAP RESTRICTIONS block -- partitioned heap and temporal history table CI swap blocks now explicitly documented with rationale (#137, #140)
-- **Docs:** `@GenerateScript` `@Help` note -- SYSTEM_VERSIONING wrappers for temporal tables require manual addition (#119)
-- **Docs:** CommandLog START ExtendedInfo comment -- clarifies included vs. omitted params for maintainers (#107)
-- **Triage:** 19 BY_DESIGN GitHub issues closed with factual explanations; 19 NEEDS_INVESTIGATION issues labeled
-
-### v1.0.2026.0302i
-
-- Resumable CI swap (`@UseResumable`) + temporal history support (`@IncludeTemporalHistory`)
-- Paused CI swap operations auto-detected via `sys.index_resumable_operations` and resumed on next run
-- `@OutputTable` -- persist results for automation and trending
-- `@GenerateScript` -- output copy-paste T-SQL rebuild scripts
+The procedure also carries its own `History:` block in the file header, which is updated in
+the same commit as the change it describes.
 
 ## Credits
 
