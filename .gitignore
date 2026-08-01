@@ -10,8 +10,10 @@
 !STYLE_GUIDE.md
 !tools/
 !tools/*.sql
-# Tests: only *.sql files (README_TESTING.md and shell scripts contain
-# environment-specific defaults like hostnames and credentials, so they
-# stay local).
+# Tests: *.sql files, plus the suite runner. Other shell scripts and
+# README_TESTING.md contain environment-specific defaults like hostnames and
+# credentials, so they stay local. run_suite.sh takes its connection details
+# from arguments or HEAPDOCTOR_SQLCMD and hardcodes neither.
 !tests/
 !tests/*.sql
+!tests/run_suite.sh

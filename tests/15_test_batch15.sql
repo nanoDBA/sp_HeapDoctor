@@ -99,15 +99,15 @@ ORDER BY ID DESC;
 
 -- @MinPages was set to 500 (non-default), should appear in Command
 IF @15b_cmd LIKE '%@MinPages = 500%'
-    RAISERROR(N'  PASS 15B: Command contains non-default @MinPages = 500', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 15B-1: Command contains non-default @MinPages = 500', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 15B: Command missing @MinPages = 500. Got: %s', 10, 1, @15b_cmd) WITH NOWAIT;
+    RAISERROR(N'  FAIL 15B-1: Command missing @MinPages = 500. Got: %s', 10, 1, @15b_cmd) WITH NOWAIT;
 
 -- @CpuSource was NONE (non-default), should appear
 IF @15b_cmd LIKE '%@CpuSource%'
-    RAISERROR(N'  PASS 15B: Command contains non-default @CpuSource', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  PASS 15B-2: Command contains non-default @CpuSource', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'  FAIL 15B: Command missing @CpuSource', 10, 1) WITH NOWAIT;
+    RAISERROR(N'  FAIL 15B-2: Command missing @CpuSource', 10, 1) WITH NOWAIT;
 GO
 
 ------------------------------------------------------------------------
