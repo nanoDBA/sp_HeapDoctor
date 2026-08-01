@@ -14,8 +14,10 @@
 # Workflow scripts. These take credentials from the environment and hardcode
 # none, so unlike the test-rig scripts they can be tracked.
 !tools/*.sh
-# Agent/tracker configuration read by the engineering skills.
+# Documentation. docs/*.md is user-facing (linked from the README); docs/agents/
+# holds the tracker and label config the engineering skills read.
 !docs/
+!docs/*.md
 !docs/agents/
 !docs/agents/*.md
 # Tests: *.sql files, plus the suite runner. Other shell scripts and
