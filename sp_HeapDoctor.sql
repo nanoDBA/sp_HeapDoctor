@@ -51,9 +51,9 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.08.01.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.08.01.5 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.08.01.4 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
+History:    2026.08.01.5 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
                             @Succeeded, @Failed and @Skipped NULL, so a caller testing
                             "IF @TargetsFound = 0" never matched and "nothing to do" was
@@ -826,7 +826,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.08.01.4';
+    DECLARE @Version nvarchar(20) = N'2026.08.01.5';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';

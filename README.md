@@ -1,54 +1,118 @@
 # sp_HeapDoctor
 
-**Heap Forwarded Record Mitigation for SQL Server** | v2026.05.11.7
+**Heap forwarded-record mitigation for SQL Server**
 
-Your heaps have forwarded records.  You know they do.  You've been meaning to deal with them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually costing you, and rebuilds them so you can stop pretending that heap is fine.
+Your heaps have forwarded records.  You know they do.  You've been meaning to deal with
+them for months.  sp_HeapDoctor finds them, ranks them by how much CPU they're actually
+costing you, and rebuilds them so you can stop pretending that heap is fine.
+
+```sql
+/* Safe by default: shows you what it would do, changes nothing. */
+EXEC dbo.sp_HeapDoctor @Databases = 'USER_DATABASES';
+```
+
+- [The problem](#the-problem)
+- [When not to use this](#when-not-to-use-this)
+- [Philosophy](#philosophy)
+- [What it does](#what-it-does)
+- [Requirements](#requirements) | [Installation](#installation) | [Quick Start](#quick-start)
+- [Real-World Scenarios](#real-world-scenarios)
+- [Before You Run @PlanOnly = 0](#before-you-run-planonly-0)
+- [Parameters](#parameters) | [Result Set Columns](#result-set-columns)
+- [How It Works](#how-it-works) | [CPU Ranking: Where Query Store Can Mislead](#cpu-ranking-where-query-store-can-mislead)
+- [CI Swap Technique](#ci-swap-technique) | [Write-Heavy Heaps](#write-heavy-heaps)
+- [CommandLog Integration](#commandlog-integration) | [Obfuscation](#obfuscation-for-external-sharing)
+- [Known Limitations and Notes](#known-limitations-and-notes)
+
+Version history lives on the [Releases page](https://github.com/nanoDBA/sp_HeapDoctor/releases).
 
 ## The Problem
 
-When a variable-length row on a heap grows beyond its original page, SQL Server doesn't move it cleanly.  It leaves a forwarding pointer on the old page and puts the row on a new page.  Every single read that follows that pointer does **double the I/O**.  At scale, forwarded records silently degrade scan and seek performance on heaps, and "silently" is the operative word because nothing in your monitoring is going to flag this until you go looking.
+When a variable-length row on a heap grows beyond its original page, SQL Server doesn't move
+it cleanly.  It leaves a forwarding pointer on the old page and puts the row on a new page.
+Every single read that follows that pointer does **double the I/O**.  At scale, forwarded
+records silently degrade scan performance on heaps, and "silently" is the operative word,
+because nothing in your monitoring is going to flag this until you go looking.
 
-Most DBAs fix this manually: run `dm_db_index_physical_stats`, squint at the results, decide which tables matter, write ALTER TABLE REBUILD, hope they picked the right ones.  sp_HeapDoctor does all of that, except it uses Query Store CPU data instead of squinting.
+Most DBAs fix this manually: run `dm_db_index_physical_stats`, squint at the results, decide
+which tables matter, write `ALTER TABLE REBUILD`, hope they picked the right ones.
+sp_HeapDoctor does all of that, except it uses Query Store CPU data instead of squinting.
+
+## When not to use this
+
+Being honest about this is cheaper than you discovering it at 3 AM.
+
+- **The heap should probably be a clustered index.** If a table is queried by a key, forwarded
+  records are a symptom, not the disease.  Rebuilding buys time; a clustered index fixes it.
+  The `usage_hint` column flags the write-heavy tables where this applies most.
+- **The heap is write-heavy.** Forwarded records come straight back.  sp_HeapDoctor ranks
+  these lower and warns about them, but the rebuild is still mostly wasted work.
+- **You want general index maintenance.** This does heaps and only heaps.  Use Ola
+  Hallengren's `IndexOptimize` for everything else -- the two are designed to coexist, and
+  this one logs to the same `CommandLog`.
+- **You are on Standard edition and cannot take an outage.** Rebuilds are offline there, and
+  offline means blocking.  The procedure tells you before it does it, but it cannot make
+  Standard do online rebuilds.
 
 ## Philosophy
 
-sp_HeapDoctor is built around three ideas:
+**Rank by impact, not by size.**  A 10 GB heap with no Query Store activity matters less than
+a 500 MB heap driving 200K CPU ms of table scans.  Three signals feed one LOG10-normalised
+score: Query Store CPU attributed to the heap via showplan `Table Scan` operators,
+`forwarded_fetch_count` (pointer traversals that actually happened at runtime), and
+forwarded percentage.  Percentage **alone** -- not percentage times page count, which would
+smuggle size back into a ranking that exists to ignore it.
 
-1. **Rank by impact, not by size.**  A 10 GB heap with zero Query Store activity is less important than a 500 MB heap driving 200K CPU ms of table scans.  The proc uses Query Store showplan XML to attribute CPU to heap objects via `Table Scan` operators, then supplements with `forwarded_fetch_count` (runtime pointer traversals) and structural severity (`forwarded_pct * page_count`).  All three signals feed a mixed ranking formula so that heaps are rebuilt in order of actual pain.
+**Measure before you fix.**  Every rebuild captures a before-snapshot of Query Store runtime
+stats and the `query_hash` values for the queries hitting that heap, persisted in CommandLog
+XML.  `query_hash` survives plan recompilation and the DDL a CI swap performs, so you can ask
+the same question afterwards and get a comparable answer.
 
-2. **Measure before you fix.**  Every rebuild captures a before-snapshot of Query Store runtime stats (logical reads, physical reads, duration, executions) and a list of `query_hash` values per heap.  These are persisted in CommandLog `ExtendedInfo` XML.  Because `query_hash` is stable across plan recompilation and CI_SWAP DDL changes, you can query current QS data by the same hashes to measure whether the rebuild actually helped.
+**Safe defaults, escape hatches.**  Plan-only is the default.  Lock timeouts, time limits and
+CI swap are opt-in.  When the procedure cannot do what you asked, it says so rather than
+quietly doing something else -- a partial result is always reported as partial.
 
-3. **Safe defaults, escape hatches.**  Plan-only mode is the default.  Lock timeouts, time limits, online preference, and CI swap are all opt-in.  The proc warns about write-heavy heaps (forwarded records will recur), pre-flight lock contention, and online-to-offline fallback rather than making silent decisions.
+## What it does
 
-## Key Features
+**Finding the right heaps**
 
-- **CPU-prioritized rebuilds** - ranks heaps by Query Store CPU cost, not just forwarded record count.  Rebuilds the heaps that actually hurt, not the ones that are just large.
-- **Query Store showplan XML mapping** - parses showplan `//RelOp[@PhysicalOp="Table Scan"]` nodes to attribute CPU to heap objects.  Only counts Table Scan operators; index seeks on your NCIs don't count.
-- **sp_QuickieStore integration** - alternative CPU source via Erik Darling's [sp_QuickieStore](https://github.com/erikdarlingdata/DarlingData), useful when Query Store isn't available or you want a second opinion on query performance.
-- **CI swap technique** - creates a temp clustered index using a safe unique NC key, then drops it.  Auto-detects keys, guards against LOB columns, and shows the NCI rebuild cost before you commit to it.
-- **Online rebuild support** - auto-detects Enterprise/Developer/Azure SQL DB.  Falls back to offline on Standard, because Microsoft would like you to upgrade.
-- **Multi-database targeting** - Ola Hallengren `@Databases` parameter (`USER_DATABASES`, wildcards, exclusions, comma-separated).  If you already know how Ola's tools work, you already know how this works.
-- **Table-level filtering** - `@Tables` parameter narrows discovery to specific tables: `@Tables = 'dbo.Orders, -dbo.Staging%'`.  Same syntax as `@Databases` (wildcards, exclusions, comma-separated).  Schema is optional: `'Orders'` matches any schema.
-- **Plan-then-execute workflow** - `@ResumeRunID` skips the expensive discovery and Query Store analysis by loading targets from a previous plan-only scan.  Run `@PlanOnly=1` to review, note the RunID, then `@ResumeRunID=<guid>, @PlanOnly=0` to execute the same targets without re-scanning.
-- **CommandLog logging** - `HEAP_REBUILD_START`/`END` bracketing with per-rebuild `ExtendedInfo` XML.  Post-rebuild verification confirms the forwarded records are actually gone, because trust but verify.
-- **Per-rebuild lock timeout** - `SET LOCK_TIMEOUT` prefix/suffix with session restore.  Your blocking chain will thank you.
-- **Time limit** - `@MaxRunSeconds` with graceful stop (remaining targets logged as `SKIPPED`).  Maintenance windows end whether you're done or not.
-- **Plan-only mode** - `@PlanOnly = 1` (default) shows targets and commands without executing.  Look before you leap.  This is the default for a reason.
-- **Query Store performance snapshot** - captures before-rebuild QS runtime stats (logical reads, physical reads, duration, executions) and `query_hash` list per heap.  Persisted in CommandLog `ExtendedInfo` XML for before/after trending.  `query_hash` is stable across plan recompilation and CI_SWAP DDL changes, so you can find the same queries in current QS data regardless of what happened to plan_id.
-- **Forwarded fetch counters** - `forwarded_fetch_count` from `dm_db_index_operational_stats` shows how many times forwarded record pointers were actually traversed at runtime, not just how many exist.  A heap with 50% forwarded records but zero fetches isn't hurting anyone.
-- **Heap-only discovery** - materializes heap `object_id`s first via `sys.indexes WHERE type = 0`, then scans only those with `dm_db_index_physical_stats`.  On databases with thousands of tables, this skips all non-heap objects instead of asking the DMF to evaluate every table.
-- **Write-heavy heap detection** - `usage_hint` column flags heaps with more writes than reads via `dm_db_index_usage_stats`.  `WRITE_ONLY` means zero reads (staging table), `WRITE_HEAVY` means more updates than scans+seeks.  Forwarded records will come right back on these tables; consider adding a clustered index instead of rebuilding.
-- **Scan phase time limit** - when `@MaxRunSeconds` is set, the discovery loop checks elapsed time between databases.  If time is exhausted during scanning, remaining databases are skipped so the execution phase can still process whatever targets were found.
-- **Pre-flight lock check** - before each rebuild, checks `dm_tran_locks` for other sessions holding locks on the target table.  If found, emits a warning that Sch-M acquisition may block or be blocked.  Does not prevent the rebuild.
-- **Obfuscation for external sharing** - `@ObfuscateKey` replaces database/schema/table names with deterministic hex pseudonyms in result sets and CommandLog.  `@RevealKey` decrypts the mapping from a previous run.  `@ObfuscateSeed` enables consistent pseudonyms across environments for side-by-side comparison.
-- **Resumable CI swap** - `@UseResumable = 1` (default) adds `RESUMABLE = ON` to CI swap CREATE INDEX.  If the operation is interrupted, the next run detects the paused index and issues ALTER INDEX ... RESUME instead of starting over.
-- **Temporal history support** - `@IncludeTemporalHistory = 1` discovers forwarded-record history tables that are normally excluded.  Auto-disables SYSTEM_VERSIONING on the parent before rebuild and re-enables after (both success and failure paths).
-- **Permission pre-check** - `@CheckPermissionsOnly = 1` validates ALTER TRACE, VIEW DATABASE STATE, ALTER, and CommandLog INSERT permissions without executing.  Respects `@Databases` for scoping.
-- **Script generation** - `@GenerateScript = 1` outputs an executable T-SQL rebuild script instead of running rebuilds.  Copy, paste, review, run.
-- **Result persistence** - `@OutputTable` writes the result set to a user-specified table for automation and trending.  Creates the table if it doesn't exist.
-- **Pre-flight safety checks** - log space (skips when insufficient), tempdb space (advisory), FK references (informational), AG failover detection, INSTEAD OF trigger detection, LOB TOCTOU re-check at execution time.
-- **Impact projections** - `size_mb`, `est_space_savings_mb`, `est_ci_swap_overhead_mb`, `est_log_mb`, and `days_since_last_rebuild` help operators size maintenance windows and anticipate log growth.
-- **IO latch wait stats** - `page_io_latch_wait_count` and `page_io_latch_wait_ms` per heap from `dm_db_index_operational_stats`.  High values indicate disk pressure independent of forwarded records.
+- Ranks by Query Store CPU cost, not forwarded-record count, so you rebuild what hurts
+  rather than what is merely large
+- Attributes CPU via showplan `Table Scan` operators only; seeks on your nonclustered
+  indexes do not count toward a heap's score
+- `forwarded_fetch_count` shows pointers actually traversed at runtime -- a heap that is 50%
+  forwarded but never scanned is not hurting anyone
+- Flags write-heavy heaps where forwarded records will simply recur
+- sp_QuickieStore is supported as an alternative CPU source
+
+**Doing it safely**
+
+- Plan-only by default; `@GenerateScript` emits a script to review instead of running
+- Online rebuilds on Enterprise/Developer/Azure, with an explicit warning when it falls back
+  to offline
+- Pre-flight checks for log space, tempdb, lock contention, FK references, AG failover and
+  `INSTEAD OF` triggers
+- Excluded automatically: memory-optimized, columnstore, temporal history (unless asked),
+  graph, ledger and Always Encrypted key columns
+- `@LockTimeoutMs` bounds both the rebuild and the discovery scan; `@MaxRunSeconds` bounds
+  the run and can interrupt a long scan
+
+**Knowing what happened**
+
+- `@Status` gives a machine-readable verdict -- `SUCCESS`, `WARNING` or `ERROR` -- because
+  "no failures" is not the same as "nothing was missed"
+- Post-rebuild verification confirms the forwarded records are actually gone
+- `CommandLog` integration with per-target `HEAP_TARGET_EVENT` rows, including
+  `RECOVERY_REQUIRED` when a CI swap leaves a table clustered
+- Impact projections (`size_mb`, `est_log_mb`, `est_space_savings_mb`) for sizing a window
+- `@ObfuscateKey` pseudonymises names so a result set can be shared outside your org
+
+**Fitting your environment**
+
+- Ola Hallengren `@Databases` / `@Tables` syntax: wildcards, exclusions, comma-separated
+- `@ResumeRunID` executes a previously reviewed plan without re-scanning
+- `@HeapsInParallel` drains a shared queue across sessions, with dead-worker recovery
+- `@OutputTable` persists results for trending; `@CheckPermissionsOnly` validates access first
 
 ## Requirements
 
@@ -925,196 +989,25 @@ This query joins the before-snapshot `query_hash` values against current Query S
 
 When sharing diagnostic reports with consultants, forums, or audit teams, real database and table names can expose sensitive information about your environment.  The obfuscation feature replaces all object names with deterministic hex pseudonyms (e.g., `DB_AA92F53B`, `S_9F96C397`, `T_43306ED0`) in result sets, CommandLog entries, and execution logs.  RAISERROR progress messages in the session continue to show real names.
 
-### Basic usage
+For the full walkthrough -- reveal workflows, cross-environment comparison, joining the
+mapping back to CommandLog history, and a complete worked example -- see
+**[docs/obfuscation.md](docs/obfuscation.md)**.
 
 ```sql
--- Plan-only with obfuscated names (safe to share)
+/* Share a result set without leaking object names. */
 EXEC dbo.sp_HeapDoctor
     @Databases    = 'USER_DATABASES',
-    @ObfuscateKey = 'my secret passphrase',
-    @PlanOnly     = 1;
+    @ObfuscateKey = 'some-long-passphrase';
+
+/* Later, decrypt the mapping for a run you own. */
+EXEC dbo.sp_HeapDoctor
+    @RevealKey   = 'some-long-passphrase',
+    @RevealRunID = '<RunID from the obfuscated run>';
 ```
 
-Output columns `database_name`, `schema_name`, `table_name`, `key_source_index`, `command_text`, `ci_drop_command`, and `verify_command` all show pseudonyms instead of real names.  The pseudonym format is `PREFIX_` + 8 hex characters (SHA2_256 derived), where prefixes are `DB_` (database), `S_` (schema), `T_` (table), and `I_` (index).
-
-### Execute with obfuscation
-
-```sql
--- Execute rebuilds; CommandLog entries use pseudonyms
-EXEC dbo.sp_HeapDoctor
-    @Databases    = 'USER_DATABASES',
-    @ObfuscateKey = 'my secret passphrase',
-    @PlanOnly     = 0;
-
--- Output includes:
--- "Obfuscation applied to 5 targets.
---  RunID=153ACF40-D520-4472-ABE1-8A9BC99203A7
---  (provide with @RevealKey to decrypt)."
-```
-
-Save the RunID.  You'll need it to reveal the mapping later.
-
-### Revealing the real names
-
-```sql
--- Decrypt the mapping from a previous obfuscated run
-EXEC dbo.sp_HeapDoctor
-    @RevealKey   = 'my secret passphrase',
-    @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
-```
-
-Returns a result set mapping each pseudonym back to the real object name:
-
-| pseudonym | object_type | real_name |
-|-----------|-------------|-----------|
-| DB_AA92F53B | DB | ProductionDB |
-| S_9F96C397 | Schema | dbo |
-| T_43306ED0 | Table | Orders |
-| T_8B2F1A77 | Table | Customers |
-
-### Cross-environment comparison
-
-When comparing obfuscated reports from multiple servers (dev, staging, prod), use `@ObfuscateSeed` to ensure the same tables get the same pseudonyms:
-
-```sql
--- Same key + seed = same pseudonyms across environments
--- Run on Server A:
-EXEC dbo.sp_HeapDoctor
-    @ObfuscateKey  = 'shared passphrase',
-    @ObfuscateSeed = 'Q1-2026-audit',
-    @PlanOnly      = 1;
-
--- Run on Server B with same key and seed:
-EXEC dbo.sp_HeapDoctor
-    @ObfuscateKey  = 'shared passphrase',
-    @ObfuscateSeed = 'Q1-2026-audit',
-    @PlanOnly      = 1;
-```
-
-Tables with the same name on both servers will have identical pseudonyms, enabling side-by-side comparison without exposing real names.  Without `@ObfuscateSeed`, each run auto-seeds with its unique RunID, producing different pseudonyms even with the same key.
-
-### Finding available RunIDs
-
-If you lost the RunID from the session output, query CommandLog to find obfuscated runs:
-
-```sql
--- List all obfuscated sp_HeapDoctor runs with their RunIDs
--- (checks both execution runs and plan-only scan summaries)
-SELECT
-    ID,
-    StartTime,
-    CommandType,
-    COALESCE(
-        ExtendedInfo.value('(/Parameters/RunID)[1]', 'uniqueidentifier'),
-        ExtendedInfo.value('(/ScanSummary/RunID)[1]', 'uniqueidentifier')
-    ) AS RunID,
-    COALESCE(
-        ExtendedInfo.value('(/Parameters/ObfuscateSeed)[1]', 'nvarchar(128)'),
-        ExtendedInfo.value('(/ScanSummary/ObfuscateSeed)[1]', 'nvarchar(128)')
-    ) AS Seed,
-    Command AS DatabasesScanned
-FROM dbo.CommandLog
-WHERE CommandType IN ('HEAP_REBUILD_START', 'HEAP_SCAN_SUMMARY')
-  AND CAST(ExtendedInfo AS nvarchar(max)) LIKE '%ObfuscatedMappingHex%'
-ORDER BY StartTime DESC;
-```
-
-### Joining reveal mapping to CommandLog history
-
-After reveal, you can decode your full rebuild history by joining the mapping back to CommandLog:
-
-```sql
--- Step 1: Reveal the mapping into a temp table
-IF OBJECT_ID('tempdb..#Mapping') IS NOT NULL DROP TABLE #Mapping;
-CREATE TABLE #Mapping (pseudonym nvarchar(20), object_type varchar(10), real_name sysname);
-
-INSERT #Mapping
-EXEC dbo.sp_HeapDoctor
-    @RevealKey   = 'my secret passphrase',
-    @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
-
--- Step 2: Join to CommandLog to see real names alongside rebuild results
-SELECT
-    c.StartTime,
-    c.EndTime,
-    DATEDIFF(SECOND, c.StartTime, c.EndTime) AS duration_sec,
-    c.CommandType,
-    ISNULL(m.real_name, c.DatabaseName) AS real_database,
-    ISNULL(t.real_name, c.ObjectName) AS real_table,
-    c.ErrorNumber,
-    c.ErrorMessage
-FROM dbo.CommandLog c
-LEFT JOIN #Mapping m ON m.pseudonym = c.DatabaseName AND m.object_type = 'DB'
-LEFT JOIN #Mapping t ON t.pseudonym = c.ObjectName  AND t.object_type = 'Table'
-WHERE c.CommandType IN ('HEAP_REBUILD_ONLINE','HEAP_REBUILD_OFFLINE','CI_SWAP_ONLINE')
-  AND CAST(c.ExtendedInfo AS nvarchar(max)) LIKE '%<RunID>153ACF40-D520-4472-ABE1-8A9BC99203A7</RunID>%'
-ORDER BY c.StartTime;
-```
-
-### End-to-end workflow: cross-environment analysis
-
-This workflow lets you analyze heap performance on a company server and safely bring the results to a non-company machine for analysis, then map findings back to real objects.
-
-```sql
--- STEP 1: On your company server, generate an obfuscated plan-only report.
---         Use @ObfuscateSeed for consistent pseudonyms across servers.
-EXEC dbo.sp_HeapDoctor
-    @Databases     = 'USER_DATABASES',
-    @ObfuscateKey  = 'acme-2026-audit',
-    @ObfuscateSeed = 'prod-q1',
-    @PlanOnly      = 1;
--- Output includes:
--- "Obfuscation applied to 5 targets.
---  RunID=153ACF40-D520-4472-ABE1-8A9BC99203A7"
--- Save this RunID! You'll need it to reveal later.
-
--- STEP 2: Copy the obfuscated result set to your analysis machine.
---         Use SSMS "Copy with Headers" or bcp. All object names are pseudonyms
---         (DB_AA92F53B, T_43306ED0, etc.) but metrics are real:
---         page_count, forwarded_pct, ranking_score, size_mb, total_cpu_ms, etc.
-
--- STEP 3: Analyze on your non-company machine.
---         Identify highest-impact heaps by ranking_score, size_mb, forwarded_pct.
---         Write notes like: "T_43306ED0 (rank 7.45, 1.2 GB, 48% forwarded) - rebuild first"
---         "T_8B2F1A77 (rank 3.12, 200 MB) - low priority, write-heavy"
-
--- STEP 4: Back on company server, reveal the mapping.
-EXEC dbo.sp_HeapDoctor
-    @RevealKey   = 'acme-2026-audit',
-    @RevealRunID = '153ACF40-D520-4472-ABE1-8A9BC99203A7';
--- Returns: T_43306ED0 = Orders, T_8B2F1A77 = AuditLog, etc.
--- Now apply your recommendations using real names.
-```
-
-**Multi-server comparison with consistent pseudonyms:**
-
-```sql
--- Run on Server A (dev):
-EXEC dbo.sp_HeapDoctor
-    @ObfuscateKey = 'compare-key', @ObfuscateSeed = 'env-compare', @PlanOnly = 1;
-
--- Run on Server B (prod):
-EXEC dbo.sp_HeapDoctor
-    @ObfuscateKey = 'compare-key', @ObfuscateSeed = 'env-compare', @PlanOnly = 1;
-
--- Tables with the same name produce identical pseudonyms on both servers.
--- Compare forwarded_pct, ranking_score, size_mb side by side in a spreadsheet.
-```
-
-**Tips for the cross-environment workflow:**
-
-- Always use `@ObfuscateSeed` when comparing multiple servers (without it, each run uses a unique seed)
-- `@LogToTable = 'Y'` (default) is required for plan-only reveal to work
-- The RunID appears in session output and is also queryable from CommandLog (see "Finding available RunIDs" above)
-- Numeric columns (page_count, forwarded_pct, total_cpu_ms, size_mb, est_log_mb, ranking_score) are never obfuscated
-- To track trends over time, run periodic plan-only scans; each creates a HEAP_SCAN_SUMMARY entry in CommandLog
-
-### Important notes
-
-- **Plan-only support**: Plan-only runs store the encrypted mapping in the HEAP_SCAN_SUMMARY CommandLog entry when `@LogToTable = 'Y'` (default). Reveal mode checks both HEAP_REBUILD_START (execution runs) and HEAP_SCAN_SUMMARY (plan-only runs). If `@LogToTable = 'N'`, no mapping is stored and a warning is emitted.
-- **Wrong key**: If you provide the wrong `@RevealKey`, the decryption fails with an error rather than returning wrong data.
-- **RAISERROR messages**: Progress messages in the session always show real names (they are ephemeral and not captured in result sets or logs).  This is by design; you need to see real names to monitor the session.
-- **Existing columns**: Physical stats, CPU metrics, ranking scores, and all numeric columns remain unobfuscated.  Only object name columns and generated command strings are pseudonymized.
+Numeric columns are never obfuscated, so page counts, percentages and CPU stay usable in a
+shared report.  The mapping is stored encrypted in CommandLog, so a run can be revealed
+later by anyone holding the key -- and by nobody else.
 
 ## Plan-Then-Execute Workflow
 
