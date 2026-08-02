@@ -56,7 +56,15 @@ echo "=== 1/2  pulling issues from GitHub ==="
 # --pull-only: GitHub is the source of truth for this repo. A bidirectional sync
 # can push local beads up as real GitHub issues, which is not what a routine
 # refresh should ever do.
-if ! bd github sync --pull-only; then
+#
+# --prefer-github, not the default --prefer-newer: step 2 below bumps each
+# bead's updated_at when it reconciles priority, so under prefer-newer the NEXT
+# pull sees the local bead as "newer" than a GitHub close that happened in
+# between and keeps it open forever. Observed 2026-08-02: three closed issues
+# stayed open in beads through two consecutive pulls until this flag. GitHub
+# being the source of truth is not just a policy statement -- the conflict
+# resolution has to say it too.
+if ! bd github sync --pull-only --prefer-github; then
     echo "error: bd github sync failed." >&2
     exit 1
 fi
