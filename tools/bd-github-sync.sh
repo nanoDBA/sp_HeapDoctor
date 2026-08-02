@@ -52,7 +52,7 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
 fi
 [ -n "${GITHUB_TOKEN:-}" ] || { echo "error: could not obtain a GitHub token." >&2; exit 2; }
 
-echo "=== 1/2  pulling issues from GitHub ==="
+echo "=== 1/3  pulling issues from GitHub ==="
 # --pull-only: GitHub is the source of truth for this repo. A bidirectional sync
 # can push local beads up as real GitHub issues, which is not what a routine
 # refresh should ever do.
@@ -70,11 +70,54 @@ if ! bd github sync --pull-only --prefer-github; then
 fi
 
 echo
-echo "=== 2/2  reconciling priority from labels ==="
+echo "=== 2/3  reconciling priority from labels ==="
 # shellcheck disable=SC2086
 if ! bash "$HERE/bd-sync-priorities.sh" $RECONCILE_ARG; then
     echo "error: priority reconciliation failed." >&2
     exit 1
+fi
+
+echo
+echo "=== 3/3  cross-checking open beads against GitHub ==="
+# The incremental pull uses a high-water mark, and a close that lands just
+# before the mark -- inside GitHub's search-index lag -- is skipped by every
+# later incremental pull. Observed 2026-08-02: three closed issues stayed open
+# in beads through THREE consecutive syncs (including one with
+# --prefer-github). So the wrapper verifies the invariant it exists to
+# maintain: no bead may be open whose GitHub issue is closed. Stragglers get a
+# targeted `bd github pull`, which bypasses the watermark.
+STALE=$(bd list --json 2>/dev/null | python3 -c '
+import sys, json, subprocess
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rows = data if isinstance(data, list) else data.get("issues", data.get("beads", []))
+open_beads = {}
+for r in rows:
+    ref = r.get("external_ref") or ""
+    if "/issues/" in ref and r.get("status") in ("open", "in_progress"):
+        open_beads[ref.rsplit("/", 1)[-1]] = r["id"]
+if not open_beads:
+    sys.exit(0)
+gh = subprocess.run(["gh", "issue", "list", "--state", "open", "--limit", "200",
+                     "--json", "number"], capture_output=True, text=True)
+gh_open = {str(x["number"]) for x in json.loads(gh.stdout or "[]")}
+for num, bead in open_beads.items():
+    if num not in gh_open:
+        print(bead)
+')
+
+if [ -n "$STALE" ]; then
+    COUNT=$(printf '%s\n' "$STALE" | grep -c '[^[:space:]]')
+    echo "found $COUNT bead(s) open whose GitHub issue is not -- watermark stragglers. Re-pulling them:"
+    # shellcheck disable=SC2086
+    if ! bd github pull $STALE; then
+        echo "error: targeted pull of stragglers failed." >&2
+        exit 1
+    fi
+else
+    echo "none: every open bead has an open GitHub issue."
 fi
 
 exit 0
