@@ -79,9 +79,15 @@ case "$ACTION" in
                 exit 2
             fi
             echo "rig-use: lease held by another harness -- waiting, not stomping."
+            # 60s polls: the acquire probe is cheap, and a coarser interval just
+            # wastes rig time after the holder releases. Measured 2026-08-02: a
+            # holder released 27 min into a ~180-min TTL, so lease-remaining says
+            # nothing about run-remaining -- poll for the release, and if a lease
+            # looks orphaned, adjudicate with EVIDENCE (holder processes, container
+            # sessions, output mtimes) before 'sqltest-lock release <holder>'.
             acquired=0
-            for _ in $(seq 1 60); do          # 3h ceiling, 3-min interval
-                sleep 180
+            for _ in $(seq 1 180); do         # 3h ceiling, 60s interval
+                sleep 60
                 if rssh "$LOCK_CMD acquire $OWNER $LEASE_MINUTES"; then
                     acquired=1
                     break

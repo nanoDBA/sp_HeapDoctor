@@ -51,9 +51,9 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.08.01.5 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.08.02.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.08.01.5 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
+History:    2026.08.02.1 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
                             @Succeeded, @Failed and @Skipped NULL, so a caller testing
                             "IF @TargetsFound = 0" never matched and "nothing to do" was
@@ -268,7 +268,7 @@ History:    2026.08.01.5 - Adopt two conventions from sp_StatUpdate's CONSISTENC
             2026.05.11.2 - Add @HeapsInParallel parameter (queue-based parallel rebuild - Phase A)
                           - Adopts Ola Hallengren's dbo.Queue parent-table pattern (same as sp_StatUpdate);
                             auto-creates child table dbo.QueueHeapRebuild on first parallel run.
-                          - Multiple sessions invoking the same EXEC share a QueueID. The first session
+                          - Multiple sessions invoking the same EXECUTE share a QueueID. The first session
                             to INSERT into dbo.Queue is the leader and runs discovery; subsequent sessions
                             are workers and skip discovery. Both then consume from the queue.
                           - Atomic claim via UPDATE OUTPUT with ROWLOCK + READPAST so concurrent workers
@@ -306,7 +306,7 @@ History:    2026.08.01.5 - Adopt two conventions from sp_StatUpdate's CONSISTENC
                           - #167: Pre-flight lock check distinguishes sleeping sessions with open transactions
                           - #168: VLF temp table created once before loop (was CREATE/DROP per iteration)
             2026.03.11 - Fix #149: SYSTEM_VERSIONING re-enable failure now halts database targets
-                          - #159: Copy-pasteable @ResumeRunID EXEC emitted after plan-only runs
+                          - #159: Copy-pasteable @ResumeRunID EXECUTE emitted after plan-only runs
             2026.03.09 - 19 remaining issues across 7 batches (v0302k-v0302q)
             2026.03.06 - Apply Erik Darling T-SQL style guide (~850 changes)
             2026.03.04 - Adopt CalVer versioning (YYYY.MM.DD); prior: 1.0.2026.0302j
@@ -549,53 +549,53 @@ How to use it
 
 1) Plan-only for the current database (recommended starting point)
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @PlanOnly          = 1;
 
 2) Scan all user databases
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @Databases         = 'USER_DATABASES',
     @PlanOnly          = 1;
 
 3) Specific databases with exclusions
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @Databases         = 'USER_DATABASES, -ReportingArchive',
     @MinPages          = 5000,
     @PlanOnly          = 1;
 
 3b) Target specific tables
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @Tables            = 'dbo.Orders, dbo.OrderDetails',
     @PlanOnly          = 1;
 
 3c) Target tables by pattern, exclude staging
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @Tables            = 'dbo.%, -dbo.Staging%',
     @Databases         = 'USER_DATABASES',
     @PlanOnly          = 1;
 
 3d) Target tables by name only (any schema)
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @Tables            = 'Heap%',
     @PlanOnly          = 1;
 
 4) Execute online rebuilds with lock timeout
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @PlanOnly          = 0,
     @OnlinePreference  = 'AUTO',
     @LockTimeoutMs     = 5000;
 
 5) Use sp_QuickieStore as CPU source (single-database only)
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @CpuSource           = 'QUICKIESTORE',
-    @QuickieExecSql      = N'EXEC dbo.sp_QuickieStore @Top=200, @SortOrder=''cpu'';',
+    @QuickieExecSql      = N'EXECUTE dbo.sp_QuickieStore @Top=200, @SortOrder=''cpu'';',
     @QuickiePlanIdColumn = N'plan_id',
     @QuickieCpuUsColumn  = N'avg_cpu_time',
     @QuickieCpuUnit      = 'us',
@@ -603,7 +603,7 @@ EXEC dbo.sp_HeapDoctor
 
 6) CI-swap when safe unique key exists (Enterprise/Developer only)
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @AllowCiSwap       = 1,
     @PreferCiSwap      = 1,
     @OnlinePreference  = 'AUTO',
@@ -611,27 +611,27 @@ EXEC dbo.sp_HeapDoctor
 
 7) Execute with time limit and parallelism control
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @PlanOnly          = 0,
     @MaxRunSeconds     = 3600,
     @Maxdop            = 2;
 
 8) Skip CPU ranking entirely (just use forwarded_pct)
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @CpuSource         = 'NONE',
     @Databases         = 'USER_DATABASES',
     @PlanOnly          = 1;
 
 9) Execute without CommandLog logging
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @PlanOnly          = 0,
     @LogToTable        = N'N';
 
 10) Execute using Ola Hallengren convention (@Execute = Y/N)
 
-EXEC dbo.sp_HeapDoctor
+EXECUTE dbo.sp_HeapDoctor
     @Execute           = N'Y',
     @OnlinePreference  = 'AUTO',
     @LockTimeoutMs     = 5000;
@@ -730,7 +730,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 
     /* CPU source */
     @CpuSource               varchar(20)    = 'QUERY_STORE', /* QUERY_STORE | QUICKIESTORE | NONE */
-    @QuickieExecSql          nvarchar(max)  = NULL, /* e.g. N'EXEC dbo.sp_QuickieStore @Top=50, @SortOrder=''cpu'';' */
+    @QuickieExecSql          nvarchar(max)  = NULL, /* e.g. N'EXECUTE dbo.sp_QuickieStore @Top=50, @SortOrder=''cpu'';' */
     @QuickiePlanIdColumn     sysname        = N'plan_id', /* column name in Quickie output */
     @QuickieCpuUsColumn      sysname        = N'avg_cpu_time', /* OR cpu_us / cpu_ms etc; see @QuickieCpuUnit */
     @QuickieCpuUnit          varchar(10)    = 'us', /* us | ms  (unit of @QuickieCpuUsColumn) */
@@ -754,7 +754,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 
     /* Parallel execution (Phase A) */
     @HeapsInParallel         nvarchar(1)    = N'N', /* Y = queue-based parallel rebuild via dbo.Queue + dbo.QueueHeapRebuild. */
-                                                                /* Run the same EXEC from multiple sessions/Agent steps. Requires Ola Hallengren's dbo.Queue. */
+                                                                /* Run the same EXECUTE from multiple sessions/Agent steps. Requires Ola Hallengren's dbo.Queue. */
 
     /* Output verbosity */
     @Debug                   bit            = 0,
@@ -826,7 +826,7 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
-    DECLARE @Version nvarchar(20) = N'2026.08.01.5';
+    DECLARE @Version nvarchar(20) = N'2026.08.02.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
@@ -839,6 +839,53 @@ BEGIN
 
     /* Reproducible invocation command for CommandLog (built after input validation) */
     DECLARE @invocation_command nvarchar(max) = NULL;
+
+    /* #209: chunked @Debug dump of dynamic SQL (see the loop before each sp_executesql) */
+    DECLARE @dbg_len   bigint,
+            @dbg_pos   bigint,
+            @dbg_chunk nvarchar(2000);
+
+    /*
+    #207: default every bit parameter when a caller passes NULL -- an
+    uninitialized bit variable, most often. Every downstream test is "= 0" or
+    "= 1", and NULL satisfies neither: both branches are UNKNOWN and the guard
+    simply does not fire. Today the guards happen to be written so that NULL
+    falls to the safe side (IF @PlanOnly = 0 skips execution), but that is
+    accidental -- one future "IF @PlanOnly = 1 ... ELSE <execute>" would arm it
+    silently, and the symptom is rebuilding when the caller believed it was
+    planning.
+
+    This block must run HERE, ahead of every consumer: @Help is read in the
+    very next region, @CheckPermissionsOnly and the @Execute alias mapping read
+    @PlanOnly during validation, and @Debug gates output everywhere. Each
+    ISNULL mirrors the parameter's declared default (@PlanOnly and
+    @UseResumable default to 1, everything else to 0), so NULL always means
+    "the default", never "whichever branch the IF was not guarding".
+
+    @Execute is deliberately NOT defaulted: NULL there means "not specified,
+    defer to @PlanOnly", and collapsing it would erase that distinction.
+
+    Convention from Erik Darling's sp_IndexCleanup, which defaults its bit
+    parameters immediately after the version check for exactly this reason.
+    */
+    SELECT
+        @Help                     = ISNULL(@Help, 0),
+        @IncludeHealthyHeaps      = ISNULL(@IncludeHealthyHeaps, 0),
+        @SkipWriteHeavy           = ISNULL(@SkipWriteHeavy, 0),
+        @AllowCiSwap              = ISNULL(@AllowCiSwap, 0),
+        @PreferCiSwap             = ISNULL(@PreferCiSwap, 0),
+        @PlanOnly                 = ISNULL(@PlanOnly, 1),
+        @Debug                    = ISNULL(@Debug, 0),
+        @EstimateTime             = ISNULL(@EstimateTime, 0),
+        @CheckPermissionsOnly     = ISNULL(@CheckPermissionsOnly, 0),
+        @UpdateStatsAfterRebuild  = ISNULL(@UpdateStatsAfterRebuild, 0),
+        @AllowReplicationRebuild  = ISNULL(@AllowReplicationRebuild, 0),
+        @Force                    = ISNULL(@Force, 0),
+        @GenerateScript           = ISNULL(@GenerateScript, 0),
+        @IncludeTemporalHistory   = ISNULL(@IncludeTemporalHistory, 0),
+        @UseResumable             = ISNULL(@UseResumable, 1),
+        @LogToTable               = ISNULL(@LogToTable, N'Y'),
+        @HeapsInParallel          = ISNULL(@HeapsInParallel, N'N');
 
 /*#endregion 01-PREAMBLE */
 
@@ -901,7 +948,11 @@ COMMON PARAMETERS:
   @ScanThrottleMs    integer     = NULL    Wait ms between database scans (0-60000, NULL=off).
   @Debug             bit     = 0       Extra diagnostic output.
   @ScanMode          nvarchar(20) = N''SAMPLED'' Discovery scan mode for dm_db_index_physical_stats.
-                                        SAMPLED: ~1%% of pages (fast, may miss recent fragmentation).
+                                        SAMPLED: ~1%% of pages (fast, estimates) -- but ONLY for heaps
+                                        of 10,000+ pages. Below that SQL Server silently runs DETAILED
+                                        instead (#206), so small heaps get exact counts and a full scan
+                                        whether you asked or not. avg_frag_pct is NULL for heaps at or
+                                        above 10,000 pages under SAMPLED.
                                         DETAILED: all pages (accurate, slower on large databases).
                                         LIMITED is NOT supported: it cannot see forwarded records (#189).
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
@@ -928,7 +979,7 @@ COMMON PARAMETERS:
 
         RAISERROR(N'  @UseResumable      bit     = 1       RESUMABLE = ON for CI swap CREATE INDEX (SQL 2019+).
                                         Paused ops auto-resumed on next run.
-  @HeapsInParallel   nvarchar(1) = N    Y = queue-based parallel rebuild. Run same EXEC from N
+  @HeapsInParallel   nvarchar(1) = N    Y = queue-based parallel rebuild. Run same EXECUTE from N
                                         sessions/Agent steps. Leader populates dbo.QueueHeapRebuild,
                                         workers consume. Requires Ola Hallengren''s dbo.Queue.
                                         Phase A: if a worker is KILLed mid-rebuild, its claimed row
@@ -938,7 +989,7 @@ COMMON PARAMETERS:
 
         RAISERROR(N'
 QUICKIESTORE PARAMETERS:
-  @QuickieExecSql    nvarchar(max) = NULL   EXEC statement for sp_QuickieStore.
+  @QuickieExecSql    nvarchar(max) = NULL   EXECUTE statement for sp_QuickieStore.
   @QuickiePlanIdColumn sysname = plan_id    Column name in Quickie output.
   @QuickieCpuUsColumn  sysname = avg_cpu_time  CPU column in Quickie output.
   @QuickieCpuUnit    varchar = us       Unit of CPU column: us | ms
@@ -953,7 +1004,7 @@ OBFUSCATION PARAMETERS:
   Cross-environment workflow:
     1. Run with @ObfuscateKey (+ @ObfuscateSeed for multi-server). Note the RunID.
     2. Copy obfuscated result set to analysis machine. All metrics are real; names are pseudonyms.
-    3. To decode: EXEC sp_HeapDoctor @RevealKey=N''<key>'', @RevealRunID=N''<RunID>'';
+    3. To decode: EXECUTE sp_HeapDoctor @RevealKey=N''<key>'', @RevealRunID=N''<RunID>'';
   Plan-only runs store mapping in HEAP_SCAN_SUMMARY when @LogToTable=''Y'' (default).
 
 RESUME PARAMETER:
@@ -963,7 +1014,7 @@ RESUME PARAMETER:
   Plan-then-execute workflow:
     1. Run with @PlanOnly=1 (default). Note the RunID from output.
     2. Review targets. When ready, execute the same targets:
-       EXEC sp_HeapDoctor @ResumeRunID=N''<RunID>'', @PlanOnly=0;
+       EXECUTE sp_HeapDoctor @ResumeRunID=N''<RunID>'', @PlanOnly=0;
   Requires @LogToTable=''Y'' (default) on the plan-only run.
   @Databases and @CpuSource are ignored in resume mode.
   @Tables and @TopN are applied as post-load filters (select a subset to execute).
@@ -972,19 +1023,19 @@ RESUME PARAMETER:
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'EXAMPLES:
-  EXEC sp_HeapDoctor;
-  EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @PlanOnly = 0;
-  EXEC sp_HeapDoctor @Databases = N''USER_DATABASES'', @Execute = N''Y'';
-  EXEC sp_HeapDoctor @Tables = N''dbo.Orders, dbo.OrderDetails'';
-  EXEC sp_HeapDoctor @Tables = N''dbo.%%, -dbo.Staging%%'';
-  EXEC sp_HeapDoctor @Tables = N''Heap%%'', @Databases = N''USER_DATABASES'';
-  EXEC sp_HeapDoctor @ObfuscateKey = N''MySecretKey'';
-  EXEC sp_HeapDoctor @RevealKey = N''MyKey'', @RevealRunID = N''<RunID-from-output>'';
+  EXECUTE sp_HeapDoctor;
+  EXECUTE sp_HeapDoctor @Databases = N''USER_DATABASES'', @PlanOnly = 0;
+  EXECUTE sp_HeapDoctor @Databases = N''USER_DATABASES'', @Execute = N''Y'';
+  EXECUTE sp_HeapDoctor @Tables = N''dbo.Orders, dbo.OrderDetails'';
+  EXECUTE sp_HeapDoctor @Tables = N''dbo.%%, -dbo.Staging%%'';
+  EXECUTE sp_HeapDoctor @Tables = N''Heap%%'', @Databases = N''USER_DATABASES'';
+  EXECUTE sp_HeapDoctor @ObfuscateKey = N''MySecretKey'';
+  EXECUTE sp_HeapDoctor @RevealKey = N''MyKey'', @RevealRunID = N''<RunID-from-output>'';
   /* Plan-then-execute: */
-  EXEC sp_HeapDoctor @Databases = N''MyDB''; /* plan-only, note RunID */
-  EXEC sp_HeapDoctor @ResumeRunID = N''<RunID>'', @PlanOnly = 0;
+  EXECUTE sp_HeapDoctor @Databases = N''MyDB''; /* plan-only, note RunID */
+  EXECUTE sp_HeapDoctor @ResumeRunID = N''<RunID>'', @PlanOnly = 0;
   /* Resume a subset: */
-  EXEC sp_HeapDoctor @ResumeRunID = N''<RunID>'', @Tables = N''dbo.Orders'', @PlanOnly = 0;
+  EXECUTE sp_HeapDoctor @ResumeRunID = N''<RunID>'', @Tables = N''dbo.Orders'', @PlanOnly = 0;
 
 WRITE-HEAVY HEAPS:
   Heaps flagged as WRITE_HEAVY or WRITE_ONLY have more updates than reads. Forwarded
@@ -1483,7 +1534,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
        Leader election + dead-row coordination happens later via dbo.Queue UPDLOCK,HOLDLOCK. */
     IF @HeapsInParallel = N'N'
     BEGIN
-        EXEC @lock_result = sp_getapplock
+        EXECUTE @lock_result = sp_getapplock
             @Resource = N'sp_HeapDoctor',
             @LockMode = N'Exclusive',
             @LockTimeout = 0,
@@ -1822,7 +1873,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     /* */
     /* Uses Ola Hallengren's dbo.Queue as the parent (one row per unique run) */
     /* and an auto-created dbo.QueueHeapRebuild child holding per-target work. */
-    /* All sessions invoking the SAME EXEC (same @invocation_command) join the */
+    /* All sessions invoking the SAME EXECUTE (same @invocation_command) join the */
     /* same QueueID. The first session to INSERT into dbo.Queue is the leader */
     /* and runs discovery; subsequent sessions are workers and skip discovery. */
     /* */
@@ -1920,7 +1971,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                    their Shared-lock wait until the leader has finished populating the queue.
                    Without this, workers race ahead, see an empty queue, and exit immediately. */
                 DECLARE @disc_lock_result integer;
-                EXEC @disc_lock_result = sp_getapplock
+                EXECUTE @disc_lock_result = sp_getapplock
                     @Resource    = N'sp_HeapDoctor_Discovery',
                     @LockMode    = N'Exclusive',
                     @LockOwner   = N'Session',
@@ -1951,7 +2002,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             /* Wait for leader's Discovery applock to release (Shared mode blocks behind Exclusive).
                Once acquired, leader has finished populating dbo.QueueHeapRebuild. Release immediately. */
             DECLARE @worker_wait_result integer;
-            EXEC @worker_wait_result = sp_getapplock
+            EXECUTE @worker_wait_result = sp_getapplock
                 @Resource    = N'sp_HeapDoctor_Discovery',
                 @LockMode    = N'Shared',
                 @LockOwner   = N'Session',
@@ -1959,7 +2010,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
             IF @worker_wait_result >= 0
             BEGIN
-                EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor_Discovery', @LockOwner = N'Session';
+                EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor_Discovery', @LockOwner = N'Session';
                 RAISERROR(N'  Leader finished discovery; worker starting consumer loop.', 10, 1) WITH NOWAIT;
             END
             ELSE
@@ -2160,7 +2211,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     IF @DatabaseCount = 0
     BEGIN
         RAISERROR(N'No databases matched the @Databases pattern.', 16, 1);
-        IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+        IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
         RETURN;
     END
 
@@ -2448,7 +2499,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF @RevealKey IS NOT NULL
         BEGIN
             RAISERROR(N'@ResumeRunID and @RevealKey cannot be used together.', 16, 1);
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -2456,7 +2507,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF @commandlog_exists = 0
         BEGIN
             RAISERROR(N'@ResumeRunID requires dbo.CommandLog (stores the plan-only scan results).', 16, 1);
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -2487,7 +2538,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                          + N'. Run sp_HeapDoctor with @PlanOnly=1, @LogToTable=''Y'' first.';
                 RAISERROR(@Msg, 16, 1);
             END
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -2499,7 +2550,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                      + N' but current proc is v' + @Version
                      + N'. Re-run with @PlanOnly=1 to generate a compatible scan.';
             RAISERROR(@Msg, 16, 1);
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -2507,7 +2558,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF @resume_xml.exist(N'/ScanSummary/ObfuscatedMappingHex[text()]') = 1
         BEGIN
             RAISERROR(N'Cannot resume from an obfuscated plan-only scan. Run without @ObfuscateKey first.', 16, 1);
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -3158,6 +3209,18 @@ BEGIN
     FROM #Heaps
     WHERE NOT ((100.0 * forwarded_record_count / NULLIF(record_count, 0)) >= @MinForwardedPct_param);
 
+    /*
+    #206: of those, how many are big enough for SAMPLED to have actually run?
+    dm_db_index_physical_stats silently substitutes DETAILED below 10,000 pages,
+    so for smaller heaps the counts are EXACT and telling the operator to
+    "re-run with DETAILED to confirm" is advice to repeat the scan they just did.
+    */
+    DECLARE @below_large integer;
+    SELECT @below_large = COUNT_BIG(*)
+    FROM #Heaps
+    WHERE NOT ((100.0 * forwarded_record_count / NULLIF(record_count, 0)) >= @MinForwardedPct_param)
+      AND page_count >= 10000;
+
     DELETE FROM #Heaps
     WHERE NOT ((100.0 * forwarded_record_count / NULLIF(record_count, 0)) >= @MinForwardedPct_param);
 
@@ -3170,9 +3233,17 @@ BEGIN
         SET @Msg_inner = N''  '' + CONVERT(nvarchar(10), @below_threshold)
                        + N'' heap(s) excluded: forwarded pct below @MinForwardedPct = ''
                        + CONVERT(nvarchar(20), @MinForwardedPct_param)
-                       + CASE WHEN @ScanMode_param = N''SAMPLED''
-                              THEN N''. Counts are SAMPLED estimates; use @ScanMode = DETAILED to confirm a borderline heap.''
-                              ELSE N''.'' END;
+                       + CASE
+                             WHEN @ScanMode_param = N''SAMPLED'' AND @below_large > 0
+                                 THEN N''. For '' + CONVERT(nvarchar(10), @below_large)
+                                    + N'' heap(s) at or above 10,000 pages the counts are SAMPLED estimates;''
+                                    + N'' use @ScanMode = DETAILED to confirm a borderline one.''
+                                    + N'' Below 10,000 pages DETAILED ran automatically and counts are exact.''
+                             WHEN @ScanMode_param = N''SAMPLED''
+                                 THEN N''. Counts are exact: every excluded heap is under 10,000 pages,''
+                                    + N'' where SQL Server runs DETAILED regardless of the requested SAMPLED mode.''
+                             ELSE N''.''
+                         END;
         RAISERROR(@Msg_inner, 10, 1) WITH NOWAIT;
     END
 END
@@ -3859,11 +3930,35 @@ END
         END
 
         /*
+        #209: dynamic SQL must be printable before execution. Without this, a broken
+        fragment in the builder surfaces only as "Msg 102 ... near X" with a line
+        number relative to a batch the operator cannot see -- which cost real time
+        twice during #199/#200 development. LEN is reported so silent nvarchar
+        truncation in the builder is visible too.
+        */
+        IF @Debug = 1
+        BEGIN
+            SET @dbg_len = LEN(@discovery_sql);
+            SET @Msg = N'-- @Debug: discovery SQL for ' + QUOTENAME(@CurrentDatabaseName) + N', LEN = '
+                     + CONVERT(nvarchar(20), @dbg_len) + N' chars, in 2000-char chunks:';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            SET @dbg_pos = 1;
+            WHILE @dbg_pos <= @dbg_len
+            BEGIN
+                SET @dbg_chunk = SUBSTRING(@discovery_sql, @dbg_pos, 2000);
+                /* Print via the '%s' ARGUMENT, never as the format string itself:
+                   a format string interprets every '%' in the dumped SQL. */
+                RAISERROR(N'%s', 10, 1, @dbg_chunk) WITH NOWAIT;
+                SET @dbg_pos += 2000;
+            END
+        END
+
+        /*
         Execute the per-database discovery.
         All parameters are passed in to avoid SQL injection from @Databases input.
         */
         BEGIN TRY
-            EXEC sys.sp_executesql
+            EXECUTE sys.sp_executesql
                 @discovery_sql,
                 N'@MinPages_param bigint, @MaxPages_param bigint, @MinForwardedPct_param decimal(6,2),
                   @IncludeHealthyHeaps_param bit,
@@ -4078,7 +4173,7 @@ END
         BEGIN CATCH
             SET @Msg = N'Could not describe @QuickieExecSql: ' + LEFT(ERROR_MESSAGE(), 800);
             RAISERROR(@Msg, 16, 1);
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END CATCH
 
@@ -4102,7 +4197,7 @@ END
                      + ISNULL(N' Reason: ' + LEFT(@QuickieMetaErr, 800), N'')
                      + N' Check that @QuickieExecSql runs standalone and that sp_QuickieStore is installed.';
             RAISERROR(@Msg, 16, 1);
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
@@ -4112,13 +4207,13 @@ END
         OR CHARINDEX(QUOTENAME(@QuickieCpuUsColumn), @ddl) = 0
         BEGIN
             RAISERROR(N'Quickie output metadata does not contain required columns. Check @QuickiePlanIdColumn / @QuickieCpuUsColumn.', 16, 1);
-            IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+            IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
             RETURN;
         END
 
         DECLARE @QuickieBatch nvarchar(max) =
             @ddl + N'
-INSERT INTO #Quickie EXEC sys.sp_executesql @InnerSql;
+INSERT INTO #Quickie EXECUTE sys.sp_executesql @InnerSql;
 
 INSERT INTO #CpuByPlan(plan_id, total_cpu_ms)
 SELECT
@@ -4133,7 +4228,31 @@ FROM #Quickie
 WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 ';
 
-        EXEC sys.sp_executesql
+        /*
+        #209: dynamic SQL must be printable before execution. Without this, a broken
+        fragment in the builder surfaces only as "Msg 102 ... near X" with a line
+        number relative to a batch the operator cannot see -- which cost real time
+        twice during #199/#200 development. LEN is reported so silent nvarchar
+        truncation in the builder is visible too.
+        */
+        IF @Debug = 1
+        BEGIN
+            SET @dbg_len = LEN(@QuickieBatch);
+            SET @Msg = N'-- @Debug: QUICKIESTORE batch, LEN = '
+                     + CONVERT(nvarchar(20), @dbg_len) + N' chars, in 2000-char chunks:';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            SET @dbg_pos = 1;
+            WHILE @dbg_pos <= @dbg_len
+            BEGIN
+                SET @dbg_chunk = SUBSTRING(@QuickieBatch, @dbg_pos, 2000);
+                /* Print via the '%s' ARGUMENT, never as the format string itself:
+                   a format string interprets every '%' in the dumped SQL. */
+                RAISERROR(N'%s', 10, 1, @dbg_chunk) WITH NOWAIT;
+                SET @dbg_pos += 2000;
+            END
+        END
+
+        EXECUTE sys.sp_executesql
             @QuickieBatch,
             N'@InnerSql nvarchar(max), @Unit varchar(10)',
             @InnerSql = @QuickieExecSql,
@@ -4330,14 +4449,26 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
     END
 
     /* 8A: Usage_hint uptime warning */
-    /* If SQL Server restarted recently, dm_db_index_usage_stats hasn't accumulated enough data */
-    /* for reliable WRITE_HEAVY/WRITE_ONLY classification. */
-    IF @UptimeHours < 24.0
+    /*
+    #211: dm_db_index_usage_stats accumulates since instance start, so on a
+    young instance the WRITE_HEAVY/WRITE_ONLY classification reflects days of
+    data, not the workload -- a table read by a weekly report and written daily
+    looks WRITE_ONLY for its first week after a restart. usage_hint is not
+    advisory here: it multiplies the ranking (x0.5 / x0.25) and, with
+    @SkipWriteHeavy = 1, excludes targets entirely. The threshold is 7 days
+    (168 hours), the established practice for usage-based recommendations
+    (Erik Darling's sp_IndexCleanup refuses them below that). The guard was
+    previously 24 hours, which said nothing at hour 48.
+    */
+    IF @UptimeHours < 168.0
        AND EXISTS (SELECT 1 FROM #Targets WHERE usage_hint IS NOT NULL)
     BEGIN
-        SET @Msg = N'WARNING: SQL Server restarted '
+        SET @Msg = N'WARNING: SQL Server has been up only '
                  + CONVERT(nvarchar(20), CONVERT(decimal(6,1), @UptimeHours))
-                 + N' hours ago. usage_hint (WRITE_HEAVY/WRITE_ONLY) may be unreliable due to insufficient dm_db_index_usage_stats accumulation.';
+                 + N' hours. usage_hint (WRITE_HEAVY/WRITE_ONLY) is built from dm_db_index_usage_stats,'
+                 + N' which resets at restart -- below 7 days of uptime the classification is low-confidence,'
+                 + N' and the write-heavy ranking penalty is being applied to it anyway.'
+                 + N' A table whose reads are periodic (weekly reports) may be misclassified WRITE_ONLY.';
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
     END
 
@@ -4367,7 +4498,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             DELETE FROM #Targets WHERE usage_hint IN (N'WRITE_HEAVY', N'WRITE_ONLY');
             SET @TargetCount = (SELECT COUNT_BIG(*) FROM #Targets);
 
-            SET @Msg = CONVERT(nvarchar(10), @skip_wh_cnt) + N' write-heavy heap(s) excluded by @SkipWriteHeavy = 1.';
+            SET @Msg = CONVERT(nvarchar(10), @skip_wh_cnt) + N' write-heavy heap(s) excluded by @SkipWriteHeavy = 1.'
+                     + CASE
+                           WHEN @UptimeHours < 168.0
+                               THEN N' NOTE: uptime is under 7 days, so these exclusions rest on'
+                                  + N' LOW-CONFIDENCE usage data (#211). Re-check after a week of uptime.'
+                           ELSE N''
+                       END;
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         END
     END
@@ -4524,7 +4661,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             BEGIN TRY
                 TRUNCATE TABLE #VlfInfo;
                 SET @vlf_sql = N'USE ' + QUOTENAME(@vlf_db) + N'; DBCC LOGINFO WITH NO_INFOMSGS;';
-                INSERT INTO #VlfInfo EXEC sys.sp_executesql @vlf_sql;
+                INSERT INTO #VlfInfo EXECUTE sys.sp_executesql @vlf_sql;
                 SET @vlf_count = ROWCOUNT_BIG();
 
                 IF @vlf_count > 1000
@@ -4635,7 +4772,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                       AND tgt.schema_name = s.name COLLATE DATABASE_DEFAULT
                       AND tgt.table_name = t.name COLLATE DATABASE_DEFAULT
                   );';
-                EXEC sys.sp_executesql @orphan_sql,
+                EXECUTE sys.sp_executesql @orphan_sql,
                     N'@db_param sysname, @out nvarchar(max) OUTPUT',
                     @db_param = @orphan_db, @out = @orphan_results OUTPUT;
             END TRY
@@ -4774,7 +4911,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         SET @Msg = N'Status: ' + @Status + N' - ' + @StatusMessage;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
-        IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+        IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
         RETURN;
     END
 
@@ -5285,7 +5422,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
 /*#region 19-OUTPUT /* Result set SELECT */ */
     /*-------------------------------------------------------------------------- */
-    /* Output: target list + commands (single result set for INSERT...EXEC compatibility) */
+    /* Output: target list + commands (single result set for INSERT...EXECUTE compatibility) */
     /* Workers in parallel mode have an empty #Targets (they skipped discovery), */
     /* so suppress both the result set and @OutputTable persistence to avoid an */
     /* empty grid in SSMS and a useless @OutputTable INSERT. */
@@ -5371,7 +5508,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
         /* Check if table exists */
         SET @output_sql = N'IF OBJECT_ID(' + QUOTENAME(@safe_OutputTable, N'''') + N') IS NOT NULL SET @exists = 1;';
-        EXEC sp_executesql @output_sql, N'@exists bit OUTPUT', @exists = @output_table_exists OUTPUT;
+        EXECUTE sp_executesql @output_sql, N'@exists bit OUTPUT', @exists = @output_table_exists OUTPUT;
 
         /* Create table if it doesn't exist */
         IF @output_table_exists = 0
@@ -5421,7 +5558,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 recommended_action    varchar(50)     NULL
             );';
             BEGIN TRY
-                EXEC sp_executesql @output_sql;
+                EXECUTE sp_executesql @output_sql;
                 SET @Msg = N'Created output table ' + @OutputTable + N'.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END TRY
@@ -5507,7 +5644,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 BEGIN TRY
                     SET @drift_sql = N'ALTER TABLE ' + @safe_OutputTable
                                    + N' ADD ' + QUOTENAME(@ec_name) + N' ' + @ec_def + N';';
-                    EXEC sp_executesql @drift_sql;
+                    EXECUTE sp_executesql @drift_sql;
                     SET @drift_count += 1;
                     SET @drift_cols += CASE WHEN @drift_cols = N'' THEN N'' ELSE N', ' END + @ec_name;
                 END TRY
@@ -5571,7 +5708,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 END
             FROM #Targets
             ORDER BY sort_order;';
-            EXEC sp_executesql @output_sql,
+            EXECUTE sp_executesql @output_sql,
                 N'@RunID uniqueidentifier, @Version nvarchar(20), @RankingAlgoVersion nvarchar(10), @obfuscate bit',
                 @RunID = @RunID, @Version = @Version, @RankingAlgoVersion = @RankingAlgoVersion, @obfuscate = @obfuscate;
 
@@ -5855,13 +5992,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             )
         );
 
-        /* #159: Emit copy-pasteable resume EXEC so the operator can execute without re-scanning */
+        /* #159: Emit copy-pasteable resume EXECUTE so the operator can execute without re-scanning */
         IF @TargetCount > 0
         BEGIN
             RAISERROR(N'', 10, 1) WITH NOWAIT;
             SET @Msg = N'To execute these targets without re-scanning, run:';
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-            SET @Msg = N'  EXEC dbo.sp_HeapDoctor @ResumeRunID = '''
+            SET @Msg = N'  EXECUTE dbo.sp_HeapDoctor @ResumeRunID = '''
                      + CONVERT(nvarchar(36), @RunID) + N''', @PlanOnly = 0;';
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
         END
@@ -5896,7 +6033,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
         /* Discovery + population complete: release the Discovery applock so any waiting workers
            can proceed into their consumer loop. Leader continues into the consumer loop alongside them. */
-        EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor_Discovery', @LockOwner = N'Session';
+        EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor_Discovery', @LockOwner = N'Session';
     END
 
 /*#region 21-EXECUTION /* WHILE loop with rebuilds */ */
@@ -6380,7 +6517,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                       AND (c.max_length = -1 OR c.system_type_id IN (34, 35, 99, 241))
                 ) THEN 1 ELSE 0 END;';
                 BEGIN TRY
-                    EXEC sys.sp_executesql @verify_sql,
+                    EXECUTE sys.sp_executesql @verify_sql,
                         N'@full_param nvarchar(512), @has_lob bit OUTPUT',
                         @full_param = @full, @has_lob = @cur_has_lob OUTPUT;
                 END TRY
@@ -6435,7 +6572,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         FROM ' + QUOTENAME(@db) + N'.sys.indexes
                         WHERE object_id = OBJECT_ID(@full_param)
                           AND name = @idx_name;';
-                    EXEC sys.sp_executesql @verify_sql,
+                    EXECUTE sys.sp_executesql @verify_sql,
                         N'@full_param nvarchar(512), @idx_name sysname, @is_disabled bit OUTPUT',
                         @full_param = @full, @idx_name = @cur_key_source_index, @is_disabled = @cur_nci_disabled OUTPUT;
                 END TRY
@@ -6489,7 +6626,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                      - CONVERT(bigint, FILEPROPERTY(name, N''SpaceUsed'')) * 8.0 / 1024.0)
                     FROM sys.database_files WHERE type = 1;';
                 BEGIN TRY
-                    EXEC sys.sp_executesql @verify_sql,
+                    EXECUTE sys.sp_executesql @verify_sql,
                         N'@free decimal(18,2) OUTPUT',
                         @free = @cur_log_free_mb OUTPUT;
                 END TRY
@@ -6666,7 +6803,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     + N' ' + CONVERT(nvarchar(10), @cur_fwd_pct) + N'%fwd'
                     + ISNULL(N' fc=' + CONVERT(nvarchar(15), @cur_fwd_fetch_count), N'')
                     + ISNULL(N' cpu=' + CONVERT(nvarchar(15), @cur_cpu_ms), N''), 128);
-                EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+                EXECUTE sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
             END TRY
             BEGIN CATCH
                 /* #113: Surface XE trace errors at debug level */
@@ -6704,7 +6841,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                       AND l.resource_associated_entity_id = OBJECT_ID(@full_param)
                       AND l.request_session_id <> @@SPID
                       AND l.request_status = N''GRANT'';';
-                EXEC sys.sp_executesql @verify_sql,
+                EXECUTE sys.sp_executesql @verify_sql,
                     N'@db_param sysname, @full_param nvarchar(512), @cnt integer OUTPUT, @sleeping integer OUTPUT',
                     @db_param = @db, @full_param = @full, @cnt = @preflight_sessions OUTPUT, @sleeping = @preflight_sleeping OUTPUT;
             END TRY
@@ -6734,7 +6871,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                       AND request_session_id <> @@SPID
                       AND request_mode = N''BU''
                       AND request_status = N''GRANT'';';
-                EXEC sys.sp_executesql @verify_sql,
+                EXECUTE sys.sp_executesql @verify_sql,
                     N'@db_param sysname, @full_param nvarchar(512), @cnt integer OUTPUT',
                     @db_param = @db, @full_param = @full, @cnt = @preflight_bu_sessions OUTPUT;
             END TRY
@@ -6813,7 +6950,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         FROM ' + QUOTENAME(@db) + N'.sys.triggers t
                         WHERE t.parent_id = OBJECT_ID(@full_param)
                           AND t.is_instead_of_trigger = 1;';
-                    EXEC sys.sp_executesql @verify_sql,
+                    EXECUTE sys.sp_executesql @verify_sql,
                         N'@full_param nvarchar(512), @names nvarchar(1000) OUTPUT',
                         @full_param = @full, @names = @trigger_names OUTPUT;
                 END TRY
@@ -6903,7 +7040,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                           AND iro.state = 1 /* PAUSED */
                           AND iro.name = @idx_name
                     ) THEN 1 ELSE 0 END;';
-                    EXEC sys.sp_executesql @verify_sql,
+                    EXECUTE sys.sp_executesql @verify_sql,
                         N'@full_param nvarchar(512), @idx_name sysname, @has_paused bit OUTPUT',
                         @full_param = @full, @idx_name = @cur_index_name, @has_paused = @has_paused_op OUTPUT;
                 END TRY
@@ -6960,7 +7097,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 END
 
                 BEGIN TRY
-                    EXEC sys.sp_executesql @versioning_sql;
+                    EXECUTE sys.sp_executesql @versioning_sql;
                 END TRY
                 BEGIN CATCH
                     SET @Msg = N'  ERROR disabling SYSTEM_VERSIONING: ' + LEFT(ERROR_MESSAGE(), 500)
@@ -7002,7 +7139,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
             SET @pre_row_count = NULL;
             BEGIN TRY
-                EXEC sys.sp_executesql @rowcount_sql,
+                EXECUTE sys.sp_executesql @rowcount_sql,
                     N'@full_param nvarchar(512), @rows_out bigint OUTPUT',
                     @full_param = @full, @rows_out = @pre_row_count OUTPUT;
             END TRY
@@ -7014,9 +7151,24 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             Execute the main command (with lock timeout prefix/suffix)
             */
             SET @exec_cmd = @LockPrefix + @cmd + @LockSuffix;
+            /* #209: printable before execution -- see the discovery dump for why. */
+            IF @Debug = 1
+            BEGIN
+                SET @dbg_len = LEN(@exec_cmd);
+                SET @Msg = N'-- @Debug: rebuild command, LEN = ' + CONVERT(nvarchar(20), @dbg_len) + N' chars:';
+                RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                SET @dbg_pos = 1;
+                WHILE @dbg_pos <= @dbg_len
+                BEGIN
+                    SET @dbg_chunk = SUBSTRING(@exec_cmd, @dbg_pos, 2000);
+                    RAISERROR(N'%s', 10, 1, @dbg_chunk) WITH NOWAIT;
+                    SET @dbg_pos += 2000;
+                END
+            END
+
 
             BEGIN TRY
-                EXEC sys.sp_executesql @exec_cmd;
+                EXECUTE sys.sp_executesql @exec_cmd;
 
                 /*
                 #138: @end is captured here, BEFORE post-rebuild stats update.
@@ -7051,7 +7203,22 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                     BEGIN TRY
                         SET @exec_cmd = @LockPrefix + @ci_drop + @LockSuffix;
-                        EXEC sys.sp_executesql @exec_cmd;
+                        /* #209: printable before execution -- see the discovery dump for why. */
+                        IF @Debug = 1
+                        BEGIN
+                            SET @dbg_len = LEN(@exec_cmd);
+                            SET @Msg = N'-- @Debug: CI drop command, LEN = ' + CONVERT(nvarchar(20), @dbg_len) + N' chars:';
+                            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                            SET @dbg_pos = 1;
+                            WHILE @dbg_pos <= @dbg_len
+                            BEGIN
+                                SET @dbg_chunk = SUBSTRING(@exec_cmd, @dbg_pos, 2000);
+                                RAISERROR(N'%s', 10, 1, @dbg_chunk) WITH NOWAIT;
+                                SET @dbg_pos += 2000;
+                            END
+                        END
+
+                        EXECUTE sys.sp_executesql @exec_cmd;
 
                         SET @Msg = N'  DROP OK';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -7103,7 +7270,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                         /* Restore lock timeout (prefix ran but suffix did not due to error) */
                         IF @LockTimeoutMs IS NOT NULL
-                            EXEC sys.sp_executesql @LockSuffix;
+                            EXECUTE sys.sp_executesql @LockSuffix;
                     END CATCH
                 END
 
@@ -7141,7 +7308,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         SET @verify_sql = N'SELECT @fwd_out = forwarded_record_count
                             FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, ''SAMPLED'')
                             WHERE index_id = 0;';
-                        EXEC sys.sp_executesql @verify_sql,
+                        EXECUTE sys.sp_executesql @verify_sql,
                             N'@db_param sysname, @full_param nvarchar(512), @fwd_out bigint OUTPUT',
                             @db_param = @db, @full_param = @full, @fwd_out = @post_fwd_count OUTPUT;
                     END TRY
@@ -7178,7 +7345,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 BEGIN
                     SET @post_row_count = NULL;
                     BEGIN TRY
-                        EXEC sys.sp_executesql @rowcount_sql,
+                        EXECUTE sys.sp_executesql @rowcount_sql,
                             N'@full_param nvarchar(512), @rows_out bigint OUTPUT',
                             @full_param = @full, @rows_out = @post_row_count OUTPUT;
                     END TRY
@@ -7241,7 +7408,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         DECLARE @stats_sql nvarchar(max) = N'USE ' + QUOTENAME(@db) + N'; UPDATE STATISTICS '
                             + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N' WITH FULLSCAN;';
                         DECLARE @stats_start datetime2(3) = SYSDATETIME();
-                        EXEC sys.sp_executesql @stats_sql;
+                        EXECUTE sys.sp_executesql @stats_sql;
                         DECLARE @stats_ms integer = DATEDIFF(MILLISECOND, @stats_start, SYSDATETIME());
                         SET @Msg = N'  Statistics updated on ' + @full
                                  + N' (' + CONVERT(nvarchar(10), @cur_nci_count) + N' NCI(s), '
@@ -7294,13 +7461,13 @@ FETCH NEXT FROM fk_child_cursor INTO @child_schema, @child_table;
 WHILE @@FETCH_STATUS = 0
 BEGIN
     SET @child_full = QUOTENAME(@child_schema) + N''.'' + QUOTENAME(@child_table);
-    EXEC(N''UPDATE STATISTICS '' + @child_full + N'' WITH FULLSCAN;'');
+    EXECUTE(N''UPDATE STATISTICS '' + @child_full + N'' WITH FULLSCAN;'');
     SET @cnt = @cnt + 1;
     FETCH NEXT FROM fk_child_cursor INTO @child_schema, @child_table;
 END
 CLOSE fk_child_cursor;
 DEALLOCATE fk_child_cursor;';
-                        EXEC sys.sp_executesql @fk_child_stats_sql,
+                        EXECUTE sys.sp_executesql @fk_child_stats_sql,
                             N'@ref_full nvarchar(512), @cnt integer OUTPUT',
                             @ref_full = @full, @cnt = @fk_child_count OUTPUT;
 
@@ -7338,7 +7505,7 @@ DEALLOCATE fk_child_cursor;';
                         + N' ' + CONVERT(nvarchar(10), @cur_page_count) + N'p'
                         + ISNULL(N' fc=' + CONVERT(nvarchar(15), @cur_fwd_fetch_count), N'')
                         + N' post=' + ISNULL(CONVERT(nvarchar(10), @post_fwd_count), N'?'), 128);
-                    EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+                    EXECUTE sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
                 END TRY
                 BEGIN CATCH
                     /* #113: Surface XE trace errors at debug level */
@@ -7519,7 +7686,7 @@ DEALLOCATE fk_child_cursor;';
                         + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
                         + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
                     BEGIN TRY
-                        EXEC sys.sp_executesql @versioning_sql;
+                        EXECUTE sys.sp_executesql @versioning_sql;
                         SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) + N'.';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -7563,7 +7730,7 @@ DEALLOCATE fk_child_cursor;';
 
                 /* Restore lock timeout (prefix ran but suffix did not due to error) */
                 IF @LockTimeoutMs IS NOT NULL
-                    EXEC sys.sp_executesql @LockSuffix;
+                    EXECUTE sys.sp_executesql @LockSuffix;
 
                 UPDATE #ExecLog
                   SET end_time = @end,
@@ -7580,7 +7747,7 @@ DEALLOCATE fk_child_cursor;';
                 /* XE observability: rebuild failed */
                 BEGIN TRY
                     SET @trace_msg = LEFT(N'sp_HeapDoctor: FAILED ' + @full + N' E' + CONVERT(nvarchar(10), @err_number), 128);
-                    EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+                    EXECUTE sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
                 END TRY
                 BEGIN CATCH
                     /* #113: Surface XE trace errors at debug level */
@@ -7654,7 +7821,7 @@ DEALLOCATE fk_child_cursor;';
                         + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
                         + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
                     BEGIN TRY
-                        EXEC sys.sp_executesql @versioning_sql;
+                        EXECUTE sys.sp_executesql @versioning_sql;
                         SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
                                  + N' (rebuild failed, but versioning restored).';
@@ -7840,7 +8007,7 @@ DEALLOCATE fk_child_cursor;';
                 + N' F=' + CONVERT(nvarchar(10), @failed_cnt)
                 + N' K=' + CONVERT(nvarchar(10), @skipped_cnt)
                 + N' ' + CONVERT(nvarchar(10), DATEDIFF(SECOND, @RunStart, SYSDATETIME())) + N's', 128);
-            EXEC sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
+            EXECUTE sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
         END TRY
         BEGIN CATCH
             /* #113: Surface XE trace errors at debug level */
@@ -8050,7 +8217,7 @@ DEALLOCATE fk_child_cursor;';
     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
     /* Release re-entrancy guard */
-    IF @HeapsInParallel = N'N' EXEC sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+    IF @HeapsInParallel = N'N' EXECUTE sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
 
     /* Return non-zero so SQL Agent jobs see failure */
     IF @failed_cnt > 0
@@ -8058,6 +8225,6 @@ DEALLOCATE fk_child_cursor;';
 END
 GO
 
-EXEC sp_MS_marksystemobject 'sp_HeapDoctor';
+EXECUTE sp_MS_marksystemobject 'sp_HeapDoctor';
 GO
 /*#endregion 22-CLEANUP */

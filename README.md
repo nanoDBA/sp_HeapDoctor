@@ -405,7 +405,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@MaxPages` | `NULL` | Skip heaps larger than this (`NULL` = no cap) |
 | `@MinForwardedPct` | `2.00` | Minimum forwarded record % to qualify.  Applied to a `SAMPLED` estimate by default, so a borderline heap can be excluded by sampling error; excluded counts are reported per database |
 | `@IncludeHealthyHeaps` | `0` | `1` = bypass **both** forwarded-record filters (the `> 0` requirement and `@MinForwardedPct`) so heaps with no forwarded records are returned.  `@MinPages`, `@TopN` and every safety guard still apply.  Mainly for force-rebuilding a specific heap alongside `@Tables` |
-| `@ScanMode` | `SAMPLED` | `dm_db_index_physical_stats` mode: `SAMPLED` (fast, estimates) or `DETAILED` (exact, slower).  `LIMITED` is rejected -- it returns NULL for `forwarded_record_count`, so the records this procedure exists to find are invisible to it |
+| `@ScanMode` | `SAMPLED` | `dm_db_index_physical_stats` mode: `SAMPLED` (fast, estimates) or `DETAILED` (exact, slower).  `LIMITED` is rejected -- it returns NULL for `forwarded_record_count`, so the records this procedure exists to find are invisible to it.  **`SAMPLED` is a request, not a guarantee**: below 10,000 pages SQL Server silently runs `DETAILED`, so with the default `@MinPages = 1000` most targets in the 1,000-9,999 band get a full scan whether you asked or not -- exact counts, but real cost (#206) |
 | `@SkipWriteHeavy` | `0` | `1` = completely exclude `WRITE_HEAVY` and `WRITE_ONLY` heaps.  Default ranking penalties still apply when `0` |
 | `@MinDaysSinceRebuild` | `NULL` | Skip heaps rebuilt fewer than N days ago (requires CommandLog for rebuild history).  `NULL` = no filtering |
 
@@ -562,14 +562,14 @@ The target list result set (returned in both plan-only and execute modes) contai
 | `forwarded_record_count` | bigint | Forwarded records found (SAMPLED estimate) |
 | `forwarded_pct` | decimal(6,2) | `forwarded_record_count / record_count * 100` |
 | `avg_page_space_pct` | decimal(5,2) | Average page space used (%).  Low values suggest compaction opportunity |
-| `avg_frag_pct` | decimal(5,2) | Logical fragmentation %.  Less meaningful for heaps than B-trees |
+| `avg_frag_pct` | decimal(5,2) | Extent fragmentation %.  Less meaningful for heaps than B-trees.  **NULL for heaps of 10,000+ pages under the default `SAMPLED` mode** -- below 10,000 pages SQL Server silently runs `DETAILED` instead, which is why smaller heaps show a value (#206) |
 | `ghost_record_count` | bigint | Ghost records awaiting cleanup.  Rebuild reclaims these |
 
 ### Operational Stats (from dm_db_index_operational_stats)
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `forwarded_fetch_count` | bigint | Cumulative count of forwarded pointer traversals since server restart.  The runtime impact metric: how often forwarded records are actually being followed |
+| `forwarded_fetch_count` | bigint | Count of forwarded pointer traversals from `dm_db_index_operational_stats`.  The runtime impact metric.  **Not guaranteed to cover the full uptime**: the counter zeroes whenever the heap's metadata re-enters the metadata cache (eviction under memory pressure targets less-active heaps) and on some DDL -- the post-rebuild reset is relied on so a fixed heap re-ranks from zero (#210) |
 
 ### CPU and Ranking
 
@@ -692,14 +692,14 @@ which action is chosen.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `page_io_latch_wait_count` | bigint | Page IO latch wait count from `dm_db_index_operational_stats`.  High values indicate disk pressure independent of forwarded records |
+| `page_io_latch_wait_count` | bigint | Page IO latch wait count from `dm_db_index_operational_stats`.  High values indicate disk pressure independent of forwarded records.  Same counter-lifetime caveat as `forwarded_fetch_count` (#210) |
 | `page_io_latch_wait_ms` | bigint | Page IO latch wait time in milliseconds |
 
 ## How It Works
 
 1. **Database selection** - parses `@Databases` using the Ola Hallengren pattern (wildcards, exclusions, AG awareness).  AG secondaries are automatically skipped because you can't rebuild on a read-only replica, no matter how badly you want to.
 2. **Heap discovery** - heap `object_id`s are materialized first from `sys.indexes WHERE type = 0`, then each heap is scanned individually via `dm_db_index_physical_stats` with `SAMPLED` mode.  This skips all non-heap objects.  Memory-optimized tables and tables with columnstore indexes are excluded.  Runtime `forwarded_fetch_count` from `dm_db_index_operational_stats` is captured alongside the physical stats.
-3. **Ranking** - targets are scored using a LOG10-normalized weighted formula: `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`.  LOG10 compresses wildly different scales (fetch counts in millions, CPU in thousands, percentages in single digits) into a comparable 0-10 range.  Query Store CPU is mapped to heap objects via showplan XML, but only for `Table Scan` operators.  Write-heavy heaps (more updates than reads) are penalized because forwarded records recur quickly after rebuild.  The `ranking_score` column shows the computed score, and `ranking_basis` tells you the CPU source (`QS_CPU`, `QS_NO_DATA`, or `FWD_PCT`).
+3. **Ranking** - targets are scored using a LOG10-normalized weighted formula (note: the `fetch_rate/hr` term divides `forwarded_fetch_count` by full server uptime, but the counter zeroes when the heap's metadata re-enters the metadata cache -- so on memory-pressured instances a recently-evicted heap's rate is deflated (#210)): `0.4*LOG10(fetch_rate/hr+1) + 0.4*LOG10(cpu+1) + 0.2*LOG10(fwd_pct+1)`.  LOG10 compresses wildly different scales (fetch counts in millions, CPU in thousands, percentages in single digits) into a comparable 0-10 range.  Query Store CPU is mapped to heap objects via showplan XML, but only for `Table Scan` operators.  Write-heavy heaps (more updates than reads) are penalized because forwarded records recur quickly after rebuild.  The `ranking_score` column shows the computed score, and `ranking_basis` tells you the CPU source (`QS_CPU`, `QS_NO_DATA`, or `FWD_PCT`).
 4. **Key detection** - for CI swap, finds the smallest safe unique non-nullable NC index with no LOB key columns and total key size <= 1700 bytes.  The `nci_count` column shows how many NCIs will get rebuilt twice if you go the CI swap route.
 5. **LOB guard** - CI swap is skipped if the table has `text`, `ntext`, `image`, `xml`, or `MAX`-length columns (`DROP INDEX ONLINE` doesn't support LOB).
 6. **Command generation** - builds 3-part-name commands (`[DB].[Schema].[Table]`) so execution is context-agnostic.  Run it from master, run it from the target database, doesn't matter.

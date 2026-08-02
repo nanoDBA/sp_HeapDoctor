@@ -415,6 +415,7 @@ These deviations from the strict Darling style are intentional design choices:
 | Variable naming | snake_case | Mixed (PascalCase for public, snake_case for internal) | Consistency with parameter names |
 | Temp table naming | snake_case (#filtered_objects) | PascalCase (#Targets, #Heaps) | Matches established codebase convention |
 | EXISTS SELECT | SELECT 1/0 | SELECT 1 | SELECT 1 is more widely understood |
+| Column aliases | `column_name = expression` | `expression AS column_name` (~66 sites) | Documented deviation (#208): rewriting them is real churn for zero behaviour change, and `AS` aliasing is what every consumer of the result set already reads.  New code may use either; do not mix within one SELECT |
 
 ---
 
