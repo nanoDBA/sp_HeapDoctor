@@ -38,6 +38,11 @@ GO
 -- Use SIMPLE recovery so log can be auto-truncated (no log backups needed for test DB).
 ALTER DATABASE [HeapDoctorTest] SET RECOVERY SIMPLE;
 GO
+-- Commits return before the log flush (#213).  On slow disk each small commit in the
+-- fixtures otherwise waits for one.  Losing the last commits on a crash is harmless here:
+-- this database is rebuilt by every test file.
+ALTER DATABASE [HeapDoctorTest] SET DELAYED_DURABILITY = FORCED;
+GO
 
 -- Enable Query Store
 ALTER DATABASE [HeapDoctorTest] SET QUERY_STORE = ON;

@@ -74,14 +74,23 @@ BLOCKER_LOG=$(mktemp)
 cleanup() {
     # The blocking transaction must not outlive this script even on failure or
     # interrupt: a held TABLOCKX would wedge every later test on this rig.
+    # Killing the local client is not enough: when it reaches the server through
+    # a remote shell, the server session keeps its lock until the WAITFOR ends.
+    # Phase 2's blocker is still running on every normal exit, so the KILL below
+    # is what actually releases it (#212). EXEC() accepts only literals and
+    # variables, not a CAST, so the statement is built in @k first.
     [ -n "${BLOCKER_PID:-}" ] && kill "$BLOCKER_PID" 2>/dev/null
     wait "${BLOCKER_PID:-}" 2>/dev/null
     eval "$SQLCMD" -d HeapDoctorTest -Q \
-      "\"DECLARE @s int; SELECT TOP 1 @s = session_id FROM sys.dm_tran_locks WHERE resource_associated_entity_id = OBJECT_ID('dbo.HeapA') AND request_mode IN ('S','X') AND request_session_id <> @@SPID; IF @s IS NOT NULL EXEC('KILL ' + CAST(@s AS varchar(10)));\"" \
+      "\"DECLARE @s int, @k nvarchar(30); SELECT TOP 1 @s = request_session_id FROM sys.dm_tran_locks WHERE resource_database_id = DB_ID() AND resource_associated_entity_id = OBJECT_ID('dbo.HeapA') AND request_mode IN ('S','X') AND request_session_id <> @@SPID; IF @s IS NOT NULL BEGIN SET @k = N'KILL ' + CONVERT(nvarchar(10), @s); EXEC (@k); END;\"" \
       >/dev/null 2>&1
     rm -f "$BLOCKER_LOG"
 }
-trap cleanup EXIT INT TERM
+# Cleanup runs once, from EXIT. A signal trap that called cleanup directly would
+# return and let the script carry on into the next phase.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- Session A: hold a SHARED table lock -------------------------------------
 #
