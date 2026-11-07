@@ -125,12 +125,15 @@ RAISERROR(N'Test 22E: Execution with progress reporting (#67)...', 10, 1) WITH N
 IF OBJECT_ID(N'dbo.HeapProgress') IS NOT NULL DROP TABLE dbo.HeapProgress;
 CREATE TABLE dbo.HeapProgress (ID int NOT NULL, Col1 nvarchar(50) NULL);
 
+-- One commit for the whole fixture: a commit per row waits on a log flush each time.
 DECLARE @p22 int = 1;
+BEGIN TRANSACTION;
 WHILE @p22 <= 5000
 BEGIN
     INSERT dbo.HeapProgress(ID, Col1) VALUES (@p22, REPLICATE(N'X', 10));
     SET @p22 += 1;
 END
+COMMIT TRANSACTION;
 UPDATE dbo.HeapProgress SET Col1 = REPLICATE(N'Y', 50);
 
 EXEC dbo.sp_HeapDoctor

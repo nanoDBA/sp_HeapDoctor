@@ -174,12 +174,15 @@ END
 GO
 
 -- Insert rows + create forwarded records
+-- One commit for the whole fixture: a commit per row waits on a log flush each time.
 DECLARE @t19 int = 1;
+BEGIN TRANSACTION;
 WHILE @t19 <= 10000
 BEGIN
     INSERT dbo.HeapTriggerTest(ID, Col1, Col2) VALUES (@t19, @t19, REPLICATE(N'X', 10));
     SET @t19 += 1;
 END
+COMMIT TRANSACTION;
 UPDATE dbo.HeapTriggerTest SET Col2 = REPLICATE(N'Y', 50);
 
 -- Mark start point in CommandLog
@@ -244,12 +247,15 @@ CREATE TABLE dbo.HeapLockEscTest
 ALTER TABLE dbo.HeapLockEscTest SET (LOCK_ESCALATION = TABLE);
 CREATE UNIQUE NONCLUSTERED INDEX UX_HeapLockEscTest_ID ON dbo.HeapLockEscTest(ID);
 
+-- One commit for the whole fixture: a commit per row waits on a log flush each time.
 DECLARE @l19 int = 1;
+BEGIN TRANSACTION;
 WHILE @l19 <= 10000
 BEGIN
     INSERT dbo.HeapLockEscTest(ID, Col1, Col2) VALUES (@l19, @l19, REPLICATE(N'X', 10));
     SET @l19 += 1;
 END
+COMMIT TRANSACTION;
 UPDATE dbo.HeapLockEscTest SET Col2 = REPLICATE(N'Y', 50);
 
 DELETE FROM #Results;

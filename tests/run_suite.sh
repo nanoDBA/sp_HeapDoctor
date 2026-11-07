@@ -40,11 +40,19 @@
 #
 # Connection handling:
 #   With -U/-P, SQL authentication is used. Without them, a trusted connection
-#   is used. Set HEAPDOCTOR_SQLCMD to override the client invocation entirely,
-#   e.g. to run against a container:
+#   is used. Set HEAPDOCTOR_SQLCMD to override the client invocation entirely.
+#   To run against the shared test environments, take the lease and go through
+#   the lease-gated connection, from the repo root:
 #
-#     HEAPDOCTOR_SQLCMD='docker exec -i sqltest-2022 /opt/mssql-tools18/bin/sqlcmd
-#         -S localhost -U sa -P "$PASSWORD" -C' bash tests/run_suite.sh
+#     bash tools/rig-use.sh use 2022
+#     HEAPDOCTOR_SQLCMD='bash tools/rig-use.sh sqlcmd 2022' bash tests/run_suite.sh
+#     bash tools/rig-use.sh stop
+#
+#   Never point this at a raw "docker exec": this runner does not consult the
+#   lease, so that would bypass it.
+#
+# WARNING: each test file starts by running 01_setup_test_data.sql, which DROPS
+# and rebuilds the HeapDoctorTest database on the target instance.
 #
 # No hostnames or credentials are stored in this file.
 #
@@ -208,7 +216,13 @@ for t in "${TEST_FILES[@]}"; do
     # wrapper: the files stay on the host, and only their contents cross over.
     #
     # Every file starts from a freshly built database, so files stay independent.
-    feed "$SETUP" | eval "$SQLCMD" -d master -b >/dev/null 2>&1
+    # A failed setup must stop this file: its assertions would otherwise run against
+    # whatever the last file left behind, and could pass.
+    if ! feed "$SETUP" | eval "$SQLCMD" -d master -b >/dev/null 2>&1; then
+        printf '%-40s %s\n' "$t" "SETUP FAILED"
+        problems+=("$t: 01_setup_test_data.sql failed, so this file was not run")
+        continue
+    fi
 
     out=$(feed "$src" | eval "$SQLCMD" -d HeapDoctorTest 2>&1)
 

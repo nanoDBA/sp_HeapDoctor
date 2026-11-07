@@ -150,9 +150,17 @@ GO
 ------------------------------------------------------------------------
 RAISERROR(N'Test 36D: plan breadth alone -> CAUTIONARY (#185)...', 10, 1) WITH NOWAIT;
 
+-- This fixture needs a Query Store plan from one cheap scan.  AUTO capture does not
+-- reliably record that: measured about 7 ms of CPU with no capture in 24 probes, and
+-- the file failed here in 1 of 8 runs on 2019 and 5 of 8 on 2022 with no code change.
+-- Its own batch, because a statement is compiled when its batch starts.
+ALTER DATABASE CURRENT SET QUERY_STORE (QUERY_CAPTURE_MODE = ALL);
+GO
+
 DECLARE @sink36 integer;
 SELECT @sink36 = COUNT_BIG(*) FROM dbo.HeapPlainAuto WHERE Padding LIKE '%X%';
 EXEC sys.sp_query_store_flush_db;
+ALTER DATABASE CURRENT SET QUERY_STORE (QUERY_CAPTURE_MODE = AUTO);
 
 SELECT * INTO #R36d FROM dbo.ResultsTemplate WHERE 1 = 0;
 INSERT INTO #R36d

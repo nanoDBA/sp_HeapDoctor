@@ -42,12 +42,15 @@ CREATE TABLE dbo.HeapStatsTest
 );
 CREATE NONCLUSTERED INDEX IX_HeapStatsTest_Col1 ON dbo.HeapStatsTest(Col1);
 
+-- One commit for the whole fixture: a commit per row waits on a log flush each time.
 DECLARE @s21 int = 1;
+BEGIN TRANSACTION;
 WHILE @s21 <= 10000
 BEGIN
     INSERT dbo.HeapStatsTest(ID, Col1, Col2) VALUES (@s21, @s21, REPLICATE(N'X', 10));
     SET @s21 += 1;
 END
+COMMIT TRANSACTION;
 UPDATE dbo.HeapStatsTest SET Col2 = REPLICATE(N'Y', 50);
 GO
 

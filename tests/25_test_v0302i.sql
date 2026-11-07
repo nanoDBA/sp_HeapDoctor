@@ -185,12 +185,15 @@ CREATE TABLE dbo.TemporalTest
 GO
 
 -- Populate base table
+-- One commit for the whole fixture: a commit per row waits on a log flush each time.
 DECLARE @t25 int = 1;
+BEGIN TRANSACTION;
 WHILE @t25 <= 2000
 BEGIN
     INSERT dbo.TemporalTest(ID, Col1) VALUES (@t25, REPLICATE(N'X', 10));
     SET @t25 += 1;
 END
+COMMIT TRANSACTION;
 -- Update to create versions (rows move to history with small Col1)
 UPDATE dbo.TemporalTest SET Col1 = REPLICATE(N'Y', 10);
 GO

@@ -1,115 +1,254 @@
 #!/usr/bin/env bash
 #
-# Lease-gated container activation for the shared sqltest rig.
+# Lease-gated access to the shared SQL Server test environments.
 #
-# THE ONLY sanctioned way for this repo to start or stop a sqltest container.
+# THE ONLY sanctioned way for this repo to start, stop, or connect to one.
 #
-# Why this exists (2026-08-02 incident): the harness had no lock integration --
-# tests/run_suite.sh drives sqlcmd through whatever HEAPDOCTOR_SQLCMD points at
-# and never consults the lease, and container switching was raw caller-side
-# `docker stop`/`docker start`. The acquire/release was a README instruction,
-# i.e. advisory. Ad-hoc orchestrators then piped `sqltest-lock acquire` to
-# /dev/null and ignored its exit code, so when sp_StatUpdate held a live lease
-# this harness stomped its containers mid-run. A refused acquire refused
-# nothing.
+#   bash tools/rig-use.sh use <2019|2022|2025>          # acquire or exit 2, then start and wait for logins
+#   bash tools/rig-use.sh use <2019|2022|2025> --wait   # acquire or poll (3h ceiling)
+#   bash tools/rig-use.sh stop                          # acquire or exit 2, then stop all and release
+#   bash tools/rig-use.sh release                       # release only; leaves the container running
+#   bash tools/rig-use.sh status
+#   bash tools/rig-use.sh sqlcmd <year> [sqlcmd args]   # run sqlcmd in that container, under our lease
 #
-# This tool makes refusal mean refusal:
+# The sqlcmd verb is what the test scripts connect through.  From the repo root:
 #
-#   bash tools/rig-use.sh <ssh-host> use <container>          # acquire or exit 2
-#   bash tools/rig-use.sh <ssh-host> use <container> --wait   # acquire or poll (3h ceiling)
-#   bash tools/rig-use.sh <ssh-host> release
-#   bash tools/rig-use.sh <ssh-host> status
+#   HEAPDOCTOR_SQLCMD='bash tools/rig-use.sh sqlcmd 2022' bash tests/run_suite.sh
 #
-# On `use`: the lease is acquired FIRST, and only a successful acquire is
-# followed by stopping other sqltest containers and starting the requested one.
-# The default on refusal is exit 2 with a message -- the polite one-liner:
+# WHY THE GATE IS HERE (2026-08-02 incident): the harness had no lock
+# integration.  Ad-hoc orchestrators piped the lease acquire to /dev/null and
+# ignored its exit code, so when the other project held a live lease this harness
+# stopped its containers mid-run.  The victim's remaining tests emit nothing,
+# which reads as zero failures.  So a refused acquire touches nothing here, and
+# the sqlcmd verb re-checks the lease on the rig in the same remote call as the
+# connection: a script cannot reach a server while another harness holds it.
 #
-#   bash tools/rig-use.sh <host> use sqltest-2022 || { echo "rig held -- not starting"; exit 2; }
+# WHY NO docker start/stop/run APPEARS BELOW: the environments are created and
+# managed by a control script on the rig host, which runs one at a time, on a
+# clone of the staged data, from a pinned image, and never deletes a container or
+# data.  Calling docker directly would bypass all of that.  A harness that looked
+# for containers by name and created any it did not find would start an empty
+# instance.  The only docker verb used here is exec, on a container the control
+# script already started, and exec cannot create or start one.
 #
-# `--wait` opts an orchestrator into polling until the lease frees.
+# CONFIGURATION: no hostname, path, or credential is committed.  Copy these into
+# tools/rig.local.env (gitignored; environment variables of the same name win):
 #
-# No hostname, credential, or rig-specific value is committed here: the host is
-# an argument, the remote lock tool defaults to ~/bin/sqltest-lock and can be
-# overridden with SQLTEST_LOCK_CMD, and this script never touches SQL logins --
-# readiness and credentials remain the caller's concern (HEAPDOCTOR_SQLCMD).
+#   RIG_SSH_HOST           ssh alias of the rig host
+#   RIG_CONTROL            path of the control script on that host, which provides
+#                          ensure <year> | stop | status | password <year> |
+#                          lock acquire|release|status [owner] [ttl-minutes]
+#   RIG_CONTAINER_PATTERN  printf pattern naming the container for a year
 #
-# The lease owner string is "sp_HeapDoctor": the lock identifies the HARNESS,
-# not the person, so the other project can tell whose run holds the rig.
+# The SA password is read on the rig host at call time and handed to sqlcmd
+# through the environment.  It never reaches this machine or a command line.
 #
-# Exit status: 0 done; 2 lease refused (nothing was touched) or usage error;
-# 1 remote/docker failure after the lease was held.
+# The lease owner is "sp_HeapDoctor": the lock identifies the HARNESS, not the
+# person, so the other project can tell whose run holds the rig.
+#
+# Exit status: 0 done; 2 lease refused (nothing was touched) or usage/config
+# error; 3 sqlcmd refused because we do not hold the lease; 1 remote failure.
+# The sqlcmd verb otherwise passes through sqlcmd's own status.
 
 set -uo pipefail
 
-HOST="${1:-}"
-ACTION="${2:-}"
-LOCK_CMD="${SQLTEST_LOCK_CMD:-~/bin/sqltest-lock}"
 OWNER="sp_HeapDoctor"
 LEASE_MINUTES=180
+READY_TIMEOUT_SECONDS=300
+SQLCMD_PATH="/opt/mssql-tools18/bin/sqlcmd"
 
 usage() {
-    echo "usage: bash tools/rig-use.sh <ssh-host> use <container> [--wait] | release | status" >&2
+    sed -n '7,12p' "${BASH_SOURCE[0]}" | sed 's/^# */usage: /' >&2
     exit 2
 }
 
-[ -n "$HOST" ] && [ -n "$ACTION" ] || usage
+# Environment variables beat the file.  CR is stripped because this tree lives on
+# cloud-synced storage that can rewrite line endings, and a stray CR would
+# silently become part of a host name.
+ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rig.local.env"
+_host="${RIG_SSH_HOST:-}"; _control="${RIG_CONTROL:-}"; _pattern="${RIG_CONTAINER_PATTERN:-}"
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    source <(tr -d '\r' < "$ENV_FILE")
+fi
+RIG_SSH_HOST="${_host:-${RIG_SSH_HOST:-}}"
+RIG_CONTROL="${_control:-${RIG_CONTROL:-}}"
+RIG_CONTAINER_PATTERN="${_pattern:-${RIG_CONTAINER_PATTERN:-}}"
 
-rssh() { timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=40 "$HOST" "$@"; }
+ACTION="${1:-}"
+[ -n "$ACTION" ] || usage
+shift
+
+# Strict host-key checking is deliberate.  Keepalives make a dead connection end
+# with an error, because a suite that hangs silently is the failure this guards.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=yes
+          -o ServerAliveInterval=30 -o ServerAliveCountMax=4)
+
+require_config() {
+    if [ -z "$RIG_SSH_HOST" ] || [ -z "$RIG_CONTROL" ] || [ -z "$RIG_CONTAINER_PATTERN" ]; then
+        echo "rig-use: RIG_SSH_HOST, RIG_CONTROL and RIG_CONTAINER_PATTERN must be set (see tools/rig.local.env)." >&2
+        exit 2
+    fi
+}
+
+# Container names are not accepted: an old-style "sqltest-2022" argument is a
+# caller still written for the previous rig, and it must fail before any ssh.
+require_year() {
+    case "${1:-}" in
+        2019|2022|2025) ;;
+        *) echo "rig-use: expected 2019, 2022 or 2025, got '${1:-}'." >&2; exit 2 ;;
+    esac
+}
+
+# Runs one control-script verb on the rig host.  Arguments are shell-quoted for
+# the remote shell.  stdin is closed so a verb cannot eat a caller's piped script.
+control() {
+    local limit="$1" cmd arg
+    shift
+    cmd=$(printf '%q' "$RIG_CONTROL")
+    for arg in "$@"; do cmd+=" $(printf '%q' "$arg")"; done
+    timeout "$limit" ssh "${SSH_OPTS[@]}" "$RIG_SSH_HOST" "$cmd" </dev/null
+}
+
+# The gate.  The control script exits 1 when another owner holds the lock and
+# only then; anything else (255 from ssh, 124 from timeout, 127 for a missing
+# script) means we do not know who holds it, so it is an error, never a wait.
+acquire_lease() {
+    local wait="$1" rc
+    control 120 lock acquire "$OWNER" "$LEASE_MINUTES"
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -ne 1 ]; then
+        echo "rig-use: could not reach the lock (exit $rc).  Nothing was touched." >&2
+        exit 1
+    fi
+    if [ "$wait" -eq 0 ]; then
+        echo "rig-use: lease REFUSED -- the rig is held by another harness.  Nothing was touched." >&2
+        echo "rig-use: wait for it, or re-run with --wait to poll." >&2
+        exit 2
+    fi
+    echo "rig-use: lease held by another harness -- waiting, not stomping."
+    # 60s polls: the acquire probe is cheap, and a coarser interval just wastes
+    # rig time after the holder releases.  Measured 2026-08-02: a holder released
+    # 27 min into a ~180-min TTL, so lease-remaining says nothing about
+    # run-remaining.  Poll for the release; never release another owner's lease.
+    for _ in $(seq 1 180); do         # 3h ceiling, 60s interval
+        sleep 60
+        control 120 lock acquire "$OWNER" "$LEASE_MINUTES" 2>/dev/null
+        rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        if [ "$rc" -ne 1 ]; then
+            echo "rig-use: could not reach the lock (exit $rc) while waiting.  Nothing was touched." >&2
+            exit 1
+        fi
+    done
+    echo "rig-use: lease still held after 3h -- giving up.  Nothing was touched." >&2
+    exit 2
+}
+
+# Runs sqlcmd inside the container, in one remote call that first confirms we
+# hold an unexpired lease.  stdin passes through, so scripts can be piped in.
+run_sqlcmd() {
+    local year="$1" container ctl args="" arg
+    shift
+    # shellcheck disable=SC2059
+    container=$(printf "$RIG_CONTAINER_PATTERN" "$year")
+    ctl=$(printf '%q' "$RIG_CONTROL")
+    for arg in "$@"; do args+=" $(printf '%q' "$arg")"; done
+
+    ssh "${SSH_OPTS[@]}" "$RIG_SSH_HOST" "
+lease=\$($ctl lock status </dev/null)
+case \"\$lease\" in
+    'held by $OWNER, -'*) echo \"rig-use: our lease has expired (\$lease).  Not connecting.\" >&2; exit 3 ;;
+    'held by $OWNER, '*) ;;
+    *) echo \"rig-use: we do not hold the lease (\$lease).  Not connecting; run 'tools/rig-use.sh use $year' first.\" >&2; exit 3 ;;
+esac
+SQLCMDPASSWORD=\$($ctl password $year </dev/null) || exit 3
+[ -n \"\$SQLCMDPASSWORD\" ] || { echo 'rig-use: no SA password available for $year.' >&2; exit 3; }
+export SQLCMDPASSWORD
+exec docker exec -i -e SQLCMDPASSWORD $(printf '%q' "$container") $SQLCMD_PATH -S localhost -U sa -C$args
+"
+}
+
+# Returns once startup recovery has finished AND every database is ONLINE, printing
+# its build.  Logins are accepted, and a state check passes, before user databases
+# have actually started.  A DROP DATABASE in that window removes the database from
+# master but leaves its files, so every later CREATE DATABASE fails with error 5170
+# (2026-11-06: the suite's setup did this to two instances, logging error 913 from
+# the startup thread and no file deletes).  So the signal is SQL Server's own
+# message.  The current error log starts at each restart, so an old message cannot
+# satisfy this.  Asserting on a parsed build rather than on exit status alone: a
+# sqlcmd error message is also output, and it must not read as ready.
+wait_for_logins() {
+    local year="$1" waited=0 build
+    while [ "$waited" -lt "$READY_TIMEOUT_SECONDS" ]; do
+        build=$(run_sqlcmd "$year" -h-1 -W -Q \
+            "SET NOCOUNT ON; DECLARE @RecoveryLog table (LogDate datetime, ProcessInfo sysname, LogText nvarchar(max)); INSERT INTO @RecoveryLog EXEC sys.xp_readerrorlog 0, 1, N'Recovery is complete'; SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM @RecoveryLog) OR EXISTS (SELECT 1 FROM sys.databases WHERE state <> 0) THEN N'recovering' ELSE CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) END;" \
+            </dev/null 2>/dev/null | tr -d '[:space:]')
+        case "$build" in
+            [0-9]*.[0-9]*.[0-9]*)
+                echo "rig-use: READY: $year, build $build, recovery complete (after ${waited}s)."
+                return 0
+                ;;
+        esac
+        sleep 5
+        waited=$((waited + 5))
+    done
+    return 1
+}
 
 case "$ACTION" in
     status)
-        rssh "$LOCK_CMD status"
+        require_config
+        control 120 status
         ;;
 
     release)
-        rssh "$LOCK_CMD release $OWNER"
+        require_config
+        control 120 lock release "$OWNER"
         ;;
 
     use)
-        CONTAINER="${3:-}"
-        [ -n "$CONTAINER" ] || usage
+        YEAR="${1:-}"
         WAIT=0
-        [ "${4:-}" = "--wait" ] && WAIT=1
+        [ "${2:-}" = "--wait" ] && WAIT=1
+        require_year "$YEAR"
+        require_config
+        acquire_lease "$WAIT"
 
-        # The gate. Exit code checked; a refusal touches nothing.
-        if ! rssh "$LOCK_CMD acquire $OWNER $LEASE_MINUTES"; then
-            if [ "$WAIT" -eq 0 ]; then
-                echo "rig-use: lease REFUSED -- the rig is held by another harness. Nothing was touched." >&2
-                echo "rig-use: wait for it, or re-run with --wait to poll." >&2
-                exit 2
-            fi
-            echo "rig-use: lease held by another harness -- waiting, not stomping."
-            # 60s polls: the acquire probe is cheap, and a coarser interval just
-            # wastes rig time after the holder releases. Measured 2026-08-02: a
-            # holder released 27 min into a ~180-min TTL, so lease-remaining says
-            # nothing about run-remaining -- poll for the release, and if a lease
-            # looks orphaned, adjudicate with EVIDENCE (holder processes, container
-            # sessions, output mtimes) before 'sqltest-lock release <holder>'.
-            acquired=0
-            for _ in $(seq 1 180); do         # 3h ceiling, 60s interval
-                sleep 60
-                if rssh "$LOCK_CMD acquire $OWNER $LEASE_MINUTES"; then
-                    acquired=1
-                    break
-                fi
-            done
-            if [ "$acquired" -ne 1 ]; then
-                echo "rig-use: lease still held after 3h -- giving up. Nothing was touched." >&2
-                exit 2
-            fi
-        fi
-
-        # Only reachable with the lease held.
-        if rssh "docker stop \$(docker ps -q --filter name=sqltest) >/dev/null 2>&1; sleep 3; docker start $CONTAINER >/dev/null"; then
-            echo "rig-use: lease held; $CONTAINER started. Allow ~30s for SQL Server to accept connections."
-        else
-            echo "rig-use: docker activation failed AFTER acquiring the lease; the lease is still held so the rig is not left unguarded. Investigate, then 'release'." >&2
+        # Only reachable with the lease held.  On failure the lease stays held so
+        # the rig is not left unguarded in an unknown state.
+        if ! control 600 ensure "$YEAR"; then
+            echo "rig-use: ensure $YEAR failed AFTER acquiring the lease; the lease is still held.  Investigate, then 'release'." >&2
             exit 1
         fi
+        if ! wait_for_logins "$YEAR"; then
+            echo "rig-use: $YEAR did not accept a login within ${READY_TIMEOUT_SECONDS}s; the lease is still held.  Investigate, then 'release'." >&2
+            exit 1
+        fi
+        ;;
+
+    stop)
+        require_config
+        acquire_lease 0
+        if ! control 300 stop; then
+            echo "rig-use: stop failed AFTER acquiring the lease; the lease is still held.  Investigate, then 'release'." >&2
+            exit 1
+        fi
+        control 120 lock release "$OWNER"
+        ;;
+
+    sqlcmd)
+        YEAR="${1:-}"
+        require_year "$YEAR"
+        shift
+        require_config
+        run_sqlcmd "$YEAR" "$@"
+        exit $?
         ;;
 
     *)
         usage
         ;;
 esac
-exit 0
+exit $?

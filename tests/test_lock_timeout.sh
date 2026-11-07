@@ -22,9 +22,11 @@
 # succeeded. Scraping messages would pass even if the rebuild silently hung.
 #
 # Usage (same conventions as run_suite.sh -- no credentials are stored here):
-#   HEAPDOCTOR_SQLCMD='docker exec -i sqltest-2025 /opt/.../sqlcmd -S localhost -U sa -P <pw> -C' \
-#     bash tests/test_lock_timeout.sh
+#   bash tools/rig-use.sh use 2025
+#   HEAPDOCTOR_SQLCMD='bash tools/rig-use.sh sqlcmd 2025' bash tests/test_lock_timeout.sh
 #   bash tests/test_lock_timeout.sh -S <server> -U <user> -P <password>
+#
+# WARNING: this runs 01_setup_test_data.sql, which DROPS and rebuilds HeapDoctorTest.
 #
 # Exit status: 0 all assertions passed, 1 an assertion failed, 2 setup error.
 

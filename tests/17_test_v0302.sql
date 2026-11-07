@@ -114,12 +114,15 @@ CREATE TABLE dbo.HeapLobTest
 CREATE UNIQUE NONCLUSTERED INDEX UX_HeapLobTest_ID ON dbo.HeapLobTest(ID);
 
 -- Insert enough rows + create forwarded records
+-- One commit for the whole fixture: a commit per row waits on a log flush each time.
 DECLARE @i17 int = 1;
+BEGIN TRANSACTION;
 WHILE @i17 <= 20000
 BEGIN
     INSERT dbo.HeapLobTest(ID, Col1, Col2) VALUES (@i17, @i17, REPLICATE(N'X', 10));
     SET @i17 += 1;
 END
+COMMIT TRANSACTION;
 
 -- Cause forwarded records by expanding rows
 UPDATE dbo.HeapLobTest SET Col2 = REPLICATE(N'Y', 50);
@@ -208,12 +211,15 @@ CREATE TABLE dbo.HeapCiTest
 );
 CREATE UNIQUE NONCLUSTERED INDEX UX_HeapCiTest_ID ON dbo.HeapCiTest(ID);
 
+-- One commit for the whole fixture: a commit per row waits on a log flush each time.
 DECLARE @j17 int = 1;
+BEGIN TRANSACTION;
 WHILE @j17 <= 20000
 BEGIN
     INSERT dbo.HeapCiTest(ID, Col1, Col2) VALUES (@j17, @j17, REPLICATE(N'X', 10));
     SET @j17 += 1;
 END
+COMMIT TRANSACTION;
 UPDATE dbo.HeapCiTest SET Col2 = REPLICATE(N'Y', 50);
 
 DELETE FROM #Results;
