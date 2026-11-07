@@ -55,7 +55,9 @@ LABEL_TO_PRIORITY = {
     'p4-deferred':     4,
 }
 
-data = json.load(open(sys.argv[1]))
+# bd writes UTF-8. Without the encoding, Windows decodes with the console code
+# page and fails on the first non-ASCII character in any bead.
+data = json.load(open(sys.argv[1], encoding='utf-8'))
 rows = data if isinstance(data, list) else data.get('issues', data.get('beads', []))
 
 for row in rows:

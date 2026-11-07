@@ -86,12 +86,18 @@ echo "=== 3/3  cross-checking open beads against GitHub ==="
 # --prefer-github). So the wrapper verifies the invariant it exists to
 # maintain: no bead may be open whose GitHub issue is closed. Stragglers get a
 # targeted `bd github pull`, which bypasses the watermark.
+#
+# The JSON is read as bytes: bd writes UTF-8, and a text-mode stdin on Windows
+# decodes it with the console code page and fails on the first non-ASCII
+# character. A parse failure fails the sync. It used to exit 0, which reported
+# "none" for a cross-check that never ran.
 STALE=$(bd list --json 2>/dev/null | python3 -c '
 import sys, json, subprocess
 try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
+    data = json.load(sys.stdin.buffer)
+except Exception as e:
+    print(f"cross-check: could not parse bd list output: {e}", file=sys.stderr)
+    sys.exit(3)
 rows = data if isinstance(data, list) else data.get("issues", data.get("beads", []))
 open_beads = {}
 for r in rows:
@@ -106,7 +112,7 @@ gh_open = {str(x["number"]) for x in json.loads(gh.stdout or "[]")}
 for num, bead in open_beads.items():
     if num not in gh_open:
         print(bead)
-')
+') || { echo "error: the open-bead cross-check could not run." >&2; exit 1; }
 
 if [ -n "$STALE" ]; then
     COUNT=$(printf '%s\n' "$STALE" | grep -c '[^[:space:]]')
