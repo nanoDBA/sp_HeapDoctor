@@ -10,6 +10,19 @@
 #   bash tools/rig-use.sh release                       # release only; leaves the container running
 #   bash tools/rig-use.sh status
 #   bash tools/rig-use.sh sqlcmd <year> [sqlcmd args]   # run sqlcmd in that container, under our lease
+#   bash tools/rig-use.sh run-create <year> [--wait]    # fresh environment for one version; versions may overlap
+#   bash tools/rig-use.sh run-sqlcmd <year> [sqlcmd args]  # run sqlcmd in that fresh environment
+#   bash tools/rig-use.sh run-destroy <year>            # remove that fresh environment and release its slot
+#   bash tools/rig-use.sh run-list                      # the fresh environments this machine created
+#
+# TWO WAYS IN.  "use" takes the whole rig and reuses one long-lived environment
+# per version, one version at a time.  "run-create" takes a slot for ONE version
+# and builds a fresh environment from the staged data, so 2019, 2022 and 2025 can
+# run side by side and nothing needs cleaning up by hand between runs.  The two
+# exclude each other: a slot waits while the whole rig is held, and "use" is
+# refused while any slot is live.  Each run has its own lease owner,
+# "sp_HeapDoctor-<run id>", and the control script deletes only the container and
+# volume that carry that run id.
 #
 # The sqlcmd verb is what the test scripts connect through.  From the repo root:
 #
@@ -58,7 +71,7 @@ READY_TIMEOUT_SECONDS=300
 SQLCMD_PATH="/opt/mssql-tools18/bin/sqlcmd"
 
 usage() {
-    sed -n '7,12p' "${BASH_SOURCE[0]}" | sed 's/^# */usage: /' >&2
+    sed -n '7,16p' "${BASH_SOURCE[0]}" | sed 's/^# */usage: /' >&2
     exit 2
 }
 
@@ -170,6 +183,54 @@ exec docker exec -i -e SQLCMDPASSWORD $(printf '%q' "$container") $SQLCMD_PATH -
 "
 }
 
+# ---- Fresh per-version environments ("run slots") ----------------------------
+#
+# The run id and container name of each run this machine created are kept
+# outside the repo, one file per version, so a later call (or a later session)
+# can find and destroy it.
+RUN_STATE_DIR="${RIG_RUN_STATE_DIR:-$HOME/.cache/sp_HeapDoctor-rig}"
+RUN_LEASE_MINUTES=180
+
+run_state_file() { echo "$RUN_STATE_DIR/run-$1"; }
+
+# Sets RUN_ID, RUN_OWNER and RUN_CONTAINER for a version, or exits 3.
+load_run() {
+    local year="$1" file
+    file=$(run_state_file "$year")
+    if [ ! -f "$file" ]; then
+        echo "rig-use: no fresh environment recorded for $year.  Run 'tools/rig-use.sh run-create $year' first." >&2
+        exit 3
+    fi
+    read -r RUN_ID RUN_CONTAINER < <(tr -d '\r' < "$file")
+    case "$RUN_ID" in
+        *[!0-9a-f]*|"") echo "rig-use: $file is not a run record." >&2; exit 3 ;;
+    esac
+    [ "${#RUN_ID}" -eq 32 ] || { echo "rig-use: $file is not a run record." >&2; exit 3; }
+    RUN_OWNER="$OWNER-$RUN_ID"
+}
+
+# Same contract as run_sqlcmd, against a run's own container and its own lease.
+run_sqlcmd_fresh() {
+    local year="$1" ctl args="" arg
+    shift
+    load_run "$year"
+    ctl=$(printf '%q' "$RIG_CONTROL")
+    for arg in "$@"; do args+=" $(printf '%q' "$arg")"; done
+
+    ssh "${SSH_OPTS[@]}" "$RIG_SSH_HOST" "
+lease=\$($ctl lock status </dev/null | grep -F 'held by $RUN_OWNER, version=$year, ')
+case \"\$lease\" in
+    'held by $RUN_OWNER, version=$year, -'*) echo \"rig-use: the lease for this run has expired (\$lease).  Not connecting.\" >&2; exit 3 ;;
+    'held by $RUN_OWNER, version=$year, '*) ;;
+    *) echo 'rig-use: this run does not hold a lease for $year.  Not connecting.' >&2; exit 3 ;;
+esac
+SQLCMDPASSWORD=\$($ctl password $year </dev/null) || exit 3
+[ -n \"\$SQLCMDPASSWORD\" ] || { echo 'rig-use: no SA password available for $year.' >&2; exit 3; }
+export SQLCMDPASSWORD
+exec docker exec -i -e SQLCMDPASSWORD $(printf '%q' "$RUN_CONTAINER") $SQLCMD_PATH -S localhost -U sa -C$args
+"
+}
+
 # Returns once startup recovery has finished AND every database is ONLINE, printing
 # its build.  Logins are accepted, and a state check passes, before user databases
 # have actually started.  A DROP DATABASE in that window removes the database from
@@ -245,6 +306,99 @@ case "$ACTION" in
         require_config
         run_sqlcmd "$YEAR" "$@"
         exit $?
+        ;;
+
+    run-create)
+        YEAR="${1:-}"
+        WAIT=0
+        [ "${2:-}" = "--wait" ] && WAIT=1
+        require_year "$YEAR"
+        require_config
+        if [ -f "$(run_state_file "$YEAR")" ]; then
+            echo "rig-use: a fresh environment for $YEAR is already recorded.  Destroy it first with 'run-destroy $YEAR'." >&2
+            exit 2
+        fi
+        # A slot waits on the rig host while the whole rig is held, so say so up
+        # front instead of blocking silently.  This is a courtesy check, not the
+        # gate: the control script is the gate.
+        LEASES=$(control 120 lock status) || { echo "rig-use: could not reach the lock.  Nothing was touched." >&2; exit 1; }
+        if printf '%s\n' "$LEASES" | grep -q '^held by ' && ! printf '%s\n' "$LEASES" | grep -q 'version='; then
+            if [ "$WAIT" -eq 0 ]; then
+                echo "rig-use: slot REFUSED -- the whole rig is held ($LEASES).  Nothing was touched." >&2
+                echo "rig-use: wait for it, or re-run with --wait." >&2
+                exit 2
+            fi
+            echo "rig-use: the whole rig is held ($LEASES) -- waiting for it."
+        fi
+        if printf '%s\n' "$LEASES" | grep -q "version=$YEAR," && [ "$WAIT" -eq 0 ]; then
+            echo "rig-use: slot REFUSED -- another run holds $YEAR.  Nothing was touched." >&2
+            exit 2
+        fi
+        RUN_ID=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+        RUN_OWNER="$OWNER-$RUN_ID"
+        mkdir -p "$RUN_STATE_DIR"
+        # Recorded before anything is created, so a failure below still leaves a
+        # record that run-destroy can act on.
+        echo "$RUN_ID pending" > "$(run_state_file "$YEAR")"
+        if ! control 7500 lock acquire "$RUN_OWNER" "$RUN_LEASE_MINUTES"; then
+            rm -f "$(run_state_file "$YEAR")"
+            echo "rig-use: could not take a slot lease.  Nothing was created." >&2
+            exit 1
+        fi
+        CREATED=$(control 7500 run create "$YEAR" "$RUN_ID" "$RUN_OWNER")
+        RC=$?
+        printf '%s\n' "$CREATED"
+        RUN_CONTAINER=$(printf '%s\n' "$CREATED" | sed -n 's/^run ready: .* container=\([^ ]*\) .*/\1/p' | tail -1)
+        if [ "$RC" -ne 0 ] || [ -z "$RUN_CONTAINER" ]; then
+            echo "rig-use: run create $YEAR failed; the record is kept.  Run 'tools/rig-use.sh run-destroy $YEAR' to clean up." >&2
+            exit 1
+        fi
+        echo "$RUN_ID $RUN_CONTAINER" > "$(run_state_file "$YEAR")"
+        BUILD=$(run_sqlcmd_fresh "$YEAR" -h-1 -W -Q "SET NOCOUNT ON; SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion'));" </dev/null 2>/dev/null | tr -d '[:space:]')
+        case "$BUILD" in
+            [0-9]*.[0-9]*.[0-9]*) echo "rig-use: READY: fresh $YEAR, build $BUILD." ;;
+            *) echo "rig-use: fresh $YEAR was created but did not answer a query.  Run 'run-destroy $YEAR' to clean up." >&2; exit 1 ;;
+        esac
+        ;;
+
+    run-sqlcmd)
+        YEAR="${1:-}"
+        require_year "$YEAR"
+        shift
+        require_config
+        run_sqlcmd_fresh "$YEAR" "$@"
+        exit $?
+        ;;
+
+    run-destroy)
+        YEAR="${1:-}"
+        require_year "$YEAR"
+        require_config
+        load_run "$YEAR"
+        # Destroy needs a live lease, and ours may have expired during a long run.
+        # Acquiring again only extends our own lease.
+        if ! control 7500 lock acquire "$RUN_OWNER" "$RUN_LEASE_MINUTES"; then
+            echo "rig-use: could not renew the lease for this run.  Nothing was removed." >&2
+            exit 1
+        fi
+        if ! control 600 run destroy "$YEAR" "$RUN_ID" "$RUN_OWNER"; then
+            echo "rig-use: run destroy $YEAR failed; the record and the lease are kept.  Investigate, then retry." >&2
+            exit 1
+        fi
+        if ! control 120 lock release "$RUN_OWNER"; then
+            echo "rig-use: the run is gone but its lease was not released.  Retry 'run-destroy $YEAR'." >&2
+            exit 1
+        fi
+        rm -f "$(run_state_file "$YEAR")"
+        ;;
+
+    run-list)
+        for YEAR in 2019 2022 2025; do
+            if [ -f "$(run_state_file "$YEAR")" ]; then
+                read -r RUN_ID RUN_CONTAINER < <(tr -d '\r' < "$(run_state_file "$YEAR")")
+                echo "$YEAR run=$RUN_ID container=$RUN_CONTAINER"
+            fi
+        done
         ;;
 
     *)
