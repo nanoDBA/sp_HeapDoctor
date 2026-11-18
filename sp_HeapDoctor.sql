@@ -826,6 +826,29 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT OFF; /* Ensure CATCH blocks execute even if caller set XACT_ABORT ON (#66) */
 
+    /*
+    Reject execution while the caller owns a transaction or implicit mode is
+    on.  This guard uses raw arguments before execution mode normalization.
+    */
+    IF ISNULL(@Help, 0) = 0
+    AND @RevealKey IS NULL
+    AND ISNULL(@CheckPermissionsOnly, 0) = 0
+    AND ISNULL(@GenerateScript, 0) = 0
+    AND
+    (
+        (@Execute IS NULL AND ISNULL(@PlanOnly, 1) = 0)
+        OR UPPER(@Execute) = N'Y'
+    )
+    AND
+    (
+        @@TRANCOUNT > 0
+        OR (@@OPTIONS & 2) = 2
+    )
+    BEGIN
+        RAISERROR(N'sp_HeapDoctor cannot execute while a caller transaction is active or IMPLICIT_TRANSACTIONS is ON.', 16, 1);
+        RETURN;
+    END
+
     DECLARE @Version nvarchar(20) = N'2026.08.02.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
