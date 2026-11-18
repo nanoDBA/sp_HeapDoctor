@@ -846,7 +846,7 @@ BEGIN
         OR (@@OPTIONS & 2) = 2
     )
     BEGIN
-        RAISERROR(N'sp_HeapDoctor cannot execute while a caller transaction is active or IMPLICIT_TRANSACTIONS is ON.', 16, 1);
+        RAISERROR(N'sp_HeapDoctor cannot execute while a caller transaction is active or IMPLICIT_TRANSACTIONS is ON, or inside INSERT...EXEC. Use @PlanOnly=1 to capture the result set with INSERT...EXEC.', 16, 1);
         RETURN;
     END
 
@@ -942,6 +942,8 @@ COMMON PARAMETERS:
                                         implies all tables when @Tables is NULL.
   @PlanOnly          bit     = 1       1=print commands only, 0=execute.
   @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
+  Real execution is refused inside INSERT...EXEC because it opens a transaction.
+  Use @PlanOnly=1 to capture the result set with INSERT...EXEC.
   @TopN              integer     = 25      Max targets per database.
 ', 10, 1) WITH NOWAIT;
 

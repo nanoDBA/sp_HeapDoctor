@@ -475,3 +475,47 @@ GO
 DROP TABLE dbo.NLFHTestHeap;
 DROP TABLE dbo.NLFHTransactionMarker;
 GO
+
+/*#region 44F-INSERT-EXEC-EXECUTION*/
+DECLARE
+    @insert_exec_returned bit = 0,
+    @insert_exec_error nvarchar(2048) = NULL,
+    @result_rows_before bigint,
+    @result_rows_after bigint;
+
+SELECT @result_rows_before = COUNT_BIG(*) FROM #Results;
+
+BEGIN TRY
+    INSERT INTO #Results
+    EXECUTE dbo.sp_HeapDoctor
+        @Databases = N'HeapDoctorTest',
+        @Tables = N'dbo.HeapA',
+        @CpuSource = N'NONE',
+        @PlanOnly = 0,
+        @Execute = N'Y',
+        @IncludeHealthyHeaps = 1,
+        @LogToTable = N'N';
+
+    SET @insert_exec_returned = 1;
+END TRY
+BEGIN CATCH
+    SET @insert_exec_error = ERROR_MESSAGE();
+END CATCH;
+
+SELECT @result_rows_after = COUNT_BIG(*) FROM #Results;
+
+IF @insert_exec_returned = 0
+AND @insert_exec_error LIKE N'%INSERT...EXEC%'
+AND @result_rows_after = @result_rows_before
+    RAISERROR(N'PASS 44F: INSERT...EXEC cannot capture an execution run; plan-only capture remains supported.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @failure_44f nvarchar(2048) = N'FAIL 44F: returned='
+        + CONVERT(nvarchar(10), @insert_exec_returned)
+        + N' error=' + ISNULL(@insert_exec_error, N'NULL')
+        + N' result_rows_before=' + CONVERT(nvarchar(20), @result_rows_before)
+        + N' result_rows_after=' + CONVERT(nvarchar(20), @result_rows_after) + N'.';
+    RAISERROR(N'%s', 10, 1, @failure_44f) WITH NOWAIT;
+END
+GO
+/*#endregion*/
