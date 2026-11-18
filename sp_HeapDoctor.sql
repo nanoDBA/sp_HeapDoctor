@@ -6137,6 +6137,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @cur_warning_severity   varchar(16),   /* #185: advisory tier for this target */
             @cur_has_forced_plans   bit,           /* #185: structural churn signal */
             @versioning_sql         nvarchar(max),
+            @versioning_reenable_ddl nvarchar(max), /* #218: one valid target-context re-enable statement */
             @versioning_log_id      integer,       /* #141: CommandLog breadcrumb for temporal versioning */
             @has_paused_op          bit,
             @preflight_sessions     integer,
@@ -7097,13 +7098,15 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
                     + N' SET (SYSTEM_VERSIONING = OFF);';
 
+                /* #218: SYSTEM_VERSIONING requires a two-part history name inside its target database. */
+                SET @versioning_reenable_ddl = N'USE ' + QUOTENAME(@db) + N'; ALTER TABLE '
+                    + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                    + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
+                    + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
+
                 /* #141: Breadcrumb with re-enable DDL in Command column (recovery if KILLed) */
                 IF @commandlog_exists = 1
                 BEGIN
-                    DECLARE @versioning_reenable_ddl nvarchar(max) = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
-                        + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
-                        + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
-                        + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
                     INSERT INTO dbo.CommandLog
                         (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime)
                     VALUES
@@ -7704,12 +7707,8 @@ DEALLOCATE fk_child_cursor;';
                 /* #84: Re-enable SYSTEM_VERSIONING after successful temporal history rebuild */
                 IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
                 BEGIN
-                    SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
-                        + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
-                        + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
-                        + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
                     BEGIN TRY
-                        EXECUTE sys.sp_executesql @versioning_sql;
+                        EXECUTE sys.sp_executesql @versioning_reenable_ddl;
                         SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) + N'.';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -7839,12 +7838,8 @@ DEALLOCATE fk_child_cursor;';
                 /* #84: Re-enable SYSTEM_VERSIONING after failed temporal history rebuild */
                 IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
                 BEGIN
-                    SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
-                        + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
-                        + N' SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = '
-                        + QUOTENAME(@db) + N'.' + QUOTENAME(@schema) + N'.' + QUOTENAME(@tbl) + N'));';
                     BEGIN TRY
-                        EXECUTE sys.sp_executesql @versioning_sql;
+                        EXECUTE sys.sp_executesql @versioning_reenable_ddl;
                         SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
                                  + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
                                  + N' (rebuild failed, but versioning restored).';
