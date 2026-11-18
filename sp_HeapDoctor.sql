@@ -6320,6 +6320,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @pre_row_count       bigint, /* #188: pre-rebuild count, same source as @post_row_count */
             @rowcount_sql        nvarchar(max), /* #188: shared row-count probe */
             @ci_drop_failed      bit,
+            @ci_drop_error_number integer,
+            @ci_drop_error_message nvarchar(1000),
             @cur_index_name      sysname,
             /* QS performance snapshot (per-target, from #Targets) */
             @cur_qs_snapshot_utc    datetime2(3),
@@ -7490,6 +7492,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 but warn loudly so the DBA can manually drop the temp CI.
                 */
                 SET @ci_drop_failed = 0;
+                SET @ci_drop_error_number = NULL;
+                SET @ci_drop_error_message = NULL;
                 IF @ci_drop IS NOT NULL
                 BEGIN
                     SET @Msg = N'  Dropping temp clustered index on ' + @display_full + N'...';
@@ -7520,8 +7524,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END TRY
                     BEGIN CATCH
                         SET @ci_drop_failed = 1;
-                        DECLARE @ci_drop_error_number int = ERROR_NUMBER();
-                        DECLARE @ci_drop_error_message nvarchar(1000) = CASE WHEN @obfuscate = 1
+                        SET @ci_drop_error_number = ERROR_NUMBER();
+                        SET @ci_drop_error_message = CASE WHEN @obfuscate = 1
                             THEN N'CI swap drop failed (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
                             ELSE LEFT(ERROR_MESSAGE(), 1000) END;
                         DECLARE @ci_drop_display_full nvarchar(512) = CASE WHEN @obfuscate = 1
@@ -7541,8 +7545,6 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                  + N'. The table is now a clustered table, NOT a heap.'
                                  + N' Forwarded records are eliminated.'
                                  + N' To restore heap: ' + @ci_drop_display_ddl;
-                        RAISERROR(@Msg, 16, 1) WITH NOWAIT;
-
                         /* #102: Log CI_SWAP_DROP_FAILED to CommandLog with remediation DDL */
                         IF @commandlog_exists = 1
                         BEGIN
@@ -7577,6 +7579,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         /* Restore lock timeout (prefix ran but suffix did not due to error) */
                         IF @LockTimeoutMs IS NOT NULL
                             EXECUTE sys.sp_executesql @LockSuffix;
+
+                        /* Persist remediation and restore session settings before
+                           propagating the target failure to the outer CATCH. */
+                        RAISERROR(@Msg, 16, 1) WITH NOWAIT;
                     END CATCH
                 END
 
@@ -8056,10 +8062,14 @@ DEALLOCATE fk_child_cursor;';
                     ELSE CONVERT(nvarchar(10), @elapsed_ms / 1000) + N's'
                 END;
 
-                SET @err_number = ERROR_NUMBER();
-                SET @err_message = CASE WHEN @obfuscate = 1
-                    THEN N'Heap rebuild failed (SQL error ' + CONVERT(nvarchar(10), @err_number) + N').'
-                    ELSE ERROR_MESSAGE() END;
+                SET @err_number = CASE WHEN @ci_drop_failed = 1
+                                             THEN COALESCE(@ci_drop_error_number, ERROR_NUMBER())
+                                       ELSE ERROR_NUMBER() END;
+                SET @err_message = CASE WHEN @ci_drop_failed = 1
+                                             THEN COALESCE(@ci_drop_error_message, N'CI swap drop failed.')
+                                       WHEN @obfuscate = 1
+                                             THEN N'Heap rebuild failed (SQL error ' + CONVERT(nvarchar(10), @err_number) + N').'
+                                       ELSE ERROR_MESSAGE() END;
 
                 /* Restore lock timeout (prefix ran but suffix did not due to error) */
                 IF @LockTimeoutMs IS NOT NULL
@@ -8069,7 +8079,8 @@ DEALLOCATE fk_child_cursor;';
                   SET end_time = @end,
                       succeeded = 0,
                       error_number = @err_number,
-                      error_message = @err_message
+                      error_message = @err_message,
+                      recovery_required = CASE WHEN @ci_drop_failed = 1 THEN 1 ELSE recovery_required END
                 WHERE target_id = @tid;
 
                 SET @Msg = N'  FAILED (' + @elapsed_fmt + N'): '
@@ -8202,6 +8213,8 @@ DEALLOCATE fk_child_cursor;';
                 UPDATE qhr
                 SET qhr.TableEndTime = SYSDATETIME(),
                     qhr.Status = CASE
+                                     WHEN EXISTS (SELECT 1 FROM #ExecLog el WHERE el.target_id = @tid AND el.recovery_required = 1)
+                                         THEN N'RECOVERY_REQUIRED'
                                      WHEN EXISTS (SELECT 1 FROM #ExecLog el WHERE el.target_id = @tid AND el.succeeded = 1)
                                          THEN N'SUCCEEDED'
                                      WHEN EXISTS (SELECT 1 FROM #ExecLog el WHERE el.target_id = @tid AND el.succeeded = 0 AND el.error_number IS NOT NULL)
@@ -8237,7 +8250,7 @@ DEALLOCATE fk_child_cursor;';
         @ObfuscateKey is set, so the stream inherits obfuscation.
 
         Outcome mapping:
-            succeeded = 1 AND recovery_required = 1 -> RECOVERY_REQUIRED
+            recovery_required = 1                 -> RECOVERY_REQUIRED
             succeeded = 1                           -> SUCCEEDED
             succeeded = 0                           -> FAILED
             succeeded IS NULL                       -> SKIPPED
@@ -8269,9 +8282,9 @@ DEALLOCATE fk_child_cursor;';
                             ISNULL(el.end_time, el.start_time) AS EventTime,
                             N'TARGET_DISPOSITION'              AS EventCode,
                             CONVERT(bit, 1)                    AS IsTerminalEvent,
-                            CASE WHEN el.succeeded IS NULL     THEN N'SKIPPED'
+                            CASE WHEN el.recovery_required = 1 THEN N'RECOVERY_REQUIRED'
+                                 WHEN el.succeeded IS NULL     THEN N'SKIPPED'
                                  WHEN el.succeeded = 0         THEN N'FAILED'
-                                 WHEN el.recovery_required = 1 THEN N'RECOVERY_REQUIRED'
                                  ELSE N'SUCCEEDED' END         AS OutcomeCode,
                             ISNULL(el.error_message, N'')      AS MessageText,
                             @@SPID                             AS SessionId,
