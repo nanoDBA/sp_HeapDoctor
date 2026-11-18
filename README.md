@@ -987,7 +987,7 @@ This query joins the before-snapshot `query_hash` values against current Query S
 
 ## Obfuscation for External Sharing
 
-When sharing diagnostic reports with consultants, forums, or audit teams, real database and table names can expose sensitive information about your environment.  The obfuscation feature replaces all object names with deterministic hex pseudonyms (e.g., `DB_AA92F53B`, `S_9F96C397`, `T_43306ED0`) in result sets, CommandLog entries, and execution logs.  RAISERROR progress messages in the session continue to show real names.
+When sharing diagnostic reports with consultants, forums, or audit teams, real database and table names can expose sensitive information about your environment. The obfuscation feature replaces object names with deterministic hex pseudonyms (e.g., `DB_AA92F53B`, `S_9F96C397`, `T_43306ED0`) in result sets, CommandLog entries, execution logs, and session progress messages. The logged invocation retains non-sensitive options while masking database and table filters, the output table, passphrase, and seed.
 
 For the full walkthrough -- reveal workflows, cross-environment comparison, joining the
 mapping back to CommandLog history, and a complete worked example -- see

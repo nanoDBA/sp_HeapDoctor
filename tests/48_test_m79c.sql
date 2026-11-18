@@ -13,20 +13,42 @@ VALUES
     (N'%M79CSecret,Key%'),
     (N'%M79CPrivateGroup%'),
     (N'%M79CPrivateGroupFile%'),
+    (N'%M79CMismatchHeap%'),
+    (N'%M79CMismatchSecretKey%'),
+    (N'%M79CMismatchAlternateKey%'),
+    (N'%UX_M79CMismatchKey%'),
     (N'%UX_M79CSecretKey%'),
     (N'%M79CTemporalParent%'),
     (N'%M79CTemporalHistory%');
 
 /*#region 48A-FIXTURE*/
 ALTER DATABASE HeapDoctorTest ADD FILEGROUP M79CTestHeap;
-ALTER DATABASE HeapDoctorTest
-    ADD FILE
-    (
-        NAME = N'M79CPrivateGroupFile',
-        FILENAME = N'/var/opt/mssql/data/M79CPrivateGroup.ndf',
-        SIZE = 8MB
-    )
-    TO FILEGROUP M79CTestHeap;
+DECLARE
+    @data_file_path nvarchar(4000),
+    @data_directory nvarchar(4000),
+    @path_separator_position int,
+    @add_file_sql nvarchar(max);
+
+SELECT TOP (1) @data_file_path = physical_name
+FROM sys.database_files
+WHERE file_id = 1;
+
+SET @path_separator_position = CASE
+    WHEN CHARINDEX(N'/', REVERSE(@data_file_path)) > 0
+        THEN CHARINDEX(N'/', REVERSE(@data_file_path))
+    ELSE CHARINDEX(N'\', REVERSE(@data_file_path))
+END;
+SET @data_directory = LEFT(@data_file_path, LEN(@data_file_path) - @path_separator_position + 1);
+SET @add_file_sql = N'ALTER DATABASE [HeapDoctorTest] ADD FILE
+    (NAME = N''M79CPrivateGroupFile'', FILENAME = N'''
+    + REPLACE(@data_directory + N'M79CPrivateGroup.ndf', N'''', N'''''')
+    + N''', SIZE = 8MB) TO FILEGROUP [M79CTestHeap];';
+EXECUTE sys.sp_executesql @add_file_sql;
+SET @add_file_sql = N'ALTER DATABASE [HeapDoctorTest] ADD FILE
+    (NAME = N''M79CPrivateGroupFile2'', FILENAME = N'''
+    + REPLACE(@data_directory + N'M79CPrivateGroup2.ndf', N'''', N'''''')
+    + N''', SIZE = 8MB) TO FILEGROUP [M79CTestHeap];';
+EXECUTE sys.sp_executesql @add_file_sql;
 
 CREATE TABLE dbo.M79CTestHeap
 (
@@ -69,7 +91,8 @@ DECLARE
     @plan_command nvarchar(max),
     @plan_filegroup sysname,
     @expected_filegroup sysname,
-    @expected_key_cols nvarchar(max);
+    @expected_key_cols nvarchar(max),
+    @plan_invocation_command nvarchar(max);
 
 SELECT @plan_log_start = COALESCE(MAX(ID), 0)
 FROM dbo.CommandLog;
@@ -78,6 +101,8 @@ INSERT INTO #PlanResults
 EXECUTE dbo.sp_HeapDoctor
     @Databases = N'HeapDoctorTest',
     @Tables = N'dbo.M79CTestHeap',
+    @ExcludeDatabases = N'NeverMatchDatabase%',
+    @ExcludeTables = N'dbo.NeverMatchTable',
     @CpuSource = N'NONE',
     @PlanOnly = 1,
     @LogToTable = N'Y',
@@ -191,6 +216,154 @@ IF EXISTS
     RAISERROR(N'FAIL 48C: a plan-only CommandLog row exposes a real object, column, index, or filegroup name.', 10, 1) WITH NOWAIT;
 ELSE
     RAISERROR(N'PASS 48C: all plan-only CommandLog rows hide real object, column, index, and filegroup names.', 10, 1) WITH NOWAIT;
+
+SELECT TOP (1) @plan_invocation_command = cl.Command
+FROM dbo.CommandLog AS cl
+WHERE cl.CommandType = N'HEAP_SCAN_SUMMARY'
+  AND cl.ExtendedInfo.exist(N'/ScanSummary/RunID[text()=sql:variable("@plan_run_id")]') = 1
+ORDER BY cl.ID DESC;
+
+IF @plan_invocation_command LIKE N'%@AllowCiSwap = 1%'
+AND @plan_invocation_command LIKE N'%@PreferCiSwap = 1%'
+AND @plan_invocation_command LIKE N'%@OnlinePreference = N''ON''%'
+AND @plan_invocation_command LIKE N'%@MinPages = 10%'
+AND CHARINDEX(N'@Databases = N''[obfuscated]''', @plan_invocation_command) > 0
+AND CHARINDEX(N'@ExcludeDatabases = N''[obfuscated]''', @plan_invocation_command) > 0
+AND CHARINDEX(N'@Tables = N''[obfuscated]''', @plan_invocation_command) > 0
+AND CHARINDEX(N'@ExcludeTables = N''[obfuscated]''', @plan_invocation_command) > 0
+AND CHARINDEX(N'@OutputTable = N''[obfuscated]''', @plan_invocation_command) > 0
+AND CHARINDEX(N'@ObfuscateKey = N''***''', @plan_invocation_command) > 0
+AND CHARINDEX(N'@ObfuscateSeed = N''***''', @plan_invocation_command) > 0
+    RAISERROR(N'PASS 48K: invocation logging preserves safe options and masks names and secrets.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'FAIL 48K: invocation logging omits safe options or exposes a name or secret.', 10, 1) WITH NOWAIT;
+GO
+/*#endregion*/
+
+/*#region 48K-MISMATCHED-KEY-METADATA*/
+CREATE TABLE dbo.M79CMismatchHeap
+(
+    ID int NOT NULL,
+    M79CMismatchSecretKey int NOT NULL,
+    M79CMismatchAlternateKey int NOT NULL,
+    Padding varchar(4000) NOT NULL
+) ON M79CTestHeap;
+
+;WITH N AS
+(
+    SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+    FROM sys.all_objects AS a
+    CROSS JOIN sys.all_objects AS b
+)
+INSERT dbo.M79CMismatchHeap (ID, M79CMismatchSecretKey, M79CMismatchAlternateKey, Padding)
+SELECT TOP (6000) n, n, n, REPLICATE('A', 10) FROM N;
+UPDATE dbo.M79CMismatchHeap SET Padding = REPLICATE('X', 3000) WHERE ID <= 4000;
+CREATE UNIQUE NONCLUSTERED INDEX UX_M79CMismatchKey
+    ON dbo.M79CMismatchHeap (ID, M79CMismatchSecretKey);
+GO
+
+SELECT * INTO #MismatchPlan
+FROM dbo.ResultsTemplate
+WHERE 1 = 0;
+
+DECLARE
+    @mismatch_run_id uniqueidentifier,
+    @mismatch_original_command nvarchar(max),
+    @mismatch_tampered_command nvarchar(max),
+    @mismatch_action varchar(32),
+    @mismatch_command nvarchar(max),
+    @mismatch_forced bit = 0;
+
+INSERT INTO #MismatchPlan
+EXECUTE dbo.sp_HeapDoctor
+    @Databases = N'HeapDoctorTest',
+    @Tables = N'dbo.M79CMismatchHeap',
+    @CpuSource = N'NONE',
+    @PlanOnly = 1,
+    @LogToTable = N'Y',
+    @MinPages = 10,
+    @MinForwardedPct = 0,
+    @IncludeHealthyHeaps = 1,
+    @AllowCiSwap = 1,
+    @PreferCiSwap = 1,
+    @OnlinePreference = N'ON';
+
+SELECT TOP (1)
+    @mismatch_original_command = command_text
+FROM #MismatchPlan;
+
+SELECT TOP (1)
+    @mismatch_run_id = TRY_CONVERT(uniqueidentifier,
+        ExtendedInfo.value(N'(/ScanSummary/RunID/text())[1]', N'nvarchar(36)'))
+FROM dbo.CommandLog
+WHERE CommandType = N'HEAP_SCAN_SUMMARY'
+  AND ExtendedInfo.exist(N'/ScanSummary/RunID[1]') = 1
+ORDER BY ID DESC;
+
+SET @mismatch_tampered_command = REPLACE
+(
+    @mismatch_original_command,
+    N'[M79CMismatchSecretKey]',
+    N'[M79CMismatchSecretKey], [M79CMismatchAlternateKey]'
+);
+IF @mismatch_tampered_command <> @mismatch_original_command
+    SET @mismatch_forced = 1;
+
+UPDATE dbo.CommandLog
+SET ExtendedInfo.modify
+(
+    'replace value of (/ScanSummary/Targets/Target/@CommandText)[1]
+     with sql:variable("@mismatch_tampered_command")'
+)
+WHERE CommandType = N'HEAP_SCAN_SUMMARY'
+  AND ExtendedInfo.exist(N'/ScanSummary/RunID[text()=sql:variable("@mismatch_run_id")]') = 1;
+
+SELECT * INTO #MismatchResults
+FROM dbo.ResultsTemplate
+WHERE 1 = 0;
+
+INSERT INTO #MismatchResults
+EXECUTE dbo.sp_HeapDoctor
+    @ResumeRunID = @mismatch_run_id,
+    @PlanOnly = 1,
+    @LogToTable = N'Y',
+    @OutputTable = N'dbo.M79CMismatchOutput',
+    @ObfuscateKey = N'regression-obfuscation-key',
+    @ObfuscateSeed = N'fixed-obfuscation-seed-m';
+
+SELECT @mismatch_action = MAX(action_chosen), @mismatch_command = MAX(command_text)
+FROM #MismatchResults;
+
+IF (SELECT COUNT_BIG(*) FROM #MismatchResults) = 1
+AND @mismatch_forced = 1
+AND @mismatch_action LIKE N'CI_SWAP%'
+AND @mismatch_command LIKE N'-- Obfuscated command omitted%'
+AND NOT EXISTS
+(
+    SELECT 1
+    FROM #MismatchResults AS r
+    CROSS APPLY (VALUES (r.command_text), (r.ci_drop_command), (r.verify_command)) AS commands(value)
+    INNER JOIN #M79CForbiddenPatterns AS forbidden ON commands.value LIKE forbidden.pattern
+)
+AND NOT EXISTS
+(
+    SELECT 1
+    FROM dbo.M79CMismatchOutput AS r
+    CROSS APPLY (VALUES (r.command_text)) AS commands(value)
+    INNER JOIN #M79CForbiddenPatterns AS forbidden ON commands.value LIKE forbidden.pattern
+)
+    RAISERROR(N'PASS 48L: stale key metadata causes an omitted, pseudonym-safe command.', 10, 1) WITH NOWAIT;
+ELSE
+BEGIN
+    DECLARE @failure_48l nvarchar(2048) = N'FAIL 48L: action='
+        + ISNULL(@mismatch_action, N'NULL') + N' command='
+        + LEFT(ISNULL(@mismatch_command, N'NULL'), 1500)
+        + N' mismatch_forced=' + CONVERT(nvarchar(1), @mismatch_forced) + N'.';
+    RAISERROR(N'%s', 10, 1, @failure_48l) WITH NOWAIT;
+END
+
+DROP TABLE dbo.M79CMismatchHeap;
+DROP TABLE dbo.M79CMismatchOutput;
 GO
 /*#endregion*/
 
@@ -466,5 +639,13 @@ ELSE
 ALTER TABLE dbo.M79CTemporalParent SET (SYSTEM_VERSIONING = OFF);
 DROP TABLE dbo.M79CTemporalParent;
 DROP TABLE dbo.M79CTemporalHistory;
+DROP TABLE dbo.M79CPlanOutput;
+DROP TABLE dbo.M79CFailureOutput;
+DROP TABLE dbo.M79CTemporalOutput;
+DBCC SHRINKFILE (N'M79CPrivateGroupFile', EMPTYFILE);
+ALTER DATABASE HeapDoctorTest REMOVE FILE M79CPrivateGroupFile;
+DBCC SHRINKFILE (N'M79CPrivateGroupFile2', 1);
+ALTER DATABASE HeapDoctorTest REMOVE FILE M79CPrivateGroupFile2;
+ALTER DATABASE HeapDoctorTest REMOVE FILEGROUP M79CTestHeap;
 GO
 /*#endregion*/

@@ -409,7 +409,7 @@ History:    2026.11.17.1 - Address P1 issues #214 through #219
                             environments (same key+seed = same pseudonyms on any server)
                           - @RevealKey + @RevealRunID: decrypt a prior run's mapping from CommandLog
                           - Encrypted mapping stored in HEAP_REBUILD_START or HEAP_SCAN_SUMMARY ExtendedInfo XML
-                          - RAISERROR messages show real names (session-local, ephemeral)
+                          - RAISERROR progress messages use pseudonyms when obfuscation is enabled
                           - Uses HASHBYTES('SHA2_256') for pseudonyms, ENCRYPTBYPASSPHRASE for mapping
             1.0.2026.0219d - Batch 9: Polish and documentation
                           - Sub-second duration formatting, error truncation 1000 chars
@@ -1024,6 +1024,9 @@ OBFUSCATION PARAMETERS:
   @ObfuscateKey      nvarchar(128) = NULL   Replace real names with 8-char hex pseudonyms.
   @ObfuscateSeed     nvarchar(128) = NULL   Optional seed for cross-environment consistency.
                                             Same key+seed on different servers = same pseudonyms.
+  When obfuscation is enabled, progress messages use pseudonyms. The logged invocation
+  retains non-sensitive options while masking database/table filters, output table,
+  passphrase, and seed.
   @RevealKey         nvarchar(128) = NULL   Decrypt a prior run''s mapping from CommandLog.
   @RevealRunID       uniqueidentifier = NULL  Required with @RevealKey.
 
@@ -1904,9 +1907,30 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     BEGIN
         SET @obfuscated_database_name = N'DB_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
             (N'SHA2_256', @passphrase + ISNULL(@Databases, DB_NAME())), 2), 8);
-        SET @logged_invocation_command = N'EXECUTE dbo.sp_HeapDoctor @RunID = '''
-            + CONVERT(nvarchar(36), @RunID) + N''', @PlanOnly = '
-            + CONVERT(nvarchar(1), @PlanOnly) + N', @ObfuscateKey = N''***'';';
+        SET @logged_invocation_command = @invocation_command;
+        SET @logged_invocation_command = REPLACE(@logged_invocation_command,
+            N'@Databases = N''' + REPLACE(ISNULL(@Databases, DB_NAME()), N'''', N'''''') + N'''',
+            N'@Databases = N''[obfuscated]''');
+        IF @ExcludeDatabases IS NOT NULL
+            SET @logged_invocation_command = REPLACE(@logged_invocation_command,
+                N'@ExcludeDatabases = N''' + REPLACE(@ExcludeDatabases, N'''', N'''''') + N'''',
+                N'@ExcludeDatabases = N''[obfuscated]''');
+        IF @Tables IS NOT NULL
+            SET @logged_invocation_command = REPLACE(@logged_invocation_command,
+                N'@Tables = N''' + REPLACE(@Tables, N'''', N'''''') + N'''',
+                N'@Tables = N''[obfuscated]''');
+        IF @ExcludeTables IS NOT NULL
+            SET @logged_invocation_command = REPLACE(@logged_invocation_command,
+                N'@ExcludeTables = N''' + REPLACE(@ExcludeTables, N'''', N'''''') + N'''',
+                N'@ExcludeTables = N''[obfuscated]''');
+        IF @OutputTable IS NOT NULL
+            SET @logged_invocation_command = REPLACE(@logged_invocation_command,
+                N'@OutputTable = N''' + REPLACE(@OutputTable, N'''', N'''''') + N'''',
+                N'@OutputTable = N''[obfuscated]''');
+        IF @ObfuscateSeed IS NOT NULL
+            SET @logged_invocation_command = REPLACE(@logged_invocation_command,
+                N'@ObfuscateSeed = N''' + REPLACE(@ObfuscateSeed, N'''', N'''''') + N'''',
+                N'@ObfuscateSeed = N''***''');
     END
 
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
@@ -5466,6 +5490,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             real_table_name    sysname        NOT NULL
         );
 
+        CREATE TABLE #ObfuKeyMap
+        (
+            target_id        integer   NOT NULL,
+            key_ordinal      smallint  NOT NULL,
+            real_column_name sysname   NOT NULL,
+            PRIMARY KEY (target_id, key_ordinal)
+        );
+
         INSERT INTO #ObfuMap WITH (TABLOCK)
         SELECT
             target_id,
@@ -5549,7 +5581,24 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                       AND index_column.is_included_column = 0
                 ) AS key_columns
                 WHERE target.database_name = @database_name COLLATE DATABASE_DEFAULT
-                  AND target.key_source_index IS NOT NULL;';
+                  AND target.key_source_index IS NOT NULL;
+
+                INSERT INTO #ObfuKeyMap (target_id, key_ordinal, real_column_name)
+                SELECT target.target_id, index_column.key_ordinal, column_metadata.name
+                FROM #Targets AS target
+                INNER JOIN sys.indexes AS source_index
+                    ON source_index.object_id = target.object_id
+                   AND source_index.name = target.key_source_index COLLATE DATABASE_DEFAULT
+                INNER JOIN sys.index_columns AS index_column
+                    ON index_column.object_id = source_index.object_id
+                   AND index_column.index_id = source_index.index_id
+                INNER JOIN sys.columns AS column_metadata
+                    ON column_metadata.object_id = index_column.object_id
+                   AND column_metadata.column_id = index_column.column_id
+                WHERE target.database_name = @database_name COLLATE DATABASE_DEFAULT
+                  AND target.key_source_index IS NOT NULL
+                  AND index_column.key_ordinal > 0
+                  AND index_column.is_included_column = 0;';
 
             EXECUTE sys.sp_executesql
                 @obfu_key_columns_sql,
@@ -5616,10 +5665,47 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         FROM #Targets t
         JOIN #ObfuMap m ON m.target_id = t.target_id;
 
-        UPDATE #Targets
-        SET pseudo_command_text = N'-- Obfuscated command omitted because key-column metadata could not be resolved.'
-        WHERE action_chosen = 'CI_SWAP_ONLINE'
-          AND pseudo_temp_key_cols IS NULL;
+        UPDATE target
+        SET pseudo_command_text = N'-- Obfuscated command omitted because identifier metadata could not be verified.',
+            pseudo_ci_drop = CASE WHEN ci_drop_command IS NULL THEN NULL
+                                  ELSE N'-- Obfuscated command omitted because identifier metadata could not be verified.' END,
+            pseudo_verify_cmd = CASE WHEN verify_command IS NULL THEN NULL
+                                     ELSE N'-- Obfuscated command omitted because identifier metadata could not be verified.' END
+        FROM #Targets AS target
+        JOIN #ObfuMap AS mapping ON mapping.target_id = target.target_id
+        WHERE EXISTS
+        (
+            SELECT 1
+            FROM (VALUES
+                (target.pseudo_command_text),
+                (target.pseudo_ci_drop),
+                (target.pseudo_verify_cmd)
+            ) AS commands(command_text)
+            WHERE commands.command_text IS NOT NULL
+              AND
+              (
+                    CHARINDEX(mapping.real_db_quoted, commands.command_text) > 0
+                 OR CHARINDEX(mapping.real_schema_quoted, commands.command_text) > 0
+                 OR CHARINDEX(mapping.real_table_quoted, commands.command_text) > 0
+                 OR CHARINDEX(N'CX__Temp__' + LEFT(mapping.real_table_name, 108), commands.command_text) > 0
+                 OR EXISTS
+                    (
+                        SELECT 1
+                        FROM #ObfuKeyMap AS key_mapping
+                        WHERE key_mapping.target_id = target.target_id
+                          AND CHARINDEX(QUOTENAME(key_mapping.real_column_name), commands.command_text) > 0
+                    )
+              )
+        )
+        OR
+        (
+            target.action_chosen = 'CI_SWAP_ONLINE'
+            AND
+            (
+                target.pseudo_temp_key_cols IS NULL
+                OR CHARINDEX(N'(' + target.temp_key_cols + N')', target.pseudo_command_text) > 0
+            )
+        );
 
         DROP TABLE #ObfuMap;
 
