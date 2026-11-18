@@ -859,6 +859,8 @@ BEGIN
     DECLARE @obfuscate      bit            = CASE WHEN @ObfuscateKey IS NOT NULL THEN 1 ELSE 0 END;
     DECLARE @passphrase     nvarchar(max)  = NULL;
     DECLARE @effective_seed nvarchar(128)  = NULL;
+    DECLARE @logged_invocation_command nvarchar(max) = NULL;
+    DECLARE @obfuscated_database_name sysname = NULL;
 
     /* Reproducible invocation command for CommandLog (built after input validation) */
     DECLARE @invocation_command nvarchar(max) = NULL;
@@ -1200,6 +1202,16 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             ORDER BY ID DESC;
         END
 
+        /* A temporal recovery breadcrumb can carry the encrypted recovery DDL when no run summary was stored. */
+        IF @reveal_xml IS NULL
+        BEGIN
+            SELECT TOP (1) @reveal_xml = ExtendedInfo, @reveal_source = N'HEAP_TEMPORAL_VERSIONING_DISABLED'
+            FROM dbo.CommandLog
+            WHERE CommandType = N'HEAP_TEMPORAL_VERSIONING_DISABLED'
+              AND ExtendedInfo.exist(N'/ExtendedInfo/RunID[text()=sql:variable("@RevealRunID")]') = 1
+            ORDER BY ID DESC;
+        END
+
         IF @reveal_xml IS NULL
         BEGIN
             SET @Msg_reveal = N'No obfuscated run found for RunID ' + CONVERT(nvarchar(36), @RevealRunID)
@@ -1216,6 +1228,35 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         BEGIN
             SET @hex_mapping = @reveal_xml.value(N'(/Parameters/ObfuscatedMappingHex)[1]', N'nvarchar(max)');
             SET @stored_seed = @reveal_xml.value(N'(/Parameters/ObfuscateSeed)[1]', N'nvarchar(128)');
+        END
+        ELSE IF @reveal_source = N'HEAP_TEMPORAL_VERSIONING_DISABLED'
+        BEGIN
+            DECLARE @temporal_recovery_hex nvarchar(max) =
+                @reveal_xml.value(N'(/ExtendedInfo/RecoveryDdlHex)[1]', N'nvarchar(max)');
+            SET @stored_seed = @reveal_xml.value(N'(/ExtendedInfo/ObfuscateSeed)[1]', N'nvarchar(128)');
+            DECLARE @temporal_reveal_passphrase nvarchar(max) =
+                @RevealKey + ISNULL(@stored_seed, CONVERT(nvarchar(36), @RevealRunID));
+            DECLARE @temporal_recovery_bytes varbinary(max) = DECRYPTBYPASSPHRASE
+            (
+                @temporal_reveal_passphrase,
+                CONVERT(varbinary(max), @temporal_recovery_hex, 2)
+            );
+
+            IF @temporal_recovery_bytes IS NULL
+            BEGIN
+                RAISERROR(N'Temporal recovery DDL decryption failed. The @RevealKey may not match this RunID.', 16, 1);
+                RETURN;
+            END
+
+            SELECT @RevealRunID AS RunID,
+                   CONVERT(nvarchar(max), @temporal_recovery_bytes) AS RecoveryDDL;
+            SET @TargetsFound = 0;
+            SET @Succeeded = 0;
+            SET @Failed = 0;
+            SET @Skipped = 0;
+            SET @Status = 'SUCCESS';
+            SET @StatusMessage = N'Temporal recovery DDL was decrypted.';
+            RETURN;
         END
         ELSE
         BEGIN
@@ -1258,6 +1299,31 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             t.c.value(N'(real_name)[1]',   N'sysname')       AS real_name
         FROM @mapping_xml.nodes(N'/ObfuscatedMapping/Object') AS t(c)
         ORDER BY object_type, pseudonym;
+
+        DECLARE @recovery_ddl_hex nvarchar(max);
+        SELECT TOP (1) @recovery_ddl_hex = ExtendedInfo.value
+            (N'(/ExtendedInfo/RecoveryDdlHex)[1]', N'nvarchar(max)')
+        FROM dbo.CommandLog
+        WHERE CommandType = N'HEAP_TEMPORAL_VERSIONING_DISABLED'
+          AND ExtendedInfo.exist(N'/ExtendedInfo/RunID[text()=sql:variable("@RevealRunID")]') = 1
+        ORDER BY ID DESC;
+
+        IF @recovery_ddl_hex IS NOT NULL
+        BEGIN
+            DECLARE @recovery_ddl_bytes varbinary(max) = DECRYPTBYPASSPHRASE
+            (
+                @reveal_passphrase,
+                CONVERT(varbinary(max), @recovery_ddl_hex, 2)
+            );
+            IF @recovery_ddl_bytes IS NULL
+            BEGIN
+                RAISERROR(N'Temporal recovery DDL decryption failed. The @RevealKey may not match this RunID.', 16, 1);
+                RETURN;
+            END
+
+            SELECT @RevealRunID AS RunID,
+                   CONVERT(nvarchar(max), @recovery_ddl_bytes) AS RecoveryDDL;
+        END
 
         /*
         #204: informational modes return cleanly without doing work, so the
@@ -1832,6 +1898,15 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     IF @ScanMode <> N'SAMPLED'
         SET @invocation_command += N', @ScanMode = N''' + @ScanMode + N'''';
     SET @invocation_command += N';';
+
+    IF @obfuscate = 1
+    BEGIN
+        SET @obfuscated_database_name = N'DB_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+            (N'SHA2_256', @passphrase + ISNULL(@Databases, DB_NAME())), 2), 8);
+        SET @logged_invocation_command = N'EXECUTE dbo.sp_HeapDoctor @RunID = '''
+            + CONVERT(nvarchar(36), @RunID) + N''', @PlanOnly = '
+            + CONVERT(nvarchar(1), @PlanOnly) + N', @ObfuscateKey = N''***'';';
+    END
 
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
     RAISERROR(N' sp_HeapDoctor - Heap Forwarded Record Mitigation', 10, 1) WITH NOWAIT;
@@ -2486,6 +2561,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         pseudo_schema_name       sysname        NULL,
         pseudo_table_name        sysname        NULL,
         pseudo_key_index         sysname        NULL,
+        pseudo_temp_key_cols     nvarchar(max)  NULL,
+        pseudo_filegroup_name    sysname        NULL,
         pseudo_command_text      nvarchar(max)  NULL,
         pseudo_ci_drop           nvarchar(max)  NULL,
         pseudo_verify_cmd        nvarchar(max)  NULL
@@ -3969,11 +4046,12 @@ END
         IF @Debug = 1
         BEGIN
             SET @dbg_len = LEN(@discovery_sql);
-            SET @Msg = N'-- @Debug: discovery SQL for ' + QUOTENAME(@CurrentDatabaseName) + N', LEN = '
-                     + CONVERT(nvarchar(20), @dbg_len) + N' chars, in 2000-char chunks:';
+            SET @Msg = CASE WHEN @obfuscate = 1 THEN N'-- @Debug: obfuscated discovery SQL omitted.'
+                            ELSE N'-- @Debug: discovery SQL for ' + QUOTENAME(@CurrentDatabaseName) + N', LEN = '
+                               + CONVERT(nvarchar(20), @dbg_len) + N' chars, in 2000-char chunks:' END;
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             SET @dbg_pos = 1;
-            WHILE @dbg_pos <= @dbg_len
+            WHILE @obfuscate = 0 AND @dbg_pos <= @dbg_len
             BEGIN
                 SET @dbg_chunk = SUBSTRING(@discovery_sql, @dbg_pos, 2000);
                 /* Print via the '%s' ARGUMENT, never as the format string itself:
@@ -4268,11 +4346,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         IF @Debug = 1
         BEGIN
             SET @dbg_len = LEN(@QuickieBatch);
-            SET @Msg = N'-- @Debug: QUICKIESTORE batch, LEN = '
-                     + CONVERT(nvarchar(20), @dbg_len) + N' chars, in 2000-char chunks:';
+            SET @Msg = CASE WHEN @obfuscate = 1 THEN N'-- @Debug: obfuscated QUICKIESTORE batch omitted.'
+                            ELSE N'-- @Debug: QUICKIESTORE batch, LEN = '
+                               + CONVERT(nvarchar(20), @dbg_len) + N' chars, in 2000-char chunks:' END;
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             SET @dbg_pos = 1;
-            WHILE @dbg_pos <= @dbg_len
+            WHILE @obfuscate = 0 AND @dbg_pos <= @dbg_len
             BEGIN
                 SET @dbg_chunk = SUBSTRING(@QuickieBatch, @dbg_pos, 2000);
                 /* Print via the '%s' ARGUMENT, never as the format string itself:
@@ -4838,11 +4917,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                  StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
             VALUES
             (
-                ISNULL(@Databases, DB_NAME()),
+                CASE WHEN @obfuscate = 1 THEN @obfuscated_database_name ELSE ISNULL(@Databases, DB_NAME()) END,
                 N'dbo',
                 N'sp_HeapDoctor',
                 N'P',
-                @invocation_command,
+                CASE WHEN @obfuscate = 1 THEN @logged_invocation_command ELSE @invocation_command END,
                 N'HEAP_SCAN_SUMMARY',
                 @start_time,
                 SYSDATETIME(),
@@ -4867,7 +4946,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         CONVERT(bigint, 0) AS TotalForwardedFetchCount,
                         (
                             SELECT
-                                DatabaseName AS [Name],
+                                CASE WHEN @obfuscate = 1
+                                     THEN N'DB_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                          (N'SHA2_256', @passphrase + DatabaseName), 2), 8)
+                                     ELSE DatabaseName END AS [Name],
                                 HeapsQualified,
                                 ScanSeconds
                             FROM @DbScanStats
@@ -5399,6 +5481,108 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             table_name
         FROM #Targets;
 
+        UPDATE t
+        SET pseudo_filegroup_name = CASE WHEN data_space_name IS NOT NULL
+            THEN N'FG_' + LEFT(CONVERT(nvarchar(64), HASHBYTES(N'SHA2_256', @passphrase + data_space_name), 2), 8)
+            ELSE NULL END
+        FROM #Targets AS t;
+
+        /* Render key-column pseudonyms from catalog rows, so commas and escaped brackets stay unambiguous. */
+        DECLARE @obfu_database_name sysname,
+                @obfu_key_columns_sql nvarchar(max);
+        DECLARE obfu_database_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT database_name
+            FROM #Targets
+            WHERE key_source_index IS NOT NULL;
+
+        OPEN obfu_database_cursor;
+        FETCH NEXT FROM obfu_database_cursor INTO @obfu_database_name;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @obfu_key_columns_sql = N'
+                USE ' + QUOTENAME(@obfu_database_name) + N';
+                UPDATE target
+                SET target.object_id = CASE WHEN target.object_id = 0
+                                            THEN COALESCE(table_metadata.object_id, 0) ELSE target.object_id END,
+                    target.temp_key_cols = COALESCE(target.temp_key_cols, key_columns.real_key_cols),
+                    target.pseudo_temp_key_cols = key_columns.pseudo_key_cols
+                FROM #Targets AS target
+                OUTER APPLY
+                (
+                    SELECT TOP (1) table_row.object_id
+                    FROM sys.tables AS table_row
+                    INNER JOIN sys.schemas AS schema_row
+                        ON schema_row.schema_id = table_row.schema_id
+                    WHERE table_row.name = target.table_name COLLATE DATABASE_DEFAULT
+                      AND schema_row.name = target.schema_name COLLATE DATABASE_DEFAULT
+                ) AS table_metadata
+                OUTER APPLY
+                (
+                    SELECT
+                        STRING_AGG
+                        (
+                            CONVERT(nvarchar(max), QUOTENAME(column_metadata.name)),
+                            N'',''
+                        ) WITHIN GROUP (ORDER BY index_column.key_ordinal) AS real_key_cols,
+                        STRING_AGG
+                    (
+                        CONVERT(nvarchar(max), QUOTENAME
+                        (
+                            N''C_'' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                            (
+                                N''SHA2_256'', @passphrase + column_metadata.name
+                            ), 2), 8)
+                        )),
+                        N'',''
+                    ) WITHIN GROUP (ORDER BY index_column.key_ordinal) AS pseudo_key_cols
+                    FROM sys.indexes AS source_index
+                    INNER JOIN sys.index_columns AS index_column
+                        ON index_column.object_id = source_index.object_id
+                       AND index_column.index_id = source_index.index_id
+                    INNER JOIN sys.columns AS column_metadata
+                        ON column_metadata.object_id = index_column.object_id
+                       AND column_metadata.column_id = index_column.column_id
+                    WHERE source_index.object_id = COALESCE(NULLIF(target.object_id, 0), table_metadata.object_id)
+                      AND source_index.name = target.key_source_index COLLATE DATABASE_DEFAULT
+                      AND index_column.key_ordinal > 0
+                      AND index_column.is_included_column = 0
+                ) AS key_columns
+                WHERE target.database_name = @database_name COLLATE DATABASE_DEFAULT
+                  AND target.key_source_index IS NOT NULL;';
+
+            EXECUTE sys.sp_executesql
+                @obfu_key_columns_sql,
+                N'@passphrase nvarchar(max), @database_name sysname',
+                @passphrase = @passphrase,
+                @database_name = @obfu_database_name;
+
+            FETCH NEXT FROM obfu_database_cursor INTO @obfu_database_name;
+        END
+        CLOSE obfu_database_cursor;
+        DEALLOCATE obfu_database_cursor;
+
+        UPDATE t
+        SET pseudo_command_text = CASE
+            WHEN t.temp_key_cols IS NOT NULL AND t.pseudo_temp_key_cols IS NOT NULL
+                THEN REPLACE(t.command_text,
+                    N'(' + t.temp_key_cols + N')',
+                    N'(' + t.pseudo_temp_key_cols + N')')
+            ELSE t.command_text
+        END
+        FROM #Targets AS t;
+
+        UPDATE t
+        SET pseudo_command_text = CASE
+            WHEN t.data_space_name IS NOT NULL
+             AND t.data_space_name <> N'PRIMARY'
+             AND t.pseudo_filegroup_name IS NOT NULL
+                THEN REPLACE(t.pseudo_command_text,
+                    N' ON ' + QUOTENAME(t.data_space_name),
+                    N' ON ' + QUOTENAME(t.pseudo_filegroup_name))
+            ELSE t.pseudo_command_text
+        END
+        FROM #Targets AS t;
+
         /* Apply pseudonyms to pseudo_ columns + REPLACE real names in command strings */
         UPDATE t
         SET
@@ -5407,7 +5591,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             t.pseudo_table_name    = m.pseudo_table,
             t.pseudo_key_index     = m.pseudo_index,
             t.pseudo_command_text  = REPLACE(REPLACE(REPLACE(
-                                        REPLACE(t.command_text,
+                                        REPLACE(t.pseudo_command_text,
                                             N'CX__Temp__' + LEFT(m.real_table_name, 108),
                                             N'CX__Temp__' + LEFT(m.pseudo_table, 108)),
                                         m.real_db_quoted,     QUOTENAME(m.pseudo_db)),
@@ -5430,6 +5614,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                      ELSE NULL END
         FROM #Targets t
         JOIN #ObfuMap m ON m.target_id = t.target_id;
+
+        UPDATE #Targets
+        SET pseudo_command_text = N'-- Obfuscated command omitted because key-column metadata could not be resolved.'
+        WHERE action_chosen = 'CI_SWAP_ONLINE'
+          AND pseudo_temp_key_cols IS NULL;
 
         DROP TABLE #ObfuMap;
 
@@ -5500,7 +5689,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         CONVERT(integer, has_indexed_views) AS has_indexed_views,
         CONVERT(integer, has_fk_references) AS has_fk_references,
         fk_ref_count,
-        data_space_name AS filegroup_name,
+        CASE WHEN @obfuscate = 1 THEN pseudo_filegroup_name ELSE data_space_name END AS filegroup_name,
         CASE WHEN @obfuscate = 1 THEN pseudo_command_text   ELSE command_text   END AS command_text,
         CASE WHEN @obfuscate = 1 THEN pseudo_ci_drop        ELSE ci_drop_command END AS ci_drop_command,
         CASE WHEN @obfuscate = 1 THEN pseudo_verify_cmd     ELSE verify_command  END AS verify_command,
@@ -5726,7 +5915,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 replication_hint,
                 CASE lock_escalation WHEN 0 THEN ''TABLE'' WHEN 1 THEN ''DISABLE'' WHEN 2 THEN ''AUTO'' ELSE ''UNKNOWN'' END,
                 partition_count,
-                CONVERT(integer, has_fk_references), fk_ref_count, data_space_name,
+                CONVERT(integer, has_fk_references), fk_ref_count,
+                CASE WHEN @obfuscate = 1 THEN pseudo_filegroup_name ELSE data_space_name END,
                 CASE WHEN @obfuscate = 1 THEN pseudo_command_text ELSE command_text END,
                 size_mb, est_log_mb, days_since_last_rebuild,
                 page_io_latch_wait_count, page_io_latch_wait_ms,
@@ -5790,8 +5980,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                    CASE WHEN @obfuscate = 1 THEN pseudo_verify_cmd    ELSE verify_command  END,
                    est_duration, size_mb,
                    ISNULL(is_temporal_history, 0),
-                   temporal_parent_schema,
-                   temporal_parent_table
+                   CASE WHEN @obfuscate = 1 AND temporal_parent_schema IS NOT NULL
+                        THEN N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                             (N'SHA2_256', @passphrase + temporal_parent_schema), 2), 8)
+                        ELSE temporal_parent_schema END,
+                   CASE WHEN @obfuscate = 1 AND temporal_parent_table IS NOT NULL
+                        THEN N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                             (N'SHA2_256', @passphrase + temporal_parent_table), 2), 8)
+                        ELSE temporal_parent_table END
             FROM #Targets
             ORDER BY sort_order;
         OPEN script_cursor;
@@ -5914,11 +6110,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
              StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
         VALUES
         (
-            ISNULL(@Databases, DB_NAME()),
+            CASE WHEN @obfuscate = 1 THEN @obfuscated_database_name ELSE ISNULL(@Databases, DB_NAME()) END,
             N'dbo',
             N'sp_HeapDoctor',
             N'P',
-            @invocation_command,
+            CASE WHEN @obfuscate = 1 THEN @logged_invocation_command ELSE @invocation_command END,
             N'HEAP_SCAN_SUMMARY',
             @start_time,
             SYSDATETIME(),
@@ -5945,7 +6141,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     CASE WHEN @obfuscate = 1 THEN CONVERT(nvarchar(max), @obfu_mapping_encrypted, 2) ELSE NULL END AS ObfuscatedMappingHex,
                     (
                         SELECT
-                            DatabaseName AS [Name],
+                            CASE WHEN @obfuscate = 1
+                                 THEN N'DB_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                      (N'SHA2_256', @passphrase + DatabaseName), 2), 8)
+                                 ELSE DatabaseName END AS [Name],
                             HeapsQualified,
                             ScanSeconds
                         FROM @DbScanStats
@@ -5983,14 +6182,20 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             partition_count AS PartitionCount,
                             CONVERT(integer, has_schema_bound_views) AS HasSchemaBoundViews,
                             CONVERT(integer, has_indexed_views) AS HasIndexedViews,
-                            data_space_name AS DataSpaceName,
+                            CASE WHEN @obfuscate = 1 THEN pseudo_filegroup_name ELSE data_space_name END AS DataSpaceName,
                             CONVERT(integer, has_fk_references) AS HasFkReferences,
                             fk_ref_count AS FkRefCount,
                             page_io_latch_wait_count AS PageIoLatchWaitCount,
                             page_io_latch_wait_ms AS PageIoLatchWaitMs,
                             CONVERT(integer, is_temporal_history) AS IsTemporalHistory,
-                            temporal_parent_schema AS TemporalParentSchema,
-                            temporal_parent_table AS TemporalParentTable,
+                            CASE WHEN @obfuscate = 1 AND temporal_parent_schema IS NOT NULL
+                                 THEN N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                      (N'SHA2_256', @passphrase + temporal_parent_schema), 2), 8)
+                                 ELSE temporal_parent_schema END AS TemporalParentSchema,
+                            CASE WHEN @obfuscate = 1 AND temporal_parent_table IS NOT NULL
+                                 THEN N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                      (N'SHA2_256', @passphrase + temporal_parent_table), 2), 8)
+                                 ELSE temporal_parent_table END AS TemporalParentTable,
                             sort_order AS SortOrder,
                             est_pages_per_sec AS EstPagesPerSec,
                             est_seconds AS EstSeconds,
@@ -6168,6 +6373,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @pseudo_db              sysname,
             @pseudo_schema          sysname,
             @pseudo_tbl             sysname,
+            @display_full           nvarchar(512),
             @pseudo_cmd             nvarchar(max),
             @pseudo_ci_drop         nvarchar(max),
             @pseudo_cur_index_name  sysname,
@@ -6209,11 +6415,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime, ExtendedInfo)
             VALUES
             (
-                ISNULL(@Databases, DB_NAME()),
+                CASE WHEN @obfuscate = 1 THEN @obfuscated_database_name ELSE ISNULL(@Databases, DB_NAME()) END,
                 N'dbo',
                 N'sp_HeapDoctor',
                 N'P',
-                @invocation_command,
+                CASE WHEN @obfuscate = 1 THEN @logged_invocation_command ELSE @invocation_command END,
                 N'HEAP_REBUILD_START',
                 @start_time,
                 (
@@ -6230,7 +6436,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         @Maxdop AS Maxdop,
                         @LockTimeoutMs AS LockTimeoutMs,
                         @MaxRunSeconds AS MaxRunSeconds,
-                        @Tables AS Tables,
+                        CASE WHEN @obfuscate = 1 THEN N'[obfuscated]' ELSE @Tables END AS Tables,
                         CASE WHEN @AllowCiSwap = 1 THEN N'Y' ELSE N'N' END AS AllowCiSwap,
                         CASE WHEN @PreferCiSwap = 1 THEN N'Y' ELSE N'N' END AS PreferCiSwap,
                         CASE WHEN @EstimateTime = 1 THEN N'Y' ELSE N'N' END AS EstimateTime,
@@ -6389,7 +6595,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     BEGIN
                         SET @stranded_reclaimed += 1;
                         SELECT TOP (1) @Msg = N'  RECLAIMED a queue row abandoned by a dead worker: '
-                                            + QUOTENAME(DatabaseName) + N'.' + QUOTENAME(SchemaName) + N'.' + QUOTENAME(TableName)
+                                            + CASE WHEN @obfuscate = 1 THEN N'[obfuscated target]'
+                                                   ELSE QUOTENAME(DatabaseName) + N'.' + QUOTENAME(SchemaName) + N'.' + QUOTENAME(TableName) END
                                             + N'. Its claiming session no longer exists.'
                         FROM @ClaimedTarget;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -6481,6 +6688,26 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
             IF ROWCOUNT_BIG() = 0 BREAK;
 
+            /* Queue rows predate the in-memory pseudonym columns. Resolve safe
+               display values at the execution boundary before any messages or
+               log rows can expose their real identifiers. */
+            IF @obfuscate = 1
+            BEGIN
+                SET @pseudo_db = COALESCE(@pseudo_db, N'DB_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                    (N'SHA2_256', @passphrase + @db), 2), 8));
+                SET @pseudo_schema = COALESCE(@pseudo_schema, N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                    (N'SHA2_256', @passphrase + @schema), 2), 8));
+                SET @pseudo_tbl = COALESCE(@pseudo_tbl, N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                    (N'SHA2_256', @passphrase + @tbl), 2), 8));
+                SET @pseudo_cmd = COALESCE(@pseudo_cmd,
+                    N'-- Obfuscated command omitted because this target came from the parallel queue.');
+                SET @pseudo_ci_drop = COALESCE(@pseudo_ci_drop,
+                    N'-- Obfuscated remediation command omitted because this target came from the parallel queue.');
+            END
+            SET @display_full = CASE WHEN @obfuscate = 1
+                THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                ELSE @full END;
+
             SET @i = @cur_sort;
 
             SET @cur_index_name = CASE WHEN @action = 'CI_SWAP_ONLINE'
@@ -6496,7 +6723,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             */
             IF OBJECT_ID(@full) IS NULL
             BEGIN
-                SET @Msg = N'  SKIPPED: ' + @full + N' no longer exists.';
+                SET @Msg = N'  SKIPPED: ' + @display_full + N' no longer exists.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 SET @skipped_cnt += 1;
                 INSERT INTO #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
@@ -6516,7 +6743,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             */
             IF DATABASEPROPERTYEX(@db, N'Updateability') <> N'READ_WRITE'
             BEGIN
-                SET @Msg = N'  SKIPPED: Database [' + @db + N'] is no longer READ_WRITE'
+                SET @Msg = N'  SKIPPED: Database [' + CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END + N'] is no longer READ_WRITE'
                          + N' (possible AG failover). Skipping remaining targets in this database.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 /* Skip all remaining targets for this database */
@@ -6558,7 +6785,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 IF @cur_has_lob = 1
                 BEGIN
-                    SET @Msg = N'  WARNING: LOB column detected on ' + @full + N' at execution time (schema changed since discovery). Falling back to heap rebuild.';
+                    SET @Msg = N'  WARNING: LOB column detected on ' + @display_full + N' at execution time (schema changed since discovery). Falling back to heap rebuild.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                     /* Generate fallback ALTER TABLE REBUILD command */
@@ -6613,8 +6840,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 IF @cur_nci_disabled = 1
                 BEGIN
-                    SET @Msg = N'  WARNING: CI swap key source index [' + @cur_key_source_index
-                             + N'] on ' + @full + N' has been disabled since discovery. Falling back to heap rebuild.';
+                    SET @Msg = N'  WARNING: CI swap key source index ['
+                             + CASE WHEN @obfuscate = 1 THEN N'[obfuscated]' ELSE @cur_key_source_index END
+                             + N'] on ' + @display_full + N' has been disabled since discovery. Falling back to heap rebuild.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                     /* Generate fallback ALTER TABLE REBUILD command (same pattern as LOB fallback) */
@@ -6667,7 +6895,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 IF @cur_log_free_mb IS NOT NULL AND @cur_est_log_mb > @cur_log_free_mb
                 BEGIN
-                    SET @Msg = N'  SKIPPED: ' + @full + N' - estimated log consumption ('
+                    SET @Msg = N'  SKIPPED: ' + @display_full + N' - estimated log consumption ('
                         + CONVERT(nvarchar(20), CONVERT(integer, @cur_est_log_mb)) + N' MB) exceeds current log free space ('
                         + CONVERT(nvarchar(20), CONVERT(integer, @cur_log_free_mb)) + N' MB). '
                         + N'Autogrowth is not considered; disk may have sufficient space. '
@@ -6810,7 +7038,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             Progress message
             */
             SET @Msg = N'[' + CONVERT(nvarchar(10), @succeeded_cnt + @failed_cnt + 1) + N'/' + CONVERT(nvarchar(10), @TargetCount) + N'] '
-                     + @action + N' on ' + @full;
+                     + @action + N' on ' + @display_full;
 
             /* Append per-target estimate if available */
             IF @EstimateTime = 1
@@ -6829,7 +7057,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 SET @trace_msg = LEFT(
                     N'sp_HeapDoctor: [' + CONVERT(nvarchar(10), @succeeded_cnt + @failed_cnt + 1)
                     + N'/' + CONVERT(nvarchar(10), @TargetCount) + N'] '
-                    + @action + N' ' + @full
+                    + @action + N' ' + @display_full
                     + N' ' + CONVERT(nvarchar(10), @cur_page_count) + N'p'
                     + N' ' + CONVERT(nvarchar(10), @cur_fwd_pct) + N'%fwd'
                     + ISNULL(N' fc=' + CONVERT(nvarchar(15), @cur_fwd_fetch_count), N'')
@@ -6883,7 +7111,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IF ISNULL(@preflight_sessions, 0) > 0
             BEGIN
                 SET @Msg = N'  NOTE: ' + CONVERT(nvarchar(10), @preflight_sessions)
-                         + N' session(s) hold locks on ' + @full
+                         + N' session(s) hold locks on ' + @display_full
                          + CASE WHEN @preflight_sleeping > 0
                                 THEN N' (' + CONVERT(nvarchar(10), @preflight_sleeping) + N' sleeping with open transactions)'
                                 ELSE N'' END
@@ -6912,7 +7140,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
             IF ISNULL(@preflight_bu_sessions, 0) > 0
             BEGIN
-                SET @Msg = N'  WARNING: Active bulk insert detected on ' + @full
+                SET @Msg = N'  WARNING: Active bulk insert detected on ' + @display_full
                          + N'. Rebuild will block until bulk operation completes.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
@@ -6948,7 +7176,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                            WHEN 'SEVERE'      THEN N'CRITICAL'
                            WHEN 'CAUTIONARY'  THEN N'WARNING'
                            ELSE N'NOTE' END
-                    + N' [' + @cur_warning_severity + N']: ' + @full
+                    + N' [' + @cur_warning_severity + N']: ' + @display_full
                     + CASE WHEN LEN(@ws_reason) > 0
                            THEN N' is operationally delicate -- ' + LEFT(@ws_reason, LEN(@ws_reason) - 1)
                            ELSE N' has a large footprint' END
@@ -6962,12 +7190,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IF @cur_lock_escalation = 0 AND @action IN ('HEAP_REBUILD_ONLINE', 'CI_SWAP_ONLINE')
             BEGIN
                 IF @action = 'CI_SWAP_ONLINE'
-                    SET @Msg = N'  WARNING: lock_escalation=TABLE on ' + @full
+                    SET @Msg = N'  WARNING: lock_escalation=TABLE on ' + @display_full
                              + N'. CI swap acquires Sch-M which blocks ALL readers (including NOLOCK).'
                              + N' Combined with TABLE escalation, blocking may persist for the full CI build duration.'
                              + N' Consider scheduling in off-peak window or using @LockTimeoutMs.';
                 ELSE
-                    SET @Msg = N'  NOTE: lock_escalation=TABLE on ' + @full
+                    SET @Msg = N'  NOTE: lock_escalation=TABLE on ' + @display_full
                              + N'. Online rebuild may escalate to table lock.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
@@ -6991,7 +7219,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 IF @trigger_names IS NOT NULL
                 BEGIN
-                    SET @Msg = N'  NOTE: ' + @full + N' has INSTEAD OF trigger(s): ' + @trigger_names
+                    SET @Msg = N'  NOTE: ' + @display_full + N' has INSTEAD OF trigger(s): '
+                             + CASE WHEN @obfuscate = 1 THEN N'[obfuscated]' ELSE @trigger_names END
                              + N'. DDL operations (CREATE INDEX, ALTER TABLE REBUILD) do not fire DML triggers.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
@@ -7001,7 +7230,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IF @cur_replication_hint IS NOT NULL AND @cur_replication_hint <> N'CDC'
                AND @AllowReplicationRebuild = 0
             BEGIN
-                SET @Msg = N'  SKIPPED: ' + @full + N' is ' + @cur_replication_hint
+                SET @Msg = N'  SKIPPED: ' + @display_full + N' is ' + @cur_replication_hint
                          + N'. Rebuild generates ~' + CONVERT(nvarchar(20), ISNULL(@cur_record_count, 0) * 2)
                          + N' replication events (DELETE+INSERT per row).'
                          + N' Use @AllowReplicationRebuild=1 to rebuild published heaps.';
@@ -7021,7 +7250,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             /* Replication warning during execution (opt-in confirmed or CDC-only) */
             IF @cur_replication_hint IS NOT NULL
             BEGIN
-                SET @Msg = N'  NOTE: ' + @full + N' is ' + @cur_replication_hint
+                SET @Msg = N'  NOTE: ' + @display_full + N' is ' + @cur_replication_hint
                          + N'. Rebuild generates replication log traffic'
                          + CASE WHEN @cur_replication_hint <> N'CDC'
                                 THEN N' (~' + CONVERT(nvarchar(20), ISNULL(@cur_record_count, 0) * 2) + N' distributor events)'
@@ -7040,7 +7269,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             /* #182: Write-heavy advisory - remind operator that forwarded records will recur quickly */
             IF @cur_usage_hint IN (N'WRITE_HEAVY', N'WRITE_ONLY') AND @SkipWriteHeavy = 0
             BEGIN
-                SET @Msg = N'  NOTE: ' + @full + N' usage_hint = ' + @cur_usage_hint
+                SET @Msg = N'  NOTE: ' + @display_full + N' usage_hint = ' + @cur_usage_hint
                          + N'. Forwarded records recur fast on write-heavy heaps; rebuild ROI may be hours, not weeks. '
                          + N'Use @SkipWriteHeavy = 1 to exclude entirely.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -7049,7 +7278,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             /* #179: Plan cache recompile storm advisory */
             IF @cur_qs_plan_count IS NOT NULL AND @cur_qs_plan_count >= @PlanCountWarnThreshold
             BEGIN
-                SET @Msg = N'  WARNING: ' + @full + N' has ' + CONVERT(nvarchar(10), @cur_qs_plan_count)
+                SET @Msg = N'  WARNING: ' + @display_full + N' has ' + CONVERT(nvarchar(10), @cur_qs_plan_count)
                          + N' cached plan(s) in Query Store. ALTER TABLE REBUILD invalidates ALL cached plans for this table; '
                          + N'expect a recompile spike when post-rebuild traffic resumes.';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -7081,7 +7310,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 IF @has_paused_op = 1
                 BEGIN
-                    SET @Msg = N'  Resuming paused resumable index operation on ' + @full + N'...';
+                    SET @Msg = N'  Resuming paused resumable index operation on ' + @display_full + N'...';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     /* Replace the CREATE command with ALTER INDEX ... RESUME */
                     SET @cmd = N'ALTER INDEX ' + QUOTENAME(@cur_index_name)
@@ -7097,8 +7326,15 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             SET @versioning_log_id = NULL;
             IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
             BEGIN
-                SET @Msg = N'  Disabling SYSTEM_VERSIONING on ' + QUOTENAME(@db) + N'.'
-                         + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) + N'...';
+                SET @Msg = N'  Disabling SYSTEM_VERSIONING on '
+                         + CASE WHEN @obfuscate = 1
+                                THEN QUOTENAME(@pseudo_db) + N'.'
+                                   + QUOTENAME(N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                       (N'SHA2_256', @passphrase + @cur_temporal_parent_schema), 2), 8)) + N'.'
+                                   + QUOTENAME(N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                       (N'SHA2_256', @passphrase + @cur_temporal_parent_table), 2), 8))
+                                ELSE QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) END
+                         + N'...';
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                 SET @versioning_sql = N'ALTER TABLE ' + QUOTENAME(@db) + N'.'
@@ -7115,16 +7351,37 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 IF @commandlog_exists = 1
                 BEGIN
                     INSERT INTO dbo.CommandLog
-                        (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime)
+                        (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime, ExtendedInfo)
                     VALUES
                     (
-                        @db,
-                        @cur_temporal_parent_schema,
-                        @cur_temporal_parent_table,
+                        CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
+                        CASE WHEN @obfuscate = 1
+                             THEN N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                  (N'SHA2_256', @passphrase + @cur_temporal_parent_schema), 2), 8)
+                             ELSE @cur_temporal_parent_schema END,
+                        CASE WHEN @obfuscate = 1
+                             THEN N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                  (N'SHA2_256', @passphrase + @cur_temporal_parent_table), 2), 8)
+                             ELSE @cur_temporal_parent_table END,
                         N'U',
-                        @versioning_reenable_ddl,
+                        CASE WHEN @obfuscate = 1
+                             THEN N'-- Recovery DDL is encrypted. Use @RevealKey with @RevealRunID = '''
+                                  + CONVERT(nvarchar(36), @RunID) + N'''.'
+                             ELSE @versioning_reenable_ddl END,
                         N'HEAP_TEMPORAL_VERSIONING_DISABLED',
-                        SYSDATETIME()
+                        SYSDATETIME(),
+                        CASE WHEN @obfuscate = 1 THEN
+                        (
+                            SELECT
+                                @RunID AS RunID,
+                                @effective_seed AS ObfuscateSeed,
+                                CONVERT(nvarchar(max), ENCRYPTBYPASSPHRASE
+                                (
+                                    @passphrase,
+                                    CONVERT(varbinary(max), @versioning_reenable_ddl)
+                                ), 2) AS RecoveryDdlHex
+                            FOR XML RAW(N'ExtendedInfo'), ELEMENTS
+                        ) ELSE NULL END
                     );
                     SET @versioning_log_id = SCOPE_IDENTITY();
                 END
@@ -7133,8 +7390,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     EXECUTE sys.sp_executesql @versioning_sql;
                 END TRY
                 BEGIN CATCH
-                    SET @Msg = N'  ERROR disabling SYSTEM_VERSIONING: ' + LEFT(ERROR_MESSAGE(), 500)
-                             + N'. Skipping temporal history rebuild.';
+                    SET @Msg = N'  ERROR disabling SYSTEM_VERSIONING'
+                             + CASE WHEN @obfuscate = 1
+                                    THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                    ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) + N'.' END
+                             + N' Skipping temporal history rebuild.';
                     RAISERROR(@Msg, 16, 1) WITH NOWAIT;
                     SET @skipped_cnt += 1;
                     INSERT INTO #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
@@ -7188,10 +7448,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IF @Debug = 1
             BEGIN
                 SET @dbg_len = LEN(@exec_cmd);
-                SET @Msg = N'-- @Debug: rebuild command, LEN = ' + CONVERT(nvarchar(20), @dbg_len) + N' chars:';
+                SET @Msg = CASE WHEN @obfuscate = 1 THEN N'-- @Debug: obfuscated rebuild command omitted.'
+                                ELSE N'-- @Debug: rebuild command, LEN = ' + CONVERT(nvarchar(20), @dbg_len) + N' chars:' END;
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 SET @dbg_pos = 1;
-                WHILE @dbg_pos <= @dbg_len
+                WHILE @obfuscate = 0 AND @dbg_pos <= @dbg_len
                 BEGIN
                     SET @dbg_chunk = SUBSTRING(@exec_cmd, @dbg_pos, 2000);
                     RAISERROR(N'%s', 10, 1, @dbg_chunk) WITH NOWAIT;
@@ -7231,7 +7492,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 SET @ci_drop_failed = 0;
                 IF @ci_drop IS NOT NULL
                 BEGIN
-                    SET @Msg = N'  Dropping temp clustered index on ' + @full + N'...';
+                    SET @Msg = N'  Dropping temp clustered index on ' + @display_full + N'...';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                     BEGIN TRY
@@ -7240,10 +7501,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         IF @Debug = 1
                         BEGIN
                             SET @dbg_len = LEN(@exec_cmd);
-                            SET @Msg = N'-- @Debug: CI drop command, LEN = ' + CONVERT(nvarchar(20), @dbg_len) + N' chars:';
+                            SET @Msg = CASE WHEN @obfuscate = 1 THEN N'-- @Debug: obfuscated CI drop command omitted.'
+                                            ELSE N'-- @Debug: CI drop command, LEN = ' + CONVERT(nvarchar(20), @dbg_len) + N' chars:' END;
                             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                             SET @dbg_pos = 1;
-                            WHILE @dbg_pos <= @dbg_len
+                            WHILE @obfuscate = 0 AND @dbg_pos <= @dbg_len
                             BEGIN
                                 SET @dbg_chunk = SUBSTRING(@exec_cmd, @dbg_pos, 2000);
                                 RAISERROR(N'%s', 10, 1, @dbg_chunk) WITH NOWAIT;
@@ -7258,16 +7520,27 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     END TRY
                     BEGIN CATCH
                         SET @ci_drop_failed = 1;
+                        DECLARE @ci_drop_error_number int = ERROR_NUMBER();
+                        DECLARE @ci_drop_error_message nvarchar(1000) = CASE WHEN @obfuscate = 1
+                            THEN N'CI swap drop failed (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                            ELSE LEFT(ERROR_MESSAGE(), 1000) END;
+                        DECLARE @ci_drop_display_full nvarchar(512) = CASE WHEN @obfuscate = 1
+                            THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                            ELSE @full END;
+                        DECLARE @ci_drop_display_ddl nvarchar(max) = CASE WHEN @obfuscate = 1
+                            THEN @pseudo_ci_drop ELSE NULL END;
 
                         /* #102: Include exact remediation DROP DDL in warning */
                         DECLARE @ci_drop_ddl nvarchar(max) = N'DROP INDEX ' + QUOTENAME(@cur_index_name)
                             + N' ON ' + @full + N';';
-                        SET @Msg = N'  WARNING: CI swap CREATE succeeded but DROP FAILED on ' + @full
-                                 + N'. Error ' + CONVERT(nvarchar(10), ERROR_NUMBER())
-                                 + N': ' + LEFT(ERROR_MESSAGE(), 1000)
+                        IF @obfuscate = 0
+                            SET @ci_drop_display_ddl = @ci_drop_ddl;
+                        SET @Msg = N'  WARNING: CI swap CREATE succeeded but DROP FAILED on ' + @ci_drop_display_full
+                                 + N'. Error ' + CONVERT(nvarchar(10), @ci_drop_error_number)
+                                 + N': ' + @ci_drop_error_message
                                  + N'. The table is now a clustered table, NOT a heap.'
                                  + N' Forwarded records are eliminated.'
-                                 + N' To restore heap: ' + @ci_drop_ddl;
+                                 + N' To restore heap: ' + @ci_drop_display_ddl;
                         RAISERROR(@Msg, 16, 1) WITH NOWAIT;
 
                         /* #102: Log CI_SWAP_DROP_FAILED to CommandLog with remediation DDL */
@@ -7289,13 +7562,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                 N'CI_SWAP_DROP_FAILED',
                                 @start,
                                 SYSDATETIME(),
-                                ERROR_NUMBER(),
-                                LEFT(ERROR_MESSAGE(), 1000),
+                                @ci_drop_error_number,
+                                @ci_drop_error_message,
                                 (
                                     SELECT
                                         @Version AS Version,
                                         @RunID AS RunID,
-                                        @ci_drop_ddl AS RemediationDDL
+                                        @ci_drop_display_ddl AS RemediationDDL
                                     FOR XML RAW(N'ExtendedInfo'), ELEMENTS
                                 )
                             );
@@ -7355,7 +7628,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     IF @post_fwd_count IS NOT NULL AND @post_fwd_count > 0
                     BEGIN
                         SET @Msg = N'  WARNING: Post-rebuild check found ' + CONVERT(nvarchar(20), @post_fwd_count)
-                                 + N' forwarded records still present on ' + @full
+                                 + N' forwarded records still present on ' + @display_full
                                  + N' (scan mode: ' + @ScanMode + N').';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
@@ -7397,7 +7670,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         not resolve the object, so validation did not happen -- which
                         must not be mistaken for "no change detected".
                         */
-                        SET @Msg = N'  NOTE: Row count validation SKIPPED on ' + @full
+                        SET @Msg = N'  NOTE: Row count validation SKIPPED on ' + @display_full
                                  + N' (post-rebuild row count probe returned no value).';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
@@ -7414,7 +7687,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                         THEN N'  NOTE: ' ELSE N'  WARNING: ' END
                             + N'Row count changed from '
                             + CONVERT(nvarchar(20), @pre_row_count) + N' to '
-                            + CONVERT(nvarchar(20), @post_row_count) + N' on ' + @full
+                            + CONVERT(nvarchar(20), @post_row_count) + N' on ' + @display_full
                             + N' during the rebuild (delta '
                             + CASE WHEN @post_row_count >= @pre_row_count THEN N'+' ELSE N'' END
                             + CONVERT(nvarchar(20), @post_row_count - @pre_row_count) + N').'
@@ -7432,7 +7705,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 ELSE IF @ci_drop_failed = 0 AND @pre_row_count IS NULL
                 BEGIN
                     /* Same reasoning as above, for a pre-rebuild probe that yielded nothing. */
-                    SET @Msg = N'  NOTE: Row count validation SKIPPED on ' + @full
+                    SET @Msg = N'  NOTE: Row count validation SKIPPED on ' + @display_full
                              + N' (pre-rebuild row count probe returned no value).';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
@@ -7447,13 +7720,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         DECLARE @stats_start datetime2(3) = SYSDATETIME();
                         EXECUTE sys.sp_executesql @stats_sql;
                         DECLARE @stats_ms integer = DATEDIFF(MILLISECOND, @stats_start, SYSDATETIME());
-                        SET @Msg = N'  Statistics updated on ' + @full
+                        SET @Msg = N'  Statistics updated on ' + @display_full
                                  + N' (' + CONVERT(nvarchar(10), @cur_nci_count) + N' NCI(s), '
                                  + CONVERT(nvarchar(10), @stats_ms) + N'ms).';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END TRY
                     BEGIN CATCH
-                        SET @Msg = N'  WARNING: UPDATE STATISTICS failed on ' + @full + N': ' + LEFT(ERROR_MESSAGE(), 500);
+                        SET @Msg = N'  WARNING: UPDATE STATISTICS failed on ' + @display_full
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                        ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END CATCH
                 END
@@ -7462,7 +7738,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     /* #93: Heap rebuild holds Sch-M lock; no DML occurs, so modification_counter is unchanged. */
                     /* Statistics are no more stale after rebuild than before. Auto-update threshold is */
                     /* modification-based and will NOT trigger from the rebuild itself. */
-                    SET @Msg = N'  Note: Statistics on ' + @full + N' (heap + '
+                    SET @Msg = N'  Note: Statistics on ' + @display_full + N' (heap + '
                              + CONVERT(nvarchar(10), @cur_nci_count) + N' NCI(s)) are unchanged by rebuild.'
                              + N' Use @UpdateStatsAfterRebuild=1 to update statistics explicitly.';
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -7517,7 +7793,10 @@ DEALLOCATE fk_child_cursor;';
                         END
                     END TRY
                     BEGIN CATCH
-                        SET @Msg = N'  WARNING: FK child table statistics update failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                        SET @Msg = N'  WARNING: FK child table statistics update failed'
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                        ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END CATCH
                 END
@@ -7537,7 +7816,7 @@ DEALLOCATE fk_child_cursor;';
 
                 /* XE observability: rebuild succeeded with key metrics */
                 BEGIN TRY
-                    SET @trace_msg = LEFT(N'sp_HeapDoctor: OK ' + @full
+                    SET @trace_msg = LEFT(N'sp_HeapDoctor: OK ' + @display_full
                         + N' ' + @elapsed_fmt
                         + N' ' + CONVERT(nvarchar(10), @cur_page_count) + N'p'
                         + ISNULL(N' fc=' + CONVERT(nvarchar(15), @cur_fwd_fetch_count), N'')
@@ -7548,7 +7827,9 @@ DEALLOCATE fk_child_cursor;';
                     /* #113: Surface XE trace errors at debug level */
                     IF @Debug = 1
                     BEGIN
-                        SET @Msg = N'  [DEBUG] sp_trace_generateevent failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                    SET @Msg = N'  [DEBUG] sp_trace_generateevent failed'
+                             + CASE WHEN @obfuscate = 1 THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                    ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
                 END CATCH
@@ -7722,7 +8003,14 @@ DEALLOCATE fk_child_cursor;';
                     BEGIN TRY
                         EXECUTE sys.sp_executesql @versioning_reenable_ddl;
                         SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
-                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) + N'.';
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN QUOTENAME(@pseudo_db) + N'.'
+                                           + QUOTENAME(N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_schema), 2), 8)) + N'.'
+                                           + QUOTENAME(N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_table), 2), 8))
+                                        ELSE QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) END
+                                 + N'.';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                         /* #141: Clear breadcrumb - versioning successfully restored */
@@ -7732,9 +8020,18 @@ DEALLOCATE fk_child_cursor;';
                     END TRY
                     BEGIN CATCH
                         SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
-                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
-                                 + N': ' + LEFT(ERROR_MESSAGE(), 500)
-                                 + N'. MANUAL RE-ENABLE REQUIRED. Skipping remaining targets in [' + @db + N'].';
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN QUOTENAME(@pseudo_db) + N'.'
+                                           + QUOTENAME(N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_schema), 2), 8)) + N'.'
+                                           + QUOTENAME(N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_table), 2), 8))
+                                        ELSE QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) END
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                        ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END
+                                 + N'. MANUAL RE-ENABLE REQUIRED. Skipping remaining targets in ['
+                                 + CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END + N'].';
                         RAISERROR(@Msg, 16, 1) WITH NOWAIT;
                         SET @failed_cnt += 1;
                         INSERT INTO #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
@@ -7760,7 +8057,9 @@ DEALLOCATE fk_child_cursor;';
                 END;
 
                 SET @err_number = ERROR_NUMBER();
-                SET @err_message = ERROR_MESSAGE();
+                SET @err_message = CASE WHEN @obfuscate = 1
+                    THEN N'Heap rebuild failed (SQL error ' + CONVERT(nvarchar(10), @err_number) + N').'
+                    ELSE ERROR_MESSAGE() END;
 
                 /* Restore lock timeout (prefix ran but suffix did not due to error) */
                 IF @LockTimeoutMs IS NOT NULL
@@ -7780,14 +8079,20 @@ DEALLOCATE fk_child_cursor;';
 
                 /* XE observability: rebuild failed */
                 BEGIN TRY
-                    SET @trace_msg = LEFT(N'sp_HeapDoctor: FAILED ' + @full + N' E' + CONVERT(nvarchar(10), @err_number), 128);
+                    SET @trace_msg = LEFT(N'sp_HeapDoctor: FAILED '
+                        + CASE WHEN @obfuscate = 1
+                               THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
+                               ELSE @full END
+                        + N' E' + CONVERT(nvarchar(10), @err_number), 128);
                     EXECUTE sp_trace_generateevent @event_class = 82, @userinfo = @trace_msg;
                 END TRY
                 BEGIN CATCH
                     /* #113: Surface XE trace errors at debug level */
                     IF @Debug = 1
                     BEGIN
-                        SET @Msg = N'  [DEBUG] sp_trace_generateevent failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                        SET @Msg = N'  [DEBUG] sp_trace_generateevent failed'
+                                 + CASE WHEN @obfuscate = 1 THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                        ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
                 END CATCH
@@ -7853,7 +8158,13 @@ DEALLOCATE fk_child_cursor;';
                     BEGIN TRY
                         EXECUTE sys.sp_executesql @versioning_reenable_ddl;
                         SET @Msg = N'  Re-enabled SYSTEM_VERSIONING on '
-                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN QUOTENAME(@pseudo_db) + N'.'
+                                           + QUOTENAME(N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_schema), 2), 8)) + N'.'
+                                           + QUOTENAME(N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_table), 2), 8))
+                                        ELSE QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) END
                                  + N' (rebuild failed, but versioning restored).';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
@@ -7864,9 +8175,18 @@ DEALLOCATE fk_child_cursor;';
                     END TRY
                     BEGIN CATCH
                         SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
-                                 + QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table)
-                                 + N': ' + LEFT(ERROR_MESSAGE(), 500)
-                                 + N'. MANUAL RE-ENABLE REQUIRED. Skipping remaining targets in [' + @db + N'].';
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN QUOTENAME(@pseudo_db) + N'.'
+                                           + QUOTENAME(N'S_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_schema), 2), 8)) + N'.'
+                                           + QUOTENAME(N'T_' + LEFT(CONVERT(nvarchar(64), HASHBYTES
+                                               (N'SHA2_256', @passphrase + @cur_temporal_parent_table), 2), 8))
+                                        ELSE QUOTENAME(@db) + N'.' + QUOTENAME(@cur_temporal_parent_schema) + N'.' + QUOTENAME(@cur_temporal_parent_table) END
+                                 + CASE WHEN @obfuscate = 1
+                                        THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                        ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END
+                                 + N'. MANUAL RE-ENABLE REQUIRED. Skipping remaining targets in ['
+                                 + CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END + N'].';
                         RAISERROR(@Msg, 16, 1) WITH NOWAIT;
                         /* Do NOT increment @failed_cnt here - outer CATCH already counted this rebuild as failed */
                         /* Skip remaining targets in this database - temporal table is in unsafe state */
@@ -8043,7 +8363,9 @@ DEALLOCATE fk_child_cursor;';
             /* #113: Surface XE trace errors at debug level */
             IF @Debug = 1
             BEGIN
-                SET @Msg = N'  [DEBUG] sp_trace_generateevent failed: ' + LEFT(ERROR_MESSAGE(), 500);
+                        SET @Msg = N'  [DEBUG] sp_trace_generateevent failed'
+                                 + CASE WHEN @obfuscate = 1 THEN N' (SQL error ' + CONVERT(nvarchar(10), ERROR_NUMBER()) + N').'
+                                        ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END;
                 RAISERROR(@Msg, 10, 1) WITH NOWAIT;
             END
         END CATCH
@@ -8058,11 +8380,11 @@ DEALLOCATE fk_child_cursor;';
                  StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
             VALUES
             (
-                ISNULL(@Databases, DB_NAME()),
+                CASE WHEN @obfuscate = 1 THEN @obfuscated_database_name ELSE ISNULL(@Databases, DB_NAME()) END,
                 N'dbo',
                 N'sp_HeapDoctor',
                 N'P',
-                @invocation_command,
+                CASE WHEN @obfuscate = 1 THEN @logged_invocation_command ELSE @invocation_command END,
                 N'HEAP_REBUILD_END',
                 @start_time,
                 SYSDATETIME(),
