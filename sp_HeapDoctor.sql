@@ -6323,6 +6323,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @ci_drop_failed      bit,
             @ci_drop_error_number integer,
             @ci_drop_error_message nvarchar(1000),
+            @versioning_reenable_failed bit,
             @cur_index_name      sysname,
             /* QS performance snapshot (per-target, from #Targets) */
             @cur_qs_snapshot_utc    datetime2(3),
@@ -6634,6 +6635,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             END
 
             /* Pick next target from #Targets - same SELECT for serial AND parallel modes. */
+            SET @ci_drop_failed = 0;
+            SET @ci_drop_error_number = NULL;
+            SET @ci_drop_error_message = NULL;
+            SET @versioning_reenable_failed = 0;
+
             SELECT TOP (1)
                 @cur_sort       = sort_order,
                 @tid            = target_id,
@@ -7492,9 +7498,6 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 We log success for the forwarded-record fix (the CREATE did the work)
                 but warn loudly so the DBA can manually drop the temp CI.
                 */
-                SET @ci_drop_failed = 0;
-                SET @ci_drop_error_number = NULL;
-                SET @ci_drop_error_message = NULL;
                 IF @ci_drop IS NOT NULL
                 BEGIN
                     SET @Msg = N'  Dropping temp clustered index on ' + @display_full + N'...';
@@ -7588,62 +7591,37 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 END
 
                 /*
-                #187: record RECOVERY_REQUIRED here, not on the success UPDATE.
-                That UPDATE runs BEFORE the CI swap DROP is attempted, so reading
-                @ci_drop_failed there would always see 0 and the outcome could
-                never be emitted. The flag is only meaningful once the DROP has
-                been tried.
-                */
-                IF @ci_drop_failed = 1
-                    UPDATE #ExecLog
-                      SET recovery_required = 1
-                    WHERE target_id = @tid;
-
-                SET @succeeded_cnt += 1;
-
-                /*
                 Post-rebuild verification sums forwarded records in IN_ROW_DATA
                 across all heap partitions, using the configured @ScanMode.  A
                 SAMPLED scan can estimate counts on large heaps.  This is skipped
                 when CI swap DROP failed (the table is now clustered, index_id = 1).
                 */
                 SET @post_fwd_count = NULL;
-                IF @ci_drop_failed = 1
-                BEGIN
-                    /* CI DROP failed; table is now clustered (index_id=1), not heap. */
-                    /* Forwarded records are eliminated by the CREATE, but we can't verify via index_id=0. */
-                    SET @Msg = N'  Skipping post-rebuild verification (table is now clustered due to DROP failure).';
-                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-                    SET @post_fwd_count = 0; /* forwarded records ARE gone (CREATE eliminated them) */
-                END
-                ELSE
-                BEGIN
-                    BEGIN TRY
-                        SET @verify_sql = N'SELECT @fwd_out = SUM(forwarded_record_count)
+                BEGIN TRY
+                    SET @verify_sql = N'SELECT @fwd_out = SUM(forwarded_record_count)
                             FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, @scan_mode_param)
                             WHERE index_id = 0
                               AND alloc_unit_type_desc = N''IN_ROW_DATA'';';
-                        EXECUTE sys.sp_executesql @verify_sql,
+                    EXECUTE sys.sp_executesql @verify_sql,
                             N'@db_param sysname, @full_param nvarchar(512), @scan_mode_param nvarchar(20), @fwd_out bigint OUTPUT',
                             @db_param = @db, @full_param = @full, @scan_mode_param = @ScanMode,
                             @fwd_out = @post_fwd_count OUTPUT;
-                    END TRY
-                    BEGIN CATCH
-                        SET @post_fwd_count = NULL; /* verification failed, don't block */
-                    END CATCH
+                END TRY
+                BEGIN CATCH
+                    SET @post_fwd_count = NULL; /* verification failed, don't block */
+                END CATCH
 
-                    IF @post_fwd_count IS NOT NULL AND @post_fwd_count > 0
-                    BEGIN
-                        SET @Msg = N'  WARNING: Post-rebuild check found ' + CONVERT(nvarchar(20), @post_fwd_count)
+                IF @post_fwd_count IS NOT NULL AND @post_fwd_count > 0
+                BEGIN
+                    SET @Msg = N'  WARNING: Post-rebuild check found ' + CONVERT(nvarchar(20), @post_fwd_count)
                                  + N' forwarded records still present on ' + @display_full
                                  + N' (scan mode: ' + @ScanMode + N').';
-                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-                    END
-                    ELSE IF @post_fwd_count = 0
-                    BEGIN
-                        SET @Msg = N'  Verified: 0 forwarded records (scan mode: ' + @ScanMode + N').';
-                        RAISERROR(@Msg, 10, 1) WITH NOWAIT;
-                    END
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+                END
+                ELSE IF @post_fwd_count = 0
+                BEGIN
+                    SET @Msg = N'  Verified: 0 forwarded records (scan mode: ' + @ScanMode + N').';
+                    RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                 END
 
                 /*
@@ -7658,7 +7636,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 itself evidence of loss -- the message states what changed and lets
                 the operator judge, rather than asserting data loss.
                 */
-                IF @ci_drop_failed = 0 AND @pre_row_count IS NOT NULL
+                IF @pre_row_count IS NOT NULL
                 BEGIN
                     SET @post_row_count = NULL;
                     BEGIN TRY
@@ -7709,7 +7687,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
                 END
-                ELSE IF @ci_drop_failed = 0 AND @pre_row_count IS NULL
+                ELSE IF @pre_row_count IS NULL
                 BEGIN
                     /* Same reasoning as above, for a pre-rebuild probe that yielded nothing. */
                     SET @Msg = N'  NOTE: Row count validation SKIPPED on ' + @display_full
@@ -8026,6 +8004,7 @@ DEALLOCATE fk_child_cursor;';
                             WHERE ID = @versioning_log_id;
                     END TRY
                     BEGIN CATCH
+                        SET @versioning_reenable_failed = 1;
                         SET @Msg = N'  CRITICAL: Failed to re-enable SYSTEM_VERSIONING on '
                                  + CASE WHEN @obfuscate = 1
                                         THEN QUOTENAME(@pseudo_db) + N'.'
@@ -8039,21 +8018,14 @@ DEALLOCATE fk_child_cursor;';
                                         ELSE N': ' + LEFT(ERROR_MESSAGE(), 500) END
                                  + N'. MANUAL RE-ENABLE REQUIRED. Skipping remaining targets in ['
                                  + CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END + N'].';
-                        RAISERROR(@Msg, 16, 1) WITH NOWAIT;
-                        SET @failed_cnt += 1;
-                        INSERT INTO #ExecLog(target_id, database_name, full_name, action, start_time, end_time, succeeded, error_message)
-                        VALUES (@tid,
-                            CASE WHEN @obfuscate = 1 THEN @pseudo_db ELSE @db END,
-                            CASE WHEN @obfuscate = 1
-                                 THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
-                                 ELSE @full END,
-                            @action, @start, SYSDATETIME(), 0, N'FAILED: SYSTEM_VERSIONING_REENABLE_FAILED');
                         /* Skip remaining targets in this database - temporal table is in unsafe state */
                         UPDATE #Targets SET sort_order = -1
                         WHERE database_name = @db AND sort_order > @i;
-                        CONTINUE;
+                        RAISERROR(@Msg, 16, 1) WITH NOWAIT;
                     END CATCH
                 END
+
+                SET @succeeded_cnt += 1;
             END TRY
             BEGIN CATCH
                 SET @end = SYSDATETIME();
@@ -8165,7 +8137,9 @@ DEALLOCATE fk_child_cursor;';
                 END
 
                 /* #84: Re-enable SYSTEM_VERSIONING after failed temporal history rebuild */
-                IF @cur_is_temporal_history = 1 AND @cur_temporal_parent_schema IS NOT NULL
+                IF @cur_is_temporal_history = 1
+                   AND @cur_temporal_parent_schema IS NOT NULL
+                   AND @versioning_reenable_failed = 0
                 BEGIN
                     BEGIN TRY
                         EXECUTE sys.sp_executesql @versioning_reenable_ddl;
