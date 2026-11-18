@@ -3101,12 +3101,19 @@ CROSS APPLY (
     /* Aggregate per-partition rows for partitioned heaps. */
     /* dm_db_index_physical_stats returns one row per partition when partition_number=NULL. */
     SELECT
+        /* Total size includes LOB and row-overflow pages; row metrics do not. */
         SUM(page_count) AS page_count,
-        SUM(record_count) AS record_count,
-        SUM(forwarded_record_count) AS forwarded_record_count,
-        AVG(avg_page_space_used_in_percent) AS avg_page_space_used_in_percent,
-        AVG(avg_fragmentation_in_percent) AS avg_fragmentation_in_percent,
-        SUM(ghost_record_count) AS ghost_record_count
+        SUM(CASE WHEN alloc_unit_type_desc = N''IN_ROW_DATA'' THEN record_count ELSE 0 END) AS record_count,
+        SUM(CASE WHEN alloc_unit_type_desc = N''IN_ROW_DATA'' THEN forwarded_record_count ELSE 0 END) AS forwarded_record_count,
+        SUM(CASE WHEN alloc_unit_type_desc = N''IN_ROW_DATA''
+                 THEN avg_page_space_used_in_percent * page_count END)
+            / NULLIF(SUM(CASE WHEN alloc_unit_type_desc = N''IN_ROW_DATA'' THEN page_count END), 0)
+            AS avg_page_space_used_in_percent,
+        SUM(CASE WHEN alloc_unit_type_desc = N''IN_ROW_DATA''
+                 THEN avg_fragmentation_in_percent * page_count END)
+            / NULLIF(SUM(CASE WHEN alloc_unit_type_desc = N''IN_ROW_DATA'' THEN page_count END), 0)
+            AS avg_fragmentation_in_percent,
+        SUM(CASE WHEN alloc_unit_type_desc = N''IN_ROW_DATA'' THEN ghost_record_count ELSE 0 END) AS ghost_record_count
     FROM sys.dm_db_index_physical_stats(DB_ID(), ho.object_id, 0, NULL, @ScanMode_param)
 ) ips
 OUTER APPLY (
