@@ -178,7 +178,9 @@ fi
 # Deploy the procedure under test. Without this the suite would run against
 # whatever build happens to be installed, and a green result would say nothing
 # about the working tree.
-PROC="$(dirname "$TESTS_DIR")/sp_HeapDoctor.sql"
+# HEAPDOCTOR_PROC overrides the file, so tools/gate.sh can prove a test fails
+# against an older build of the procedure.
+PROC="${HEAPDOCTOR_PROC:-$(dirname "$TESTS_DIR")/sp_HeapDoctor.sql}"
 if [ -f "$PROC" ]; then
     if feed "$PROC" | eval "$SQLCMD" -d master -b >/dev/null 2>&1; then
         echo "deployed: $PROC"
