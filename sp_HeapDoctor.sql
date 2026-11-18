@@ -7322,9 +7322,10 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 SET @succeeded_cnt += 1;
 
                 /*
-                Post-rebuild verification: confirm forwarded records are gone.
-                Uses SAMPLED mode for speed. This is a spot-check, not a guarantee.
-                Skipped when CI swap DROP failed (table is now clustered, index_id = 1 not 0).
+                Post-rebuild verification sums forwarded records in IN_ROW_DATA
+                across all heap partitions, using the configured @ScanMode.  A
+                SAMPLED scan can estimate counts on large heaps.  This is skipped
+                when CI swap DROP failed (the table is now clustered, index_id = 1).
                 */
                 SET @post_fwd_count = NULL;
                 IF @ci_drop_failed = 1
@@ -7338,12 +7339,14 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 ELSE
                 BEGIN
                     BEGIN TRY
-                        SET @verify_sql = N'SELECT @fwd_out = forwarded_record_count
-                            FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, ''SAMPLED'')
-                            WHERE index_id = 0;';
+                        SET @verify_sql = N'SELECT @fwd_out = SUM(forwarded_record_count)
+                            FROM sys.dm_db_index_physical_stats(DB_ID(@db_param), OBJECT_ID(@full_param), 0, NULL, @scan_mode_param)
+                            WHERE index_id = 0
+                              AND alloc_unit_type_desc = N''IN_ROW_DATA'';';
                         EXECUTE sys.sp_executesql @verify_sql,
-                            N'@db_param sysname, @full_param nvarchar(512), @fwd_out bigint OUTPUT',
-                            @db_param = @db, @full_param = @full, @fwd_out = @post_fwd_count OUTPUT;
+                            N'@db_param sysname, @full_param nvarchar(512), @scan_mode_param nvarchar(20), @fwd_out bigint OUTPUT',
+                            @db_param = @db, @full_param = @full, @scan_mode_param = @ScanMode,
+                            @fwd_out = @post_fwd_count OUTPUT;
                     END TRY
                     BEGIN CATCH
                         SET @post_fwd_count = NULL; /* verification failed, don't block */
@@ -7352,12 +7355,13 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     IF @post_fwd_count IS NOT NULL AND @post_fwd_count > 0
                     BEGIN
                         SET @Msg = N'  WARNING: Post-rebuild check found ' + CONVERT(nvarchar(20), @post_fwd_count)
-                                 + N' forwarded records still present on ' + @full + N'.';
+                                 + N' forwarded records still present on ' + @full
+                                 + N' (scan mode: ' + @ScanMode + N').';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
                     ELSE IF @post_fwd_count = 0
                     BEGIN
-                        SET @Msg = N'  Verified: 0 forwarded records.';
+                        SET @Msg = N'  Verified: 0 forwarded records (scan mode: ' + @ScanMode + N').';
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
                 END
@@ -7672,6 +7676,7 @@ DEALLOCATE fk_child_cursor;';
                             @cur_ghost_count AS GhostRecordCount,
                             @cur_cpu_ms AS TotalCpuMs,
                             @post_fwd_count AS PostRebuildForwardedRecords,
+                            @ScanMode AS RequestedPostRebuildScanMode,
                             @elapsed_ms AS DurationMs,
                             CASE WHEN @elapsed_ms > 100
                                  THEN CONVERT(integer, CONVERT(float, @cur_page_count) / (@elapsed_ms / 1000.0))
