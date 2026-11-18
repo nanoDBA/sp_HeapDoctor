@@ -942,7 +942,7 @@ COMMON PARAMETERS:
                                         implies all tables when @Tables is NULL.
   @PlanOnly          bit     = 1       1=print commands only, 0=execute.
   @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
-  Real execution is refused inside INSERT...EXEC because it opens a transaction.
+  Real execution is refused inside INSERT...EXEC. That pattern opens a transaction.
   Use @PlanOnly=1 to capture the result set with INSERT...EXEC.
   @TopN              integer     = 25      Max targets per database.
 ', 10, 1) WITH NOWAIT;
