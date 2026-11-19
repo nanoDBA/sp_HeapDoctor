@@ -21,7 +21,7 @@ BEGIN CATCH
     SET @caught_number=ERROR_NUMBER();
     SET @caught_message=ERROR_MESSAGE();
 END CATCH;
-DECLARE @procedure_text nvarchar(max)=OBJECT_DEFINITION(OBJECT_ID(N'dbo.sp_HeapDoctor'));
+DECLARE @procedure_text nvarchar(max)=(SELECT m.definition FROM master.sys.sql_modules AS m WHERE m.object_id=OBJECT_ID(N'master.dbo.sp_HeapDoctor'));
 DECLARE @decrypt_error_at int=CHARINDEX(N'Encrypted mapping chunk decryption failed.',@procedure_text);
 DECLARE @decrypt_return_at int=CHARINDEX(N'RETURN;',@procedure_text,@decrypt_error_at);
 DECLARE @next_chunk_fetch_at int=CHARINDEX(N'FETCH NEXT FROM mapping_chunks',@procedure_text,@decrypt_error_at);
@@ -30,7 +30,13 @@ IF @caught_number=50000 AND @caught_message LIKE N'%Encrypted mapping chunk decr
    AND (@next_chunk_fetch_at=0 OR @decrypt_return_at<@next_chunk_fetch_at)
     RAISERROR(N'PASS 63A: a wrong reveal key raises one decryption error and exits the chunk loop.',10,1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'FAIL 63A: wrong-key reveal returned an unexpected or cursor-follow-up error.',10,1) WITH NOWAIT;
+BEGIN
+    DECLARE @fail_63a nvarchar(2000)=N'FAIL 63A: wrong-key reveal returned an unexpected or cursor-follow-up error. number='
+        +ISNULL(CONVERT(nvarchar(20),@caught_number),N'NULL')+N' message='+ISNULL(LEFT(@caught_message,300),N'NULL')
+        +N' error_at='+CONVERT(nvarchar(20),@decrypt_error_at)+N' return_at='+CONVERT(nvarchar(20),@decrypt_return_at)
+        +N' fetch_at='+CONVERT(nvarchar(20),@next_chunk_fetch_at);
+    RAISERROR(N'%s',10,1,@fail_63a) WITH NOWAIT;
+END
 
 DECLARE @stored_seed nvarchar(128), @legacy_hex nvarchar(max), @legacy_xml nvarchar(max), @passphrase nvarchar(max);
 SELECT @stored_seed=ExtendedInfo.value(N'(/ScanSummary/ObfuscateSeed)[1]',N'nvarchar(128)')
