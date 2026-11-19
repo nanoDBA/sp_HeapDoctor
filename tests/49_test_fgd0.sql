@@ -199,7 +199,7 @@ CREATE UNIQUE NONCLUSTERED INDEX UX_FGD0SerialDrop_ID ON dbo.FGD0SerialDrop (ID)
 )
 INSERT dbo.FGD0SerialRebuild (ID, Padding)
 SELECT TOP (10000) n, REPLICATE('A', 10) FROM N;
-UPDATE dbo.FGD0SerialRebuild SET Padding = REPLICATE('X', 1500) WHERE ID <= 5000;
+UPDATE dbo.FGD0SerialRebuild SET Padding = REPLICATE('X', 1500) WHERE ID <= 500;
 GO
 
 CREATE TRIGGER trFGD0_BlockSerialTempDrop ON DATABASE
@@ -234,6 +234,8 @@ DECLARE
     @serial_failed int = NULL,
     @serial_skipped int = NULL,
     @serial_run_id uniqueidentifier = NULL,
+    @serial_drop_event_id int = NULL,
+    @serial_rebuild_event_id int = NULL,
     @serial_drop_outcome nvarchar(50) = NULL,
     @serial_rebuild_outcome nvarchar(50) = NULL,
     @serial_rebuild_recovery bit = NULL,
@@ -264,6 +266,8 @@ WHERE cl.CommandType = N'HEAP_TARGET_EVENT'
 ORDER BY cl.ID DESC;
 
 SELECT
+    @serial_drop_event_id = MAX(CASE WHEN cl.ObjectName = N'FGD0SerialDrop' THEN cl.ID END),
+    @serial_rebuild_event_id = MAX(CASE WHEN cl.ObjectName = N'FGD0SerialRebuild' THEN cl.ID END),
     @serial_drop_outcome = MAX(CASE WHEN cl.ObjectName = N'FGD0SerialDrop'
         THEN cl.ExtendedInfo.value('(/TargetEvent/OutcomeCode/text())[1]', 'nvarchar(50)') END),
     @serial_rebuild_outcome = MAX(CASE WHEN cl.ObjectName = N'FGD0SerialRebuild'
@@ -279,11 +283,12 @@ WHERE cl.CommandType = N'HEAP_TARGET_EVENT'
 IF @serial_targets = 2
 AND @serial_drop_outcome = N'RECOVERY_REQUIRED'
 AND @serial_rebuild_outcome = N'FAILED'
+AND @serial_drop_event_id < @serial_rebuild_event_id
 AND @serial_rebuild_recovery = 0
 AND @serial_rebuild_error LIKE N'%FGD0 serial simulated rebuild failure%'
-    RAISERROR(N'PASS 49G: serial target failures retain their own error and recovery state.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'PASS 49G: the CI drop ran first, and the next failure retained its own error and recovery state.', 10, 1) WITH NOWAIT;
 ELSE
-    RAISERROR(N'FAIL 49G: serial target outcome or error state leaked from the earlier CI drop failure.', 10, 1) WITH NOWAIT;
+    RAISERROR(N'FAIL 49G: target order, outcome, or error state did not match the forced serial sequence.', 10, 1) WITH NOWAIT;
 GO
 
 DROP TRIGGER trFGD0_BlockSerialTempDrop ON DATABASE;
@@ -350,7 +355,15 @@ DECLARE
     @temporal_succeeded int = NULL,
     @temporal_failed int = NULL,
     @temporal_skipped int = NULL,
-    @temporal_status varchar(10) = NULL;
+    @temporal_status varchar(10) = NULL,
+    @temporal_log_id_before int = NULL,
+    @temporal_run_id uniqueidentifier = NULL,
+    @temporal_outcome_rows int = NULL,
+    @temporal_outcome_error int = NULL,
+    @temporal_outcome_message nvarchar(1000) = NULL;
+
+SELECT @temporal_log_id_before = COALESCE(MAX(ID), 0)
+FROM dbo.CommandLog;
 
 EXECUTE dbo.sp_HeapDoctor
     @Databases = N'HeapDoctorTest',
@@ -366,14 +379,34 @@ EXECUTE dbo.sp_HeapDoctor
     @Succeeded = @temporal_succeeded OUTPUT,
     @Failed = @temporal_failed OUTPUT,
     @Skipped = @temporal_skipped OUTPUT,
-    @Status = @temporal_status OUTPUT;
+    @Status = @temporal_status OUTPUT,
+    @ObfuscateKey = N'fgd0-temporal-obfuscation-key';
+
+SELECT TOP (1)
+    @temporal_run_id = cl.ExtendedInfo.value('(/TargetEvent/RunID/text())[1]', 'uniqueidentifier')
+FROM dbo.CommandLog AS cl
+WHERE cl.ID > @temporal_log_id_before
+  AND cl.CommandType = N'HEAP_TARGET_EVENT'
+ORDER BY cl.ID;
+
+SELECT
+    @temporal_outcome_rows = COUNT_BIG(*),
+    @temporal_outcome_error = MAX(cl.ErrorNumber),
+    @temporal_outcome_message = MAX(cl.ErrorMessage)
+FROM dbo.CommandLog AS cl
+WHERE cl.ErrorNumber IS NOT NULL
+  AND cl.ExtendedInfo.value('(/ExtendedInfo/RunID/text())[1]', 'uniqueidentifier') = @temporal_run_id;
 
 IF @temporal_targets = 1
 AND @temporal_succeeded + @temporal_failed + @temporal_skipped = @temporal_targets
 AND @temporal_succeeded = 0
 AND @temporal_failed = 1
 AND @temporal_status = N'ERROR'
-    RAISERROR(N'PASS 49H: temporal restore failure is counted once as a failed target.', 10, 1) WITH NOWAIT;
+AND @temporal_outcome_rows = 1
+AND @temporal_outcome_error IS NOT NULL
+AND @temporal_outcome_error <> 0
+AND @temporal_outcome_message LIKE N'%SYSTEM_VERSIONING_REENABLE_FAILED%'
+    RAISERROR(N'PASS 49H: temporal restore failure has one failed outcome row with an operator-searchable marker.', 10, 1) WITH NOWAIT;
 ELSE
 BEGIN
     DECLARE @failure_49h nvarchar(1000) = N'FAIL 49H: targets='
@@ -381,7 +414,10 @@ BEGIN
         + N' succeeded=' + ISNULL(CONVERT(nvarchar(10), @temporal_succeeded), N'NULL')
         + N' failed=' + ISNULL(CONVERT(nvarchar(10), @temporal_failed), N'NULL')
         + N' skipped=' + ISNULL(CONVERT(nvarchar(10), @temporal_skipped), N'NULL')
-        + N' status=' + ISNULL(@temporal_status, N'NULL') + N'.';
+        + N' status=' + ISNULL(@temporal_status, N'NULL')
+        + N' outcome_rows=' + ISNULL(CONVERT(nvarchar(10), @temporal_outcome_rows), N'NULL')
+        + N' outcome_error=' + ISNULL(CONVERT(nvarchar(10), @temporal_outcome_error), N'NULL')
+        + N' outcome_message=' + LEFT(ISNULL(@temporal_outcome_message, N'NULL'), 350) + N'.';
     RAISERROR(N'%s', 10, 1, @failure_49h) WITH NOWAIT;
 END
 GO

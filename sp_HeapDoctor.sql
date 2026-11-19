@@ -6412,6 +6412,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             @ci_drop_error_number integer,
             @ci_drop_error_message nvarchar(1000),
             @versioning_reenable_failed bit,
+            @target_success_log_id integer,
             @cur_index_name      sysname,
             /* QS performance snapshot (per-target, from #Targets) */
             @cur_qs_snapshot_utc    datetime2(3),
@@ -6727,6 +6728,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             SET @ci_drop_error_number = NULL;
             SET @ci_drop_error_message = NULL;
             SET @versioning_reenable_failed = 0;
+            SET @target_success_log_id = NULL;
 
             SELECT TOP (1)
                 @cur_sort       = sort_order,
@@ -7582,9 +7584,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 /*
                 CI swap step 2: DROP the temp clustered index to return to heap.
-                If DROP fails, the table is left as a clustered table (not a heap).
-                We log success for the forwarded-record fix (the CREATE did the work)
-                but warn loudly so the DBA can manually drop the temp CI.
+                If DROP fails, the table is left clustered. The nested handler logs
+                the dedicated failure and raises to the outer CATCH, which records
+                one failed, recovery-required outcome; success logging is bypassed.
                 */
                 IF @ci_drop IS NOT NULL
                 BEGIN
@@ -7680,9 +7682,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
 
                 /*
                 Post-rebuild verification sums forwarded records in IN_ROW_DATA
-                across all heap partitions, using the configured @ScanMode.  A
-                SAMPLED scan can estimate counts on large heaps.  This is skipped
-                when CI swap DROP failed (the table is now clustered, index_id = 1).
+                across all heap partitions, using the configured @ScanMode. A
+                SAMPLED scan can estimate counts on large heaps. CI swap DROP
+                failure raises to the outer CATCH before this heap-only check.
                 */
                 SET @post_fwd_count = NULL;
                 BEGIN TRY
@@ -8068,6 +8070,7 @@ DEALLOCATE fk_child_cursor;';
                          0,
                          CASE WHEN @obfuscate = 1 THEN @pseudo_cmd ELSE @cmd END, @action,
                          @start, @end, 0, NULL, @extended_info);
+                    SET @target_success_log_id = CONVERT(integer, SCOPE_IDENTITY());
                 END
 
                 /* #84: Re-enable SYSTEM_VERSIONING after successful temporal history rebuild */
@@ -8126,7 +8129,12 @@ DEALLOCATE fk_child_cursor;';
                 SET @err_number = CASE WHEN @ci_drop_failed = 1
                                              THEN COALESCE(@ci_drop_error_number, ERROR_NUMBER())
                                        ELSE ERROR_NUMBER() END;
-                SET @err_message = CASE WHEN @ci_drop_failed = 1
+                SET @err_message = CASE WHEN @versioning_reenable_failed = 1 AND @obfuscate = 1
+                                             THEN N'SYSTEM_VERSIONING_REENABLE_FAILED (SQL error '
+                                                  + CONVERT(nvarchar(10), @err_number) + N'). Manual re-enable required.'
+                                        WHEN @versioning_reenable_failed = 1
+                                             THEN N'SYSTEM_VERSIONING_REENABLE_FAILED: ' + LEFT(ERROR_MESSAGE(), 1000)
+                                        WHEN @ci_drop_failed = 1
                                              THEN COALESCE(@ci_drop_error_message, N'CI swap drop failed.')
                                        WHEN @obfuscate = 1
                                              THEN N'Heap rebuild failed (SQL error ' + CONVERT(nvarchar(10), @err_number) + N').'
@@ -8176,52 +8184,63 @@ DEALLOCATE fk_child_cursor;';
                 */
                 IF @commandlog_exists = 1
                 BEGIN
-                    SET @extended_info = (
-                        SELECT
-                            @Version AS Version,
-                            @cur_page_count AS PageCount,
-                            CONVERT(decimal(18,2), @cur_page_count) / 128.0 AS SizeMB,
-                            @cur_fwd_count AS ForwardedRecords,
-                            @cur_fwd_pct AS ForwardedPct,
-                            @cur_fwd_fetch_count AS ForwardedFetchCount,
-                            @cur_page_space_pct AS AvgPageSpacePct,
-                            @cur_frag_pct AS AvgFragPct,
-                            @cur_ghost_count AS GhostRecordCount,
-                            @cur_cpu_ms AS TotalCpuMs,
-                            @elapsed_ms AS DurationMs,
-                            @cur_qs_snapshot_utc AS QsSnapshotTimeUtc,
-                            @cur_qs_logical_reads AS QsTotalLogicalReads,
-                            @cur_qs_physical_reads AS QsTotalPhysicalReads,
-                            @cur_qs_duration_ms AS QsTotalDurationMs,
-                            @cur_qs_executions AS QsTotalExecutions,
-                            @cur_qs_plan_count AS QsPlanCount,
-                            @cur_qs_query_count AS QsQueryCount,
-                            @cur_qs_query_hashes AS QsQueryHashes,
-                            @cur_usage_hint AS UsageHint,
-                            @cur_ranking_score AS RankingScore,
-                            @cur_replication_hint AS ReplicationHint,
-                            @cur_lock_escalation AS LockEscalation,
-                            @cur_record_count AS RecordCount,
-                            @cur_nci_count AS NciCount,
-                            @cur_est_seconds AS EstSeconds,
-                            @cur_days_since_rebuild AS DaysSinceLastRebuild,
-                            @RunID AS RunID
-                        FOR XML RAW(N'ExtendedInfo'), ELEMENTS
-                    );
+                    IF @versioning_reenable_failed = 1 AND @target_success_log_id IS NOT NULL
+                    BEGIN
+                        UPDATE dbo.CommandLog
+                        SET EndTime = @end,
+                            ErrorNumber = @err_number,
+                            ErrorMessage = @err_message
+                        WHERE ID = @target_success_log_id;
+                    END
+                    ELSE
+                    BEGIN
+                        SET @extended_info = (
+                            SELECT
+                                @Version AS Version,
+                                @cur_page_count AS PageCount,
+                                CONVERT(decimal(18,2), @cur_page_count) / 128.0 AS SizeMB,
+                                @cur_fwd_count AS ForwardedRecords,
+                                @cur_fwd_pct AS ForwardedPct,
+                                @cur_fwd_fetch_count AS ForwardedFetchCount,
+                                @cur_page_space_pct AS AvgPageSpacePct,
+                                @cur_frag_pct AS AvgFragPct,
+                                @cur_ghost_count AS GhostRecordCount,
+                                @cur_cpu_ms AS TotalCpuMs,
+                                @elapsed_ms AS DurationMs,
+                                @cur_qs_snapshot_utc AS QsSnapshotTimeUtc,
+                                @cur_qs_logical_reads AS QsTotalLogicalReads,
+                                @cur_qs_physical_reads AS QsTotalPhysicalReads,
+                                @cur_qs_duration_ms AS QsTotalDurationMs,
+                                @cur_qs_executions AS QsTotalExecutions,
+                                @cur_qs_plan_count AS QsPlanCount,
+                                @cur_qs_query_count AS QsQueryCount,
+                                @cur_qs_query_hashes AS QsQueryHashes,
+                                @cur_usage_hint AS UsageHint,
+                                @cur_ranking_score AS RankingScore,
+                                @cur_replication_hint AS ReplicationHint,
+                                @cur_lock_escalation AS LockEscalation,
+                                @cur_record_count AS RecordCount,
+                                @cur_nci_count AS NciCount,
+                                @cur_est_seconds AS EstSeconds,
+                                @cur_days_since_rebuild AS DaysSinceLastRebuild,
+                                @RunID AS RunID
+                            FOR XML RAW(N'ExtendedInfo'), ELEMENTS
+                        );
 
-                    INSERT INTO dbo.CommandLog
-                        (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
-                         Command, CommandType,
-                         StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
-                    VALUES
-                        (CASE WHEN @obfuscate = 1 THEN @pseudo_db     ELSE @db     END,
-                         CASE WHEN @obfuscate = 1 THEN @pseudo_schema ELSE @schema END,
-                         CASE WHEN @obfuscate = 1 THEN @pseudo_tbl    ELSE @tbl    END,
-                         N'U',
-                         CASE WHEN @obfuscate = 1 THEN @pseudo_cur_index_name ELSE @cur_index_name END,
-                         0,
-                         CASE WHEN @obfuscate = 1 THEN @pseudo_cmd ELSE @cmd END, @action,
-                         @start, @end, @err_number, @err_message, @extended_info);
+                        INSERT INTO dbo.CommandLog
+                            (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
+                             Command, CommandType,
+                             StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+                        VALUES
+                            (CASE WHEN @obfuscate = 1 THEN @pseudo_db     ELSE @db     END,
+                             CASE WHEN @obfuscate = 1 THEN @pseudo_schema ELSE @schema END,
+                             CASE WHEN @obfuscate = 1 THEN @pseudo_tbl    ELSE @tbl    END,
+                             N'U',
+                             CASE WHEN @obfuscate = 1 THEN @pseudo_cur_index_name ELSE @cur_index_name END,
+                             0,
+                             CASE WHEN @obfuscate = 1 THEN @pseudo_cmd ELSE @cmd END, @action,
+                             @start, @end, @err_number, @err_message, @extended_info);
+                    END
                 END
 
                 /* #84: Re-enable SYSTEM_VERSIONING after failed temporal history rebuild */
