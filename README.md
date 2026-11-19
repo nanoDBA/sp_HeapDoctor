@@ -609,7 +609,7 @@ CPU ranking across every database.
 | `recommended_action` | varchar(50) | Coarse, machine-readable form of `action_chosen`: `CI_SWAP`, `REBUILD`, or `MONITOR`.  Use this when branching in a script; `action_chosen` carries the detail |
 | `command_text` | nvarchar(max) | The rebuild command (3-part name) |
 | `ci_drop_command` | nvarchar(max) | DROP INDEX command for CI swap cleanup.  NULL for heap rebuilds |
-| `verify_command` | nvarchar(max) | Paste-ready `dm_db_index_physical_stats` query to verify forwarded records after rebuild |
+| `verify_command` | nvarchar(max) | Paste-ready `dm_db_index_physical_stats` query with a database-qualified object name; runs from any database context |
 
 ### Estimation (when @EstimateTime = 1)
 

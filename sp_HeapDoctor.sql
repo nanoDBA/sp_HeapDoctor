@@ -3761,7 +3761,7 @@ SELECT TOP (@TopN_param)
     r.usage_hint,
     r.ranking_score,
     /* 8O: Verification command for change management */
-    N''SELECT forwarded_record_count FROM sys.dm_db_index_physical_stats(DB_ID(N'''''' + QUOTENAME(DB_NAME()) + N''''''), OBJECT_ID(N'''''' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) + N''''''), 0, NULL, N''''SAMPLED'''');'',
+    N''SELECT forwarded_record_count FROM sys.dm_db_index_physical_stats(DB_ID('' + QUOTENAME(DB_NAME(), '''''''') + N''), OBJECT_ID(N'''''' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) + N''''''), 0, NULL, N''''SAMPLED'''');'',
     r.has_forced_plans   /* #185 */
 FROM Ranked r
 ORDER BY r.target_rank;
