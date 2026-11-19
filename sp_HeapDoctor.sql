@@ -53,8 +53,9 @@ License:    MIT License
 
 Version:    2026.11.19.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.11.19.1 - P2 fixes for parallel queue safety, repeat runs, collation-safe scans,
-                          and exact forced-plan checks (#221, #223, #232, #240)
+History:    2026.11.19.1 - P2 fixes for queue safety, repeat runs, collation-safe scans,
+                          forced-plan checks, and safe CI swap keys
+                          (#221, #223, #226, #232, #240)
             2026.11.17.1 - Address P1 issues #214 through #219
             2026.08.02.1 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
@@ -969,7 +970,7 @@ COMMON PARAMETERS:
   @MaxPages          bigint  = NULL    Skip heaps larger than this (NULL=no cap).
   @OnlinePreference  varchar = AUTO     AUTO | ON (require) | OFF (force offline)
   @AllowCiSwap       bit     = 0       Allow CI swap rebuild path.
-  @PreferCiSwap      bit     = 0       Prefer CI swap when safe key exists + online allowed.
+  @PreferCiSwap      bit     = 0       Prefer CI swap when a supported key of at most 900 bytes exists.
   @FillFactor        tinyint = 0       Fill factor for CI swap CREATE INDEX (0=server default, 1-100).
   @Maxdop            integer     = NULL    MAXDOP on index ops (NULL=omit, 0=unlimited).
   @LockTimeoutMs     integer     = NULL    Lock ACQUISITION wait per rebuild in ms -- caps the wait to OBTAIN Sch-M, NOT how long the rebuild holds it. NULL=don''t set.
@@ -3677,13 +3678,14 @@ CandidateKeys AS
       AND i.is_disabled = 0
       AND i.is_hypothetical = 0
       AND ic.key_ordinal > 0
-      AND c.is_nullable = 0
-      AND ISNULL(c.encryption_type, 0) = 0
-      AND c.is_computed = 0 /* exclude computed columns (#76) */
-      AND c.max_length <> -1
-      AND t.name NOT IN (N''text'',N''ntext'',N''image'',N''xml'')
     GROUP BY i.object_id, i.name
-    HAVING SUM(CASE WHEN c.max_length < 0 THEN 99999 ELSE c.max_length END) <= 1700
+    HAVING SUM(CASE WHEN c.is_nullable = 1
+                         OR ISNULL(c.encryption_type, 0) <> 0
+                         OR c.is_computed = 1
+                         OR c.max_length = -1
+                         OR t.name IN (N''text'', N''ntext'', N''image'', N''xml'')
+                    THEN 1 ELSE 0 END) = 0
+       AND SUM(CASE WHEN c.max_length < 0 THEN 99999 ELSE c.max_length END) <= 900
 ),
 BestKey AS
 (
