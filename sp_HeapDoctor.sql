@@ -1627,14 +1627,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                   AND HAS_DBACCESS(d.name) = 1
                   AND d.source_database_id IS NULL
                   AND d.is_read_only = 0
-                  AND NOT EXISTS
-                  (
-                      SELECT 1
-                      FROM sys.dm_hadr_database_replica_states AS drs
-                      WHERE drs.database_id = d.database_id
-                        AND drs.is_local = 1
-                        AND drs.is_primary_replica = 0
-                  )
+                  /* A secondary replica reports READ_ONLY here.  This must not read a
+                     DMV: the caller may hold no server or database state permission,
+                     and reporting that is the purpose of this mode. */
+                  AND CONVERT(nvarchar(128), DATABASEPROPERTYEX(d.name, N'Updateability')) = N'READ_WRITE'
                   AND EXISTS
                   (
                       SELECT 1
