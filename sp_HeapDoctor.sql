@@ -54,8 +54,8 @@ License:    MIT License
 Version:    2026.11.19.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
 History:    2026.11.19.1 - P2 fixes for queue safety, repeat runs, collation-safe scans,
-                          forced-plan checks, and safe CI swap keys
-                          (#221, #223, #226, #232, #240)
+                          forced-plan checks, safe CI swap keys, and atomic parallel claims
+                          (#220, #221, #223, #226, #232, #240)
             2026.11.17.1 - Address P1 issues #214 through #219
             2026.08.02.1 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
@@ -1021,6 +1021,12 @@ COMMON PARAMETERS:
                                         Phase A: if a worker is KILLed mid-rebuild, its claimed row
                                         stays TableStartTime IS NOT NULL, TableEndTime IS NULL and
                                         will NOT be retried by other workers. Manual cleanup needed.
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'PARALLEL MODE:
+  @HeapsInParallel = N''Y'' claims queue rows atomically with UPDLOCK and skips locked rows.
+  A worker retries if unclaimed queue rows still exist but are temporarily locked.
+  A worker exits after the queue has no unclaimed rows and no abandoned claim to recover.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'
@@ -6819,16 +6825,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 /* Atomic claim: UPDATE TOP (1) with ROWLOCK+READPAST so concurrent workers skip locked rows. */
                 ;WITH NextUnclaimed AS
                 (
-                    SELECT TOP (1) qhr.QueueID, qhr.DatabaseName, qhr.SchemaName, qhr.TableName
-                    FROM dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
+                    SELECT TOP (1) qhr.*
+                    FROM dbo.QueueHeapRebuild AS qhr WITH (UPDLOCK, ROWLOCK, READPAST)
                     WHERE qhr.QueueID = @queue_id
                       AND qhr.TableStartTime IS NULL
                     ORDER BY qhr.SortOrder
                 )
-                UPDATE qhr
-                SET qhr.TableStartTime = SYSDATETIME(),
-                    qhr.SessionID      = @@SPID,
-                    qhr.ClaimLoginTime = @claim_login_time
+                UPDATE NextUnclaimed
+                SET TableStartTime = SYSDATETIME(),
+                    SessionID      = @@SPID,
+                    ClaimLoginTime = @claim_login_time
                 OUTPUT inserted.DatabaseName, inserted.SchemaName, inserted.TableName,
                        inserted.ObjectID, inserted.SortOrder, inserted.ActionChosen,
                        inserted.PageCount, inserted.RecordCount, inserted.ForwardedRecordCount,
@@ -6839,13 +6845,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                        inserted.KeySourceIndex, inserted.UsageHint, inserted.QsPlanCount,
                        inserted.WarningSeverity, inserted.HasForcedPlans,
                        inserted.CommandText, inserted.CiDropCommand, inserted.VerifyCommand
-                INTO @ClaimedTarget
-                FROM NextUnclaimed AS nu
-                JOIN dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
-                  ON qhr.QueueID     = nu.QueueID
-                 AND qhr.DatabaseName = nu.DatabaseName
-                 AND qhr.SchemaName   = nu.SchemaName
-                 AND qhr.TableName    = nu.TableName;
+                INTO @ClaimedTarget;
 
                 /*
                 #201: dead-worker recovery.
@@ -6870,8 +6870,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 BEGIN
                     ;WITH Stranded AS
                     (
-                        SELECT TOP (1) qhr.QueueID, qhr.DatabaseName, qhr.SchemaName, qhr.TableName
-                        FROM dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
+                        SELECT TOP (1) qhr.*
+                        FROM dbo.QueueHeapRebuild AS qhr WITH (UPDLOCK, ROWLOCK, READPAST)
                         WHERE qhr.QueueID = @queue_id
                           AND qhr.TableStartTime IS NOT NULL
                           AND qhr.TableEndTime IS NULL
@@ -6883,12 +6883,12 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                               )
                         ORDER BY qhr.SortOrder
                     )
-                    UPDATE qhr
-                    SET qhr.TableStartTime = SYSDATETIME(),
-                        qhr.SessionID      = @@SPID,
-                        qhr.ClaimLoginTime = @claim_login_time,
-                        qhr.Status         = NULL,
-                        qhr.ErrorMessage   = NULL
+                    UPDATE Stranded
+                    SET TableStartTime = SYSDATETIME(),
+                        SessionID      = @@SPID,
+                        ClaimLoginTime = @claim_login_time,
+                        Status         = NULL,
+                        ErrorMessage   = NULL
                     OUTPUT inserted.DatabaseName, inserted.SchemaName, inserted.TableName,
                            inserted.ObjectID, inserted.SortOrder, inserted.ActionChosen,
                            inserted.PageCount, inserted.RecordCount, inserted.ForwardedRecordCount,
@@ -6899,13 +6899,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                            inserted.KeySourceIndex, inserted.UsageHint, inserted.QsPlanCount,
                            inserted.WarningSeverity, inserted.HasForcedPlans,
                            inserted.CommandText, inserted.CiDropCommand, inserted.VerifyCommand
-                    INTO @ClaimedTarget
-                    FROM Stranded AS st
-                    JOIN dbo.QueueHeapRebuild AS qhr WITH (ROWLOCK, READPAST)
-                      ON qhr.QueueID      = st.QueueID
-                     AND qhr.DatabaseName = st.DatabaseName
-                     AND qhr.SchemaName   = st.SchemaName
-                     AND qhr.TableName    = st.TableName;
+                    INTO @ClaimedTarget;
 
                     IF EXISTS (SELECT 1 FROM @ClaimedTarget)
                     BEGIN
@@ -6917,6 +6911,15 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         FROM @ClaimedTarget;
                         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
                     END
+                END
+
+                IF NOT EXISTS (SELECT 1 FROM @ClaimedTarget)
+                   AND EXISTS
+                       (SELECT 1 FROM dbo.QueueHeapRebuild AS qhr
+                        WHERE qhr.QueueID = @queue_id AND qhr.TableStartTime IS NULL)
+                BEGIN
+                    WAITFOR DELAY '00:00:00.100';
+                    CONTINUE;
                 END
 
                 IF NOT EXISTS (SELECT 1 FROM @ClaimedTarget) BREAK;

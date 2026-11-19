@@ -445,7 +445,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@Force` | `0` | Bypass orphaned applock from KILLed sessions.  Use when prior run was killed and the re-entrancy guard blocks new runs |
 | `@AllowReplicationRebuild` | `0` | Allow published heap rebuilds (shows estimated replication events).  Heaps with `replication_hint` are skipped by default |
 | `@CheckPermissionsOnly` | `0` | Check permissions (ALTER TRACE, VIEW DATABASE STATE, ALTER, CommandLog INSERT) for selected databases and return without executing. Uses `@Databases` and `@ExcludeDatabases`; warns if none match |
-| `@HeapsInParallel` | `'N'` | `'Y'` = queue-based parallel rebuilds across sessions. Requires Ola Hallengren's `dbo.Queue`; `dbo.QueueHeapRebuild` is created automatically. Sessions with the same parameters join an active queue. A completed invocation starts a fresh queue on the next run. Incompatible with `@PlanOnly = 1` |
+| `@HeapsInParallel` | `'N'` | `'Y'` = queue-based parallel rebuilds across sessions. Queue rows are claimed atomically; workers retry when remaining unclaimed rows are temporarily locked. Requires Ola Hallengren's `dbo.Queue`; `dbo.QueueHeapRebuild` is created automatically. Sessions with the same parameters join an active queue. A completed invocation starts a fresh queue on the next run. Incompatible with `@PlanOnly = 1` |
 
 Execution mode cannot be invoked inside `INSERT...EXEC` because that pattern opens a transaction. Capture a result set with `@PlanOnly = 1`, or call execution mode directly in autocommit mode.
 
