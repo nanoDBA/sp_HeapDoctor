@@ -51,9 +51,10 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.11.17.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.11.19.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.11.17.1 - Address P1 issues #214 through #219
+History:    2026.11.19.1 - P2 fixes for parallel queue safety and repeat runs (#221, #223)
+            2026.11.17.1 - Address P1 issues #214 through #219
             2026.08.02.1 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
                             @Succeeded, @Failed and @Skipped NULL, so a caller testing
@@ -850,7 +851,7 @@ BEGIN
         RETURN;
     END
 
-    DECLARE @Version nvarchar(20) = N'2026.11.17.1';
+    DECLARE @Version nvarchar(20) = N'2026.11.19.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
