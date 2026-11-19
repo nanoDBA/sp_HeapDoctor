@@ -7,6 +7,7 @@ GO
 CREATE TABLE #M79CForbiddenPatterns (pattern nvarchar(128) NOT NULL);
 INSERT INTO #M79CForbiddenPatterns (pattern)
 VALUES
+    (N'%HeapDoctorTest%'),
     (N'%M79CTestHeap%'),
     (N'%M79CFailureHeap%'),
     (N'%M79CSecretPatientNumber%'),
@@ -181,7 +182,6 @@ OR EXISTS
     SELECT 1
     FROM dbo.M79CPlanOutput AS r
     CROSS APPLY (VALUES
-        (CONVERT(nvarchar(max), r.database_name)),
         (CONVERT(nvarchar(max), r.schema_name)),
         (CONVERT(nvarchar(max), r.table_name)),
         (CONVERT(nvarchar(max), r.key_source_index)),
@@ -198,10 +198,19 @@ ELSE
 
 IF EXISTS
 (
+    SELECT 1 FROM #PlanResults
+    WHERE verify_command LIKE N'%HeapDoctorTest%'
+       OR verify_command NOT LIKE N'%DB_ID(%'
+)
+    RAISERROR(N'FAIL 48M: verify_command exposes the real database name or lost DB_ID verification.', 10, 1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'PASS 48M: verify_command uses the pseudonymized database name.', 10, 1) WITH NOWAIT;
+
+IF EXISTS
+(
     SELECT 1
     FROM dbo.CommandLog AS cl
     CROSS APPLY (VALUES
-        (CONVERT(nvarchar(max), cl.DatabaseName)),
         (CONVERT(nvarchar(max), cl.SchemaName)),
         (CONVERT(nvarchar(max), cl.ObjectName)),
         (CONVERT(nvarchar(max), cl.IndexName)),

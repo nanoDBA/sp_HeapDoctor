@@ -5876,7 +5876,9 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                                             m.real_table_quoted,  QUOTENAME(m.pseudo_table))
                                      ELSE NULL END,
             t.pseudo_verify_cmd    = CASE WHEN t.verify_command IS NOT NULL
-                                     THEN REPLACE(REPLACE(REPLACE(t.verify_command,
+                                      THEN REPLACE(REPLACE(REPLACE(REPLACE(t.verify_command,
+                                             N'DB_ID(' + QUOTENAME(t.database_name, N'''') + N')',
+                                             N'DB_ID(' + QUOTENAME(m.pseudo_db, N'''') + N')'),
                                             m.real_db_quoted,     QUOTENAME(m.pseudo_db)),
                                             m.real_schema_quoted, QUOTENAME(m.pseudo_schema)),
                                             m.real_table_quoted,  QUOTENAME(m.pseudo_table))
@@ -5904,6 +5906,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
               AND
               (
                     CHARINDEX(mapping.real_db_quoted, commands.command_text) > 0
+                  OR CHARINDEX(N'DB_ID(' + QUOTENAME(target.database_name, N'''') + N')', commands.command_text) > 0
                  OR CHARINDEX(mapping.real_schema_quoted, commands.command_text) > 0
                  OR CHARINDEX(mapping.real_table_quoted, commands.command_text) > 0
                  OR CHARINDEX(N'CX__Temp__' + LEFT(mapping.real_table_name, 108), commands.command_text) > 0
