@@ -193,5 +193,5 @@ EXEC dbo.sp_HeapDoctor
 
 - **Plan-only support**: Plan-only runs store the encrypted mapping in the HEAP_SCAN_SUMMARY CommandLog entry when `@LogToTable = 'Y'` (default). Reveal mode checks both HEAP_REBUILD_START (execution runs) and HEAP_SCAN_SUMMARY (plan-only runs). If `@LogToTable = 'N'`, no mapping is stored and a warning is emitted.
 - **Wrong key**: If you provide the wrong `@RevealKey`, the decryption fails with an error rather than returning wrong data.
-- **RAISERROR messages**: Progress messages in the session always show real names (they are ephemeral and not captured in result sets or logs).  This is by design; you need to see real names to monitor the session.
+- **RAISERROR messages**: Progress messages use pseudonyms when `@ObfuscateKey` is enabled. Without obfuscation, they show real names.
 - **Existing columns**: Physical stats, CPU metrics, ranking scores, and all numeric columns remain unobfuscated.  Only object name columns and generated command strings are pseudonymized.
