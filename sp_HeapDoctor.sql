@@ -53,9 +53,11 @@ License:    MIT License
 
 Version:    2026.11.19.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.11.19.1 - P2 fixes for queue safety, repeat runs, collation-safe scans,
-                          forced-plan checks, safe CI swap keys, and atomic parallel claims
-                          (#220, #221, #223, #226, #232, #240)
+History:    2026.11.19.1 - P2 fixes for queue recovery and claims, repeat runs, selection,
+                          collation-safe scans, forced-plan checks, safe CI swap keys,
+                          and obfuscation (#220, #221, #223, #224, #226, #227, #228,
+                          #229, #232, #233, #236, #240). ALL_DATABASES includes master,
+                          model, and msdb; tempdb remains excluded.
             2026.11.17.1 - Address P1 issues #214 through #219
             2026.08.02.1 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
@@ -660,8 +662,8 @@ Notes
 @Databases parameter (Ola Hallengren pattern):
   NULL            = current database only
   USER_DATABASES  = all user databases (excludes master, msdb, model, tempdb)
-  ALL_DATABASES   = same as USER_DATABASES (excludes system DBs)
-  SYSTEM_DATABASES = master, msdb, model only
+  ALL_DATABASES   = all databases except tempdb (includes master, model, and msdb)
+  SYSTEM_DATABASES = master, msdb, model, and distributor databases (excludes tempdb)
   AVAILABILITY_GROUP_DATABASES = databases in AG
   Wildcards:      'Prod%' matches ProdDB, ProdArchive, etc.
   Exclusions:     'USER_DATABASES, -ReportingArchive' = all user DBs except one
@@ -1018,9 +1020,9 @@ COMMON PARAMETERS:
                                         workers consume. Requires Ola Hallengren''s dbo.Queue.
                                         Sessions with the same parameters join an active queue;
                                         a completed invocation starts a fresh queue on the next run.
-                                        Phase A: if a worker is KILLed mid-rebuild, its claimed row
-                                        stays TableStartTime IS NOT NULL, TableEndTime IS NULL and
-                                        will NOT be retried by other workers. Manual cleanup needed.
+                                        If a worker is KILLed mid-rebuild, another worker reclaims
+                                        its row after the claiming session ends. Live claims are
+                                        never stolen. Recovered work is reported as incomplete.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'PARALLEL MODE:
@@ -1598,7 +1600,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         DECLARE @perm_db sysname;
         DECLARE @perm_sql nvarchar(max);
 
-        IF @Databases IS NULL
+        IF @Databases IS NULL AND @ExcludeDatabases IS NULL
         BEGIN
             SET @perm_db = DB_NAME();
             INSERT INTO #PermCheck(database_name, permission_name, granted)
@@ -1620,13 +1622,22 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                 SELECT d.name
                 FROM sys.databases AS d
                 WHERE d.state_desc = N'ONLINE'
+                  AND d.name <> N'tempdb'
                   AND HAS_DBACCESS(d.name) = 1
                   AND d.source_database_id IS NULL
                   AND d.is_read_only = 0
+                  AND NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM sys.dm_hadr_database_replica_states AS drs
+                      WHERE drs.database_id = d.database_id
+                        AND drs.is_local = 1
+                        AND drs.is_primary_replica = 0
+                  )
                   AND EXISTS
                   (
                       SELECT 1
-                      FROM STRING_SPLIT(ISNULL(@Databases, DB_NAME()), N',') AS item
+                       FROM STRING_SPLIT(ISNULL(@Databases, N'USER_DATABASES'), N',') AS item
                       CROSS APPLY (VALUES (LTRIM(RTRIM(item.value)))) AS parsed(DatabaseItem)
                       WHERE parsed.DatabaseItem <> N''
                         AND LEFT(parsed.DatabaseItem, 1) <> N'-'
@@ -1648,7 +1659,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                       FROM STRING_SPLIT
                       (
                           CONCAT(@Databases,
-                              CASE WHEN @ExcludeDatabases IS NULL THEN N''
+                               CASE WHEN @ExcludeDatabases IS NULL THEN N''
                                    ELSE N',-' + REPLACE(@ExcludeDatabases, N',', N',-') END),
                           N','
                       ) AS item

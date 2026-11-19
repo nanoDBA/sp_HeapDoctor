@@ -395,7 +395,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@Databases` | `NULL` | `NULL` = current DB.  Supports `USER_DATABASES`, `ALL_DATABASES`, `SYSTEM_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%`), exclusions (`-`), comma-separated. Databases with different collations are supported |
+| `@Databases` | `NULL` | `NULL` = current DB. Supports `USER_DATABASES`, `ALL_DATABASES`, `SYSTEM_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%`), exclusions (`-`), comma-separated. `ALL_DATABASES` includes master, model, and msdb; tempdb is excluded. Databases with different collations are supported |
 | `@Tables` | `NULL` | `NULL` = all tables.  Filter by table name: `'dbo.Orders'`, `'Orders'` (any schema), `'dbo.%'` (wildcard), `'-dbo.Staging%'` (exclude).  Same syntax as `@Databases` |
 | `@ExcludeDatabases` | `NULL` | Comma-separated databases to exclude.  Wildcards allowed; no `-` prefix needed.  Merged into `@Databases` before parsing, so it composes with it |
 | `@ExcludeTables` | `NULL` | Comma-separated tables to exclude, same syntax.  Merged into `@Tables` the same way |
@@ -445,7 +445,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@Force` | `0` | Bypass orphaned applock from KILLed sessions.  Use when prior run was killed and the re-entrancy guard blocks new runs |
 | `@AllowReplicationRebuild` | `0` | Allow published heap rebuilds (shows estimated replication events).  Heaps with `replication_hint` are skipped by default |
 | `@CheckPermissionsOnly` | `0` | Check permissions (ALTER TRACE, VIEW DATABASE STATE, ALTER, CommandLog INSERT) for selected databases and return without executing. Uses `@Databases` and `@ExcludeDatabases`; warns if none match |
-| `@HeapsInParallel` | `'N'` | `'Y'` = queue-based parallel rebuilds across sessions. Queue rows are claimed atomically; workers retry when remaining unclaimed rows are temporarily locked. Requires Ola Hallengren's `dbo.Queue`; `dbo.QueueHeapRebuild` is created automatically. Sessions with the same parameters join an active queue. A completed invocation starts a fresh queue on the next run. Incompatible with `@PlanOnly = 1` |
+| `@HeapsInParallel` | `'N'` | `'Y'` = queue-based parallel rebuilds across sessions. Queue rows are claimed atomically; workers retry when remaining unclaimed rows are temporarily locked and reclaim a dead worker's row after its session ends. Requires Ola Hallengren's `dbo.Queue`; `dbo.QueueHeapRebuild` is created automatically. Sessions with the same parameters join an active queue. A completed invocation starts a fresh queue on the next run. Incompatible with `@PlanOnly = 1` |
 
 Execution mode cannot be invoked inside `INSERT...EXEC` because that pattern opens a transaction. Capture a result set with `@PlanOnly = 1`, or call execution mode directly in autocommit mode.
 
