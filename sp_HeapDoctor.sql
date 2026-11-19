@@ -1011,6 +1011,8 @@ COMMON PARAMETERS:
   @HeapsInParallel   nvarchar(1) = N    Y = queue-based parallel rebuild. Run same EXECUTE from N
                                         sessions/Agent steps. Leader populates dbo.QueueHeapRebuild,
                                         workers consume. Requires Ola Hallengren''s dbo.Queue.
+                                        Sessions with the same parameters join an active queue;
+                                        a completed invocation starts a fresh queue on the next run.
                                         Phase A: if a worker is KILLed mid-rebuild, its claimed row
                                         stays TableStartTime IS NOT NULL, TableEndTime IS NULL and
                                         will NOT be retried by other workers. Manual cleanup needed.
@@ -2101,6 +2103,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     DECLARE @queue_id           integer = NULL;
     DECLARE @parallel_is_leader bit     = 1;  /* irrelevant unless @HeapsInParallel = 'Y' */
     DECLARE @parallel_worker    bit     = 0;  /* 1 = skip discovery (load targets from queue) */
+    DECLARE @parallel_request_id integer = NULL;
+    DECLARE @parallel_request_start_time datetime = NULL;
 
     IF @HeapsInParallel = N'Y'
     BEGIN
@@ -2177,27 +2181,78 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         IF COL_LENGTH(N'dbo.QueueHeapRebuild', N'HasForcedPlans') IS NULL
             ALTER TABLE dbo.QueueHeapRebuild ADD HasForcedPlans bit NULL;
 
-        /* Leader election: race on dbo.Queue insertion. Same @invocation_command -> same QueueID. */
-        SELECT @queue_id = q.QueueID
+        /* Join only a queue whose discovery or target work still has a live request. */
+        SELECT TOP (1) @queue_id = q.QueueID
         FROM dbo.Queue AS q
         WHERE q.SchemaName = N'dbo'
           AND q.ObjectName = N'sp_HeapDoctor'
-          AND q.Parameters = @invocation_command;
+          AND q.Parameters = @invocation_command
+          AND (
+              EXISTS
+              (
+                  SELECT 1
+                  FROM sys.dm_exec_requests AS r
+                  WHERE r.session_id = q.SessionID
+                    AND r.request_id = q.RequestID
+                    AND r.start_time = q.RequestStartTime
+              )
+              OR EXISTS
+              (
+                  SELECT 1
+                  FROM dbo.QueueHeapRebuild AS qhr
+                  JOIN sys.dm_exec_requests AS r ON r.session_id = qhr.SessionID
+                  JOIN sys.dm_exec_sessions AS s ON s.session_id = qhr.SessionID
+                                                AND s.login_time = qhr.ClaimLoginTime
+                  WHERE qhr.QueueID = q.QueueID
+                    AND qhr.TableStartTime IS NOT NULL
+                    AND qhr.TableEndTime IS NULL
+              )
+          )
+        ORDER BY q.QueueID DESC;
 
         IF @queue_id IS NULL
         BEGIN
             BEGIN TRANSACTION;
 
-            SELECT @queue_id = q.QueueID
+            SELECT TOP (1) @queue_id = q.QueueID
             FROM dbo.Queue AS q WITH (UPDLOCK, HOLDLOCK)
             WHERE q.SchemaName = N'dbo'
               AND q.ObjectName = N'sp_HeapDoctor'
-              AND q.Parameters = @invocation_command;
+              AND q.Parameters = @invocation_command
+              AND (
+                  EXISTS
+                  (
+                      SELECT 1
+                      FROM sys.dm_exec_requests AS r
+                      WHERE r.session_id = q.SessionID
+                        AND r.request_id = q.RequestID
+                        AND r.start_time = q.RequestStartTime
+                  )
+                  OR EXISTS
+                  (
+                      SELECT 1
+                      FROM dbo.QueueHeapRebuild AS qhr
+                      JOIN sys.dm_exec_requests AS r ON r.session_id = qhr.SessionID
+                      JOIN sys.dm_exec_sessions AS s ON s.session_id = qhr.SessionID
+                                                    AND s.login_time = qhr.ClaimLoginTime
+                      WHERE qhr.QueueID = q.QueueID
+                        AND qhr.TableStartTime IS NOT NULL
+                        AND qhr.TableEndTime IS NULL
+                  )
+              )
+            ORDER BY q.QueueID DESC;
 
             IF @queue_id IS NULL
             BEGIN
-                INSERT INTO dbo.Queue (SchemaName, ObjectName, Parameters)
-                SELECT N'dbo', N'sp_HeapDoctor', @invocation_command;
+                SELECT @parallel_request_id = r.request_id,
+                       @parallel_request_start_time = r.start_time
+                FROM sys.dm_exec_requests AS r
+                WHERE r.session_id = @@SPID;
+
+                INSERT INTO dbo.Queue
+                    (SchemaName, ObjectName, Parameters, QueueStartTime, SessionID, RequestID, RequestStartTime)
+                SELECT N'dbo', N'sp_HeapDoctor', @invocation_command, SYSDATETIME(), @@SPID,
+                       @parallel_request_id, @parallel_request_start_time;
 
                 SET @queue_id = CONVERT(integer, SCOPE_IDENTITY());
                 SET @parallel_is_leader = 1;
