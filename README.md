@@ -794,6 +794,9 @@ This eliminates forwarded records by physically reordering the data.  The temp C
 - Temporal history table (`is_temporal_history = 1`)
 - Computed columns excluded from CI swap key candidates
 
+Forced plans are checked whenever Query Store is readable, regardless of `@CpuSource`.
+Matching includes both schema and table names, with LIKE metacharacters treated literally.
+
 **Trade-off:** Every nonclustered index on the table gets rebuilt when the clustered index is created, *and again* when it's dropped.  Check the `nci_count` column in the output before committing to this.  A table with 2 NCIs?  Sure.  A table with 15 NCIs?  Maybe just do the heap rebuild.
 
 ## Write-Heavy Heaps

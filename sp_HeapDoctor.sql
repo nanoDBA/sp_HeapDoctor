@@ -53,8 +53,8 @@ License:    MIT License
 
 Version:    2026.11.19.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.11.19.1 - P2 fixes for parallel queue safety, repeat runs, and collation-safe scans
-                          (#221, #223, #240)
+History:    2026.11.19.1 - P2 fixes for parallel queue safety, repeat runs, collation-safe scans,
+                          and exact forced-plan checks (#221, #223, #232, #240)
             2026.11.17.1 - Address P1 issues #214 through #219
             2026.08.02.1 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
@@ -963,7 +963,8 @@ COMMON PARAMETERS:
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'ADVANCED PARAMETERS:
-  @CpuSource         varchar = QUERY_STORE  QUERY_STORE | QUICKIESTORE | NONE
+  @CpuSource         varchar = QUERY_STORE  QUERY_STORE | QUICKIESTORE | NONE.
+                                        Forced Query Store plans block CI swap for every source.
   @LookbackDays      integer     = 7       Query Store lookback window in days.
   @MaxPages          bigint  = NULL    Skip heaps larger than this (NULL=no cap).
   @OnlinePreference  varchar = AUTO     AUTO | ON (require) | OFF (force offline)
@@ -3745,12 +3746,15 @@ Ranked AS
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = h.object_id
              AND name = N''CX__Temp__'' + LEFT(h.table_name COLLATE DATABASE_DEFAULT, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
         /* 8I: Forced plan check - CI swap invalidates forced plans */
-        /* Lightweight LIKE on forced plans only (no XML parsing needed). */
+        /* Escape LIKE metacharacters and include schema to avoid false positives. */
         /* sys.query_store_plan is safe to query when QS is OFF (returns empty set). */
-        CASE WHEN @CpuSource_param COLLATE DATABASE_DEFAULT = N''QUERY_STORE''
-             AND EXISTS (SELECT 1 FROM sys.query_store_plan fp
+        CASE WHEN EXISTS (SELECT 1 FROM sys.query_store_plan fp
                          WHERE fp.is_forced_plan = 1
-                         AND fp.query_plan LIKE N''%Table="[[]'' + h.table_name COLLATE DATABASE_DEFAULT + N'']%'')
+                         AND fp.query_plan LIKE N''%Schema="[[]''
+                             + REPLACE(REPLACE(REPLACE(h.schema_name COLLATE DATABASE_DEFAULT, N''['', N''[[]''), N''%'', N''[%]''), N''_'', N''[_]'')
+                             + N'']" Table="[[]''
+                             + REPLACE(REPLACE(REPLACE(h.table_name COLLATE DATABASE_DEFAULT, N''['', N''[[]''), N''%'', N''[%]''), N''_'', N''[_]'')
+                             + N'']%'')
         THEN 1 ELSE 0 END AS has_forced_plans,
         /* QS performance snapshot (NULL when CpuSource=NONE or QS not available) */
         CASE WHEN cbo.object_id IS NOT NULL THEN SYSUTCDATETIME() ELSE NULL END AS qs_snapshot_time_utc,
@@ -3965,14 +3969,12 @@ BEGIN
     DEALLOCATE repl_cursor;
 END
 
-/* 8I: Forced plan warning */
-/* has_forced_plans in Ranked CTE uses lightweight LIKE on sys.query_store_plan. */
-/* If CI_SWAP conditions are met but action_chosen is not CI_SWAP_ONLINE, forced plans caused the downgrade. */
-IF @CpuSource_param COLLATE DATABASE_DEFAULT = N''QUERY_STORE''
-   AND @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
+/* 8I: Warn about forced plans that blocked a requested CI swap, for any CPU source. */
+IF @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
    AND EXISTS (SELECT 1 FROM #Targets t
                WHERE t.database_name = DB_NAME()
                  AND t.action_chosen <> ''CI_SWAP_ONLINE''
+                 AND t.has_forced_plans = 1
                  AND t.temp_key_cols IS NOT NULL
                  AND t.has_lob_columns = 0)
 BEGIN
@@ -3980,6 +3982,7 @@ BEGIN
         SELECT t.schema_name, t.table_name FROM #Targets t
         WHERE t.database_name = DB_NAME()
           AND t.action_chosen <> ''CI_SWAP_ONLINE''
+          AND t.has_forced_plans = 1
           AND t.temp_key_cols IS NOT NULL
           AND t.has_lob_columns = 0;
     DECLARE @fp_schema sysname, @fp_table sysname;
