@@ -944,7 +944,7 @@ COMMON PARAMETERS:
   @Execute           nvarchar(1) = NULL  Ola convention: Y=execute, N=plan only. Overrides @PlanOnly.
   Real execution is refused inside INSERT...EXEC. That pattern opens a transaction.
   Use @PlanOnly=1 to capture the result set with INSERT...EXEC.
-  @TopN              integer     = 25      Max targets per database.
+  @TopN              integer     = 25      Max targets per database; NULL = no limit.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'  @MinPages          bigint  = 1000    Discovery filter: heaps below this page count are excluded.
@@ -1838,7 +1838,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     SET @invocation_command += N', @PlanOnly = ' + CONVERT(nvarchar(1), @PlanOnly);
     /* #107: Always include key filter params for historical audit (even at default values) */
     SET @invocation_command += N', @LookbackDays = ' + CONVERT(nvarchar(10), @LookbackDays);
-    SET @invocation_command += N', @TopN = ' + CONVERT(nvarchar(10), @TopN);
+    SET @invocation_command += N', @TopN = ' + ISNULL(CONVERT(nvarchar(10), @TopN), N'NULL');
     SET @invocation_command += N', @MinPages = ' + CONVERT(nvarchar(20), @MinPages);
     IF @MaxPages IS NOT NULL
         SET @invocation_command += N', @MaxPages = ' + CONVERT(nvarchar(20), @MaxPages);
@@ -3652,7 +3652,8 @@ INSERT INTO #Targets
     usage_hint, ranking_score, verify_command,
     has_forced_plans   /* #185 */
 )
-SELECT TOP (@TopN_param)
+/* NULL means no per-database cap; TOP cannot accept NULL (issue #224). */
+SELECT TOP (ISNULL(@TopN_param, 2147483647))
     DB_NAME(),
     r.object_id, r.schema_name, r.table_name,
     r.page_count, r.record_count, r.forwarded_record_count, r.forwarded_pct,

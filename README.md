@@ -400,7 +400,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@ExcludeDatabases` | `NULL` | Comma-separated databases to exclude.  Wildcards allowed; no `-` prefix needed.  Merged into `@Databases` before parsing, so it composes with it |
 | `@ExcludeTables` | `NULL` | Comma-separated tables to exclude, same syntax.  Merged into `@Tables` the same way |
 | `@LookbackDays` | `7` | Query Store lookback window in days |
-| `@TopN` | `25` | Max targets per database |
+| `@TopN` | `25` | Max targets per database (`NULL` = no limit) |
 | `@MinPages` | `1000` | Skip heaps smaller than this (page count) |
 | `@MaxPages` | `NULL` | Skip heaps larger than this (`NULL` = no cap) |
 | `@MinForwardedPct` | `2.00` | Minimum forwarded record % to qualify.  Applied to a `SAMPLED` estimate by default, so a borderline heap can be excluded by sampling error; excluded counts are reported per database |
