@@ -395,7 +395,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@Databases` | `NULL` | `NULL` = current DB.  Supports `USER_DATABASES`, `ALL_DATABASES`, `SYSTEM_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%`), exclusions (`-`), comma-separated |
+| `@Databases` | `NULL` | `NULL` = current DB.  Supports `USER_DATABASES`, `ALL_DATABASES`, `SYSTEM_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%`), exclusions (`-`), comma-separated. Databases with different collations are supported |
 | `@Tables` | `NULL` | `NULL` = all tables.  Filter by table name: `'dbo.Orders'`, `'Orders'` (any schema), `'dbo.%'` (wildcard), `'-dbo.Staging%'` (exclude).  Same syntax as `@Databases` |
 | `@ExcludeDatabases` | `NULL` | Comma-separated databases to exclude.  Wildcards allowed; no `-` prefix needed.  Merged into `@Databases` before parsing, so it composes with it |
 | `@ExcludeTables` | `NULL` | Comma-separated tables to exclude, same syntax.  Merged into `@Tables` the same way |

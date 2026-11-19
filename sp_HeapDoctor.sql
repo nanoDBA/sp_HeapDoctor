@@ -53,7 +53,8 @@ License:    MIT License
 
 Version:    2026.11.19.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.11.19.1 - P2 fixes for parallel queue safety and repeat runs (#221, #223)
+History:    2026.11.19.1 - P2 fixes for parallel queue safety, repeat runs, and collation-safe scans
+                          (#221, #223, #240)
             2026.11.17.1 - Address P1 issues #214 through #219
             2026.08.02.1 - Adopt two conventions from sp_StatUpdate's CONSISTENCY_GUIDELINES.md
                           - Output parameter contract: the zero-target exit left @TargetsFound,
@@ -932,6 +933,7 @@ COMMON PARAMETERS:
   @Databases         nvarchar(max) = NULL  NULL=current DB. USER_DATABASES, ALL_DATABASES,
                                         SYSTEM_DATABASES, AVAILABILITY_GROUP_DATABASES,
                                         wildcards (%%), exclusions (-), comma-separated.
+                                        Databases with different collations are supported.
   @ExcludeDatabases  nvarchar(max) = NULL  Patterns to exclude (no - prefix). Combines with @Databases;
                                         implies USER_DATABASES when @Databases is NULL.
 ', 10, 1, @Version) WITH NOWAIT;
@@ -3068,6 +3070,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         @CurrentDatabaseName sysname,
         @CurrentDatabaseID   integer,
         @discovery_sql       nvarchar(max),
+        @discovery_collation_clause nvarchar(258),
         @discovery_errors    integer = 0,
         @discovery_blocked   integer = 0,   /* #199: scans that timed out waiting for a lock */
         @heaps_filtered      integer = 0,   /* #198/#203: heaps dropped by @MinForwardedPct, all databases */
@@ -3094,6 +3097,11 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         FROM @tmpDatabases
         WHERE Selected = 1 AND Completed = 0
         ORDER BY ID;
+
+        /* The collation name comes from sys.databases and is a SQL Server collation identifier. */
+        SELECT @discovery_collation_clause = N'COLLATE ' + collation_name
+        FROM sys.databases
+        WHERE database_id = @CurrentDatabaseID;
 
         SET @Msg = N'Scanning database: ' + @CurrentDatabaseName;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -3235,13 +3243,13 @@ WHERE o.is_memory_optimized = 0
   AND (NOT EXISTS (SELECT 1 FROM #SelectedTables WHERE Selected = 1)
        OR EXISTS (SELECT 1 FROM #SelectedTables st
                   WHERE st.Selected = 1
-                  AND s.name LIKE REPLACE(st.SchemaPattern, N''_'', N''[_]'')
-                  AND o.name LIKE REPLACE(st.TablePattern, N''_'', N''[_]'')))
+                  AND s.name LIKE REPLACE(st.SchemaPattern COLLATE DATABASE_DEFAULT, N''_'', N''[_]'')
+                  AND o.name LIKE REPLACE(st.TablePattern COLLATE DATABASE_DEFAULT, N''_'', N''[_]'')))
   /* Table exclude filter */
   AND NOT EXISTS (SELECT 1 FROM #SelectedTables st
                   WHERE st.Selected = 0
-                  AND s.name LIKE REPLACE(st.SchemaPattern, N''_'', N''[_]'')
-                  AND o.name LIKE REPLACE(st.TablePattern, N''_'', N''[_]''))';
+                  AND s.name LIKE REPLACE(st.SchemaPattern COLLATE DATABASE_DEFAULT, N''_'', N''[_]'')
+                  AND o.name LIKE REPLACE(st.TablePattern COLLATE DATABASE_DEFAULT, N''_'', N''[_]''))';
 
         SET @discovery_sql += N';
 
@@ -3535,12 +3543,12 @@ BEGIN
                        + N'' heap(s) excluded: forwarded pct below @MinForwardedPct = ''
                        + CONVERT(nvarchar(20), @MinForwardedPct_param)
                        + CASE
-                             WHEN @ScanMode_param = N''SAMPLED'' AND @below_large > 0
+                             WHEN @ScanMode_param COLLATE DATABASE_DEFAULT = N''SAMPLED'' AND @below_large > 0
                                  THEN N''. For '' + CONVERT(nvarchar(10), @below_large)
                                     + N'' heap(s) at or above 10,000 pages the counts are SAMPLED estimates;''
                                     + N'' use @ScanMode = DETAILED to confirm a borderline one.''
                                     + N'' Below 10,000 pages DETAILED ran automatically and counts are exact.''
-                             WHEN @ScanMode_param = N''SAMPLED''
+                             WHEN @ScanMode_param COLLATE DATABASE_DEFAULT = N''SAMPLED''
                                  THEN N''. Counts are exact: every excluded heap is under 10,000 pages,''
                                     + N'' where SQL Server runs DETAILED regardless of the requested SAMPLED mode.''
                              ELSE N''.''
@@ -3709,7 +3717,7 @@ Ranked AS
         h.forwarded_fetch_count,
         cbo.total_cpu_ms,
         CASE
-            WHEN @CpuSource_param = ''NONE'' THEN ''FWD_PCT''
+            WHEN @CpuSource_param COLLATE DATABASE_DEFAULT = ''NONE'' THEN ''FWD_PCT''
             WHEN cbo.total_cpu_ms IS NOT NULL THEN ''QS_CPU''
             WHEN @QsRw = 0 THEN ''QS_DISABLED''
             ELSE ''QS_NO_DATA''
@@ -3735,14 +3743,14 @@ Ranked AS
         h.temporal_parent_table,
         /* Leftover temp CI from failed previous run */
         CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = h.object_id
-             AND name = N''CX__Temp__'' + LEFT(h.table_name, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
+             AND name = N''CX__Temp__'' + LEFT(h.table_name COLLATE DATABASE_DEFAULT, 108)) THEN 1 ELSE 0 END AS has_leftover_ci,
         /* 8I: Forced plan check - CI swap invalidates forced plans */
         /* Lightweight LIKE on forced plans only (no XML parsing needed). */
         /* sys.query_store_plan is safe to query when QS is OFF (returns empty set). */
-        CASE WHEN @CpuSource_param = N''QUERY_STORE''
+        CASE WHEN @CpuSource_param COLLATE DATABASE_DEFAULT = N''QUERY_STORE''
              AND EXISTS (SELECT 1 FROM sys.query_store_plan fp
                          WHERE fp.is_forced_plan = 1
-                         AND fp.query_plan LIKE N''%Table="[[]'' + h.table_name + N'']%'')
+                         AND fp.query_plan LIKE N''%Table="[[]'' + h.table_name COLLATE DATABASE_DEFAULT + N'']%'')
         THEN 1 ELSE 0 END AS has_forced_plans,
         /* QS performance snapshot (NULL when CpuSource=NONE or QS not available) */
         CASE WHEN cbo.object_id IS NOT NULL THEN SYSUTCDATETIME() ELSE NULL END AS qs_snapshot_time_utc,
@@ -3960,7 +3968,7 @@ END
 /* 8I: Forced plan warning */
 /* has_forced_plans in Ranked CTE uses lightweight LIKE on sys.query_store_plan. */
 /* If CI_SWAP conditions are met but action_chosen is not CI_SWAP_ONLINE, forced plans caused the downgrade. */
-IF @CpuSource_param = N''QUERY_STORE''
+IF @CpuSource_param COLLATE DATABASE_DEFAULT = N''QUERY_STORE''
    AND @AllowCiSwap_param = 1 AND @PreferCiSwap_param = 1 AND @Online_param = 1
    AND EXISTS (SELECT 1 FROM #Targets t
                WHERE t.database_name = DB_NAME()
@@ -4139,7 +4147,7 @@ BEGIN
             JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
             WHERE EXISTS (SELECT 1 FROM #Targets t
                           WHERE t.database_name = DB_NAME()
-                          AND p.query_plan LIKE N''%Table="[[]'' + t.table_name + N'']%'')
+                          AND p.query_plan LIKE N''%Table="[[]'' + t.table_name COLLATE DATABASE_DEFAULT + N'']%'')
         ) sub
         WHERE sub.rn = 1;
 
@@ -4230,6 +4238,10 @@ BEGIN
 END
 ';
         END
+
+        /* Replace DATABASE_DEFAULT with the target database collation. The procedure
+           runs in master and temp table columns inherit tempdb's collation. */
+        SET @discovery_sql = REPLACE(@discovery_sql, N'COLLATE DATABASE_DEFAULT', @discovery_collation_clause);
 
         /*
         #209: dynamic SQL must be printable before execution. Without this, a broken
@@ -4608,7 +4620,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
                 JOIN sys.query_store_query q ON p.query_id = q.query_id
                 WHERE EXISTS (SELECT 1 FROM #Targets t2 WHERE t2.database_name = DB_NAME()
-                              AND p.query_plan LIKE N'%Table="[[]' + t2.table_name + N']%')
+                              AND p.query_plan LIKE N'%Table="[[]' + t2.table_name COLLATE DATABASE_DEFAULT + N']%')
             ),
             PlanObj AS
             (

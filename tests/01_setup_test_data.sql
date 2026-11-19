@@ -569,3 +569,32 @@ ORDER BY t.name;
 RAISERROR(N'', 10, 1) WITH NOWAIT;
 RAISERROR(N'Setup complete. Run the test scripts next.', 10, 1) WITH NOWAIT;
 GO
+
+------------------------------------------------------------------------
+-- 7) Heap fixture whose database collation differs from tempdb/server defaults
+------------------------------------------------------------------------
+IF DB_ID(N'HeapDoctorCollationTest') IS NULL
+    EXECUTE(N'CREATE DATABASE HeapDoctorCollationTest COLLATE Latin1_General_100_BIN2;');
+GO
+USE HeapDoctorCollationTest;
+GO
+IF OBJECT_ID(N'dbo.CollationHeap', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.CollationHeap
+    (
+        ID int NOT NULL,
+        Padding varchar(2000) NOT NULL
+    );
+    ;WITH N AS
+    (
+        SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b
+    )
+    INSERT dbo.CollationHeap (ID, Padding)
+    SELECT TOP (6000) n, 'x' FROM N;
+    UPDATE dbo.CollationHeap SET Padding = REPLICATE('x', 1500) WHERE ID % 2 = 0;
+    CREATE UNIQUE NONCLUSTERED INDEX UX_CollationHeap_ID ON dbo.CollationHeap(ID);
+END;
+GO
+USE HeapDoctorTest;
+GO
