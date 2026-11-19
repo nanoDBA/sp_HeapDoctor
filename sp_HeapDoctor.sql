@@ -1279,9 +1279,51 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         /* If no stored seed, the original run used @RunID as seed */
         DECLARE @reveal_passphrase nvarchar(max) = @RevealKey + ISNULL(@stored_seed, CONVERT(nvarchar(36), @RevealRunID));
 
-        /* Decrypt the mapping */
+        /* New mappings use independently encrypted byte chunks so each passphrase
+           input stays below ENCRYPTBYPASSPHRASE's 8,000-byte limit. Keep reading
+           the original single-blob format for runs written by older versions. */
         DECLARE @encrypted_blob varbinary(max) = CONVERT(varbinary(max), @hex_mapping, 2);
-        DECLARE @decrypted_bytes varbinary(max) = DECRYPTBYPASSPHRASE(@reveal_passphrase, @encrypted_blob);
+        DECLARE @chunk_marker varbinary(12) = CONVERT(varbinary(12), N'HDOM2:');
+        DECLARE @decrypted_bytes varbinary(max);
+
+        IF SUBSTRING(@encrypted_blob, 1, DATALENGTH(@chunk_marker)) = @chunk_marker
+        BEGIN
+            DECLARE @chunk_envelope xml = TRY_CONVERT(xml, CONVERT(nvarchar(max),
+                SUBSTRING(@encrypted_blob, DATALENGTH(@chunk_marker) + 1,
+                    DATALENGTH(@encrypted_blob) - DATALENGTH(@chunk_marker))));
+            IF @chunk_envelope IS NULL
+            BEGIN
+                RAISERROR(N'Encrypted mapping chunk envelope is invalid.', 16, 1);
+                RETURN;
+            END
+
+            SET @decrypted_bytes = 0x;
+            DECLARE @chunk_hex nvarchar(max), @chunk_bytes varbinary(max), @chunk_sequence int;
+            DECLARE mapping_chunks CURSOR LOCAL FAST_FORWARD FOR
+                SELECT c.value(N'(@Sequence)[1]', N'int'),
+                       c.value(N'(text())[1]', N'nvarchar(max)')
+                FROM @chunk_envelope.nodes(N'/EncryptedMapping/Chunk') AS chunks(c)
+                ORDER BY c.value(N'(@Sequence)[1]', N'int');
+            OPEN mapping_chunks;
+            FETCH NEXT FROM mapping_chunks INTO @chunk_sequence, @chunk_hex;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @chunk_bytes = DECRYPTBYPASSPHRASE
+                    (@reveal_passphrase, CONVERT(varbinary(max), @chunk_hex, 2));
+                IF @chunk_bytes IS NULL
+                BEGIN
+                    CLOSE mapping_chunks;
+                    DEALLOCATE mapping_chunks;
+                    RAISERROR(N'Encrypted mapping chunk decryption failed. The @RevealKey may not match this RunID.', 16, 1);
+                END
+                SET @decrypted_bytes = @decrypted_bytes + @chunk_bytes;
+                FETCH NEXT FROM mapping_chunks INTO @chunk_sequence, @chunk_hex;
+            END
+            CLOSE mapping_chunks;
+            DEALLOCATE mapping_chunks;
+        END
+        ELSE
+            SET @decrypted_bytes = DECRYPTBYPASSPHRASE(@reveal_passphrase, @encrypted_blob);
 
         IF @decrypted_bytes IS NULL
         BEGIN
@@ -5470,10 +5512,36 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                 FOR XML RAW(N'Object'), ROOT(N'ObfuscatedMapping'), ELEMENTS
             ));
 
-            SET @obfu_mapping_encrypted = ENCRYPTBYPASSPHRASE(
-                @passphrase,
-                CONVERT(varbinary(max), @obfu_mapping_xml)
+            DECLARE @obfu_mapping_bytes varbinary(max) = CONVERT(varbinary(max), @obfu_mapping_xml);
+            DECLARE @obfu_mapping_chunks TABLE
+            (
+                ChunkNumber integer NOT NULL PRIMARY KEY,
+                EncryptedHex nvarchar(max) NOT NULL
             );
+            DECLARE @mapping_offset bigint = 1, @mapping_chunk_number integer = 1;
+            DECLARE @mapping_chunk varbinary(max), @mapping_chunk_encrypted varbinary(max);
+
+            WHILE @mapping_offset <= DATALENGTH(@obfu_mapping_bytes)
+            BEGIN
+                SET @mapping_chunk = SUBSTRING(@obfu_mapping_bytes, @mapping_offset, 7800);
+                SET @mapping_chunk_encrypted = ENCRYPTBYPASSPHRASE(@passphrase, @mapping_chunk);
+                IF @mapping_chunk_encrypted IS NULL
+                    RAISERROR(N'Obfuscated name mapping encryption returned NULL.', 16, 1);
+
+                INSERT INTO @obfu_mapping_chunks (ChunkNumber, EncryptedHex)
+                VALUES (@mapping_chunk_number, CONVERT(nvarchar(max), @mapping_chunk_encrypted, 2));
+                SET @mapping_offset += DATALENGTH(@mapping_chunk);
+                SET @mapping_chunk_number += 1;
+            END
+
+            DECLARE @obfu_mapping_envelope nvarchar(max) = CONVERT(nvarchar(max),
+            (
+                SELECT ChunkNumber AS [@Sequence], EncryptedHex AS [text()]
+                FROM @obfu_mapping_chunks
+                ORDER BY ChunkNumber
+                FOR XML PATH(N'Chunk'), ROOT(N'EncryptedMapping'), TYPE
+            ));
+            SET @obfu_mapping_encrypted = CONVERT(varbinary(max), N'HDOM2:' + @obfu_mapping_envelope);
         END
 
         /* 8b: Populate pseudo_ columns using #ObfuMap for atomic real->pseudo transformation */
