@@ -2248,7 +2248,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                     CASE
                         WHEN DatabaseItem = N'SYSTEM_DATABASES' THEN 'S'
                         WHEN DatabaseItem = N'USER_DATABASES' THEN 'U'
-                        WHEN DatabaseItem = N'ALL_DATABASES' THEN 'U'
+                        /* ALL_DATABASES has no user/system type restriction. */
                         ELSE NULL
                     END,
                 AvailabilityGroup =
