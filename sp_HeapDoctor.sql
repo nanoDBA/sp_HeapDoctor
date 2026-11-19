@@ -1331,6 +1331,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                     CLOSE mapping_chunks;
                     DEALLOCATE mapping_chunks;
                     RAISERROR(N'Encrypted mapping chunk decryption failed. The @RevealKey may not match this RunID.', 16, 1);
+                    RETURN;
                 END
                 SET @decrypted_bytes = @decrypted_bytes + @chunk_bytes;
                 FETCH NEXT FROM mapping_chunks INTO @chunk_sequence, @chunk_hex;
