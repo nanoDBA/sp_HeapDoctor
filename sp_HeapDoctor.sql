@@ -2761,7 +2761,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             days_since_last_rebuild,
             qs_snapshot_time_utc, qs_total_logical_reads, qs_total_physical_reads,
             qs_total_duration_ms, qs_total_executions, qs_plan_count, qs_query_count,
-            qs_query_hashes
+            qs_query_hashes, has_forced_plans
         )
         SELECT
             t.c.value(N'@DatabaseName',          N'sysname'),
@@ -2819,7 +2819,8 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             t.c.value(N'@QsTotalExecutions',     N'bigint'),
             t.c.value(N'@QsPlanCount',           N'int'),
             t.c.value(N'@QsQueryCount',          N'int'),
-            t.c.value(N'@QsQueryHashes',         N'nvarchar(max)')
+            t.c.value(N'@QsQueryHashes',         N'nvarchar(max)'),
+            ISNULL(t.c.value(N'@HasForcedPlans', N'bit'), 0)
         FROM @resume_xml.nodes(N'/ScanSummary/Targets/Target') AS t(c);
 
         SET @resume_loaded = 1;
@@ -6372,6 +6373,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             qs_plan_count AS QsPlanCount,
                             qs_query_count AS QsQueryCount,
                             qs_query_hashes AS QsQueryHashes,
+                            has_forced_plans AS HasForcedPlans,
                             CASE
                                 WHEN action_chosen = 'CI_SWAP_ONLINE' THEN 'CI_SWAP'
                                 WHEN action_chosen LIKE 'HEAP_REBUILD%' THEN 'REBUILD'
