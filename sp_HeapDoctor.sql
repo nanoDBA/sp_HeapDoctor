@@ -990,7 +990,8 @@ COMMON PARAMETERS:
         RAISERROR(N'  @BaselineRebuildMBPerMin integer = NULL  Cold-start: assumed MB/min when no CommandLog history
                                         exists. Typical range 100-2000 (SSD vs HDD).
   @UpdateStatsAfterRebuild bit = 0    Run UPDATE STATISTICS WITH FULLSCAN after each rebuild.
-  @CheckPermissionsOnly bit  = 0       Check required permissions per database and return.
+  @CheckPermissionsOnly bit  = 0       Check required permissions for the selected databases and return.
+                                        Uses @Databases and @ExcludeDatabases; warns when none match.
   @AllowReplicationRebuild bit = 0    Published heaps skipped unless 1 (replication log flood risk).
   @Force             bit     = 0       Bypass re-entrancy guard (orphaned applock from KILLed run).
 ', 10, 1) WITH NOWAIT;
@@ -1603,13 +1604,56 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         ELSE
         BEGIN
             DECLARE perm_cursor CURSOR LOCAL FAST_FORWARD FOR
-                SELECT name FROM sys.databases
-                WHERE state_desc = N'ONLINE'
-                  AND HAS_DBACCESS(name) = 1
-                  AND (@Databases = N'USER_DATABASES' AND database_id > 4
-                    OR @Databases = N'ALL_DATABASES'
-                    OR @Databases = N'SYSTEM_DATABASES' AND database_id <= 4
-                    OR name LIKE REPLACE(@Databases, N'*', N'%'));
+                SELECT d.name
+                FROM sys.databases AS d
+                WHERE d.state_desc = N'ONLINE'
+                  AND HAS_DBACCESS(d.name) = 1
+                  AND d.source_database_id IS NULL
+                  AND d.is_read_only = 0
+                  AND EXISTS
+                  (
+                      SELECT 1
+                      FROM STRING_SPLIT(ISNULL(@Databases, DB_NAME()), N',') AS item
+                      CROSS APPLY (VALUES (LTRIM(RTRIM(item.value)))) AS parsed(DatabaseItem)
+                      WHERE parsed.DatabaseItem <> N''
+                        AND LEFT(parsed.DatabaseItem, 1) <> N'-'
+                        AND
+                        (
+                            parsed.DatabaseItem = N'ALL_DATABASES'
+                            OR parsed.DatabaseItem = N'SYSTEM_DATABASES'
+                               AND (d.database_id <= 4 OR d.is_distributor = 1)
+                            OR parsed.DatabaseItem = N'USER_DATABASES'
+                               AND d.database_id > 4 AND d.is_distributor = 0
+                            OR parsed.DatabaseItem = N'AVAILABILITY_GROUP_DATABASES'
+                               AND sys.fn_hadr_is_primary_replica(d.name) = 1
+                            OR d.name LIKE REPLACE(REPLACE(parsed.DatabaseItem, N'*', N'%'), N'_', N'[_]')
+                        )
+                  )
+                  AND NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM STRING_SPLIT
+                      (
+                          CONCAT(@Databases,
+                              CASE WHEN @ExcludeDatabases IS NULL THEN N''
+                                   ELSE N',-' + REPLACE(@ExcludeDatabases, N',', N',-') END),
+                          N','
+                      ) AS item
+                      CROSS APPLY (VALUES (LTRIM(RTRIM(item.value)))) AS parsed(DatabaseItem)
+                      WHERE LEFT(parsed.DatabaseItem, 1) = N'-'
+                        AND
+                        (
+                            STUFF(parsed.DatabaseItem, 1, 1, N'') = N'ALL_DATABASES'
+                            OR STUFF(parsed.DatabaseItem, 1, 1, N'') = N'SYSTEM_DATABASES'
+                               AND (d.database_id <= 4 OR d.is_distributor = 1)
+                            OR STUFF(parsed.DatabaseItem, 1, 1, N'') = N'USER_DATABASES'
+                               AND d.database_id > 4 AND d.is_distributor = 0
+                            OR STUFF(parsed.DatabaseItem, 1, 1, N'') = N'AVAILABILITY_GROUP_DATABASES'
+                               AND sys.fn_hadr_is_primary_replica(d.name) = 1
+                            OR d.name LIKE REPLACE(REPLACE(STUFF(parsed.DatabaseItem, 1, 1, N''), N'*', N'%'), N'_', N'[_]')
+                        )
+                  )
+                ORDER BY d.name;
             OPEN perm_cursor;
             FETCH NEXT FROM perm_cursor INTO @perm_db;
             WHILE @@FETCH_STATUS = 0
@@ -1632,9 +1676,14 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         ORDER BY CASE WHEN granted = N'N' THEN 0 ELSE 1 END, database_name, permission_name;
 
         /* Summary */
-        DECLARE @missing_count integer;
+        DECLARE @missing_count integer, @checked_database_count integer;
         SELECT @missing_count = COUNT_BIG(*) FROM #PermCheck WHERE granted = N'N';
-        IF @missing_count > 0
+        SELECT @checked_database_count = COUNT(DISTINCT database_name)
+        FROM #PermCheck
+        WHERE database_name <> N'(server)';
+        IF @checked_database_count = 0
+            RAISERROR(N'No databases matched @Databases; the permission check is incomplete.', 10, 1) WITH NOWAIT;
+        ELSE IF @missing_count > 0
         BEGIN
             SET @Msg = CONVERT(nvarchar(10), @missing_count) + N' missing permission(s) found. See result set above.';
             RAISERROR(@Msg, 10, 1) WITH NOWAIT;
@@ -1652,8 +1701,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @Succeeded    = 0;
         SET @Failed       = 0;
         SET @Skipped      = 0;
-        SET @Status       = 'SUCCESS';
-        SET @StatusMessage = N'Informational mode: no scan or rebuild was performed.';
+        SET @Status       = CASE WHEN @checked_database_count = 0 THEN 'WARNING' ELSE 'SUCCESS' END;
+        SET @StatusMessage = CASE WHEN @checked_database_count = 0
+            THEN N'Informational mode: permission check incomplete because no databases matched @Databases.'
+            ELSE N'Informational mode: no scan or rebuild was performed.' END;
 
         RETURN;
     END

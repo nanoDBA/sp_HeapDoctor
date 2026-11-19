@@ -444,7 +444,7 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | `@ResumeRunID` | `NULL` | Load targets from a prior `@PlanOnly=1` HEAP_SCAN_SUMMARY.  Skips discovery and QS analysis.  Requires `@LogToTable='Y'` on the original run |
 | `@Force` | `0` | Bypass orphaned applock from KILLed sessions.  Use when prior run was killed and the re-entrancy guard blocks new runs |
 | `@AllowReplicationRebuild` | `0` | Allow published heap rebuilds (shows estimated replication events).  Heaps with `replication_hint` are skipped by default |
-| `@CheckPermissionsOnly` | `0` | Check permissions (ALTER TRACE, VIEW DATABASE STATE, ALTER, CommandLog INSERT) and return without executing |
+| `@CheckPermissionsOnly` | `0` | Check permissions (ALTER TRACE, VIEW DATABASE STATE, ALTER, CommandLog INSERT) for selected databases and return without executing. Uses `@Databases` and `@ExcludeDatabases`; warns if none match |
 
 | `@HeapsInParallel` | `'N'` | `'Y'` = queue-based parallel rebuilds across sessions.  Requires Ola Hallengren's `dbo.Queue`; `dbo.QueueHeapRebuild` is created automatically.  The first session becomes the leader and populates the queue, later sessions become workers and drain it.  Incompatible with `@PlanOnly = 1` |
 
