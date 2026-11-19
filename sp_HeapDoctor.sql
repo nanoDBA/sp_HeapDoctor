@@ -2134,6 +2134,11 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
                 IsTemporalHistory      bit            NULL,
                 TemporalParentSchema   sysname        NULL,
                 TemporalParentTable    sysname        NULL,
+                KeySourceIndex         sysname        NULL,
+                UsageHint              varchar(30)    NULL,
+                QsPlanCount            integer        NULL,
+                WarningSeverity        varchar(16)    NULL,
+                HasForcedPlans         bit            NULL,
                 CommandText            nvarchar(max)  NOT NULL,
                 CiDropCommand          nvarchar(max)  NULL,
                 VerifyCommand          nvarchar(max)  NULL,
@@ -2159,6 +2164,18 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
 
             RAISERROR(N'Created dbo.QueueHeapRebuild table and indexes.', 10, 1) WITH NOWAIT;
         END
+
+        /* Add diagnostic and safety fields when upgrading an existing queue table. */
+        IF COL_LENGTH(N'dbo.QueueHeapRebuild', N'KeySourceIndex') IS NULL
+            ALTER TABLE dbo.QueueHeapRebuild ADD KeySourceIndex sysname NULL;
+        IF COL_LENGTH(N'dbo.QueueHeapRebuild', N'UsageHint') IS NULL
+            ALTER TABLE dbo.QueueHeapRebuild ADD UsageHint varchar(30) NULL;
+        IF COL_LENGTH(N'dbo.QueueHeapRebuild', N'QsPlanCount') IS NULL
+            ALTER TABLE dbo.QueueHeapRebuild ADD QsPlanCount integer NULL;
+        IF COL_LENGTH(N'dbo.QueueHeapRebuild', N'WarningSeverity') IS NULL
+            ALTER TABLE dbo.QueueHeapRebuild ADD WarningSeverity varchar(16) NULL;
+        IF COL_LENGTH(N'dbo.QueueHeapRebuild', N'HasForcedPlans') IS NULL
+            ALTER TABLE dbo.QueueHeapRebuild ADD HasForcedPlans bit NULL;
 
         /* Leader election: race on dbo.Queue insertion. Same @invocation_command -> same QueueID. */
         SELECT @queue_id = q.QueueID
@@ -6464,6 +6481,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
              HeapCompression, ReplicationHint, LockEscalation,
              HasFkReferences, FkRefCount,
              IsTemporalHistory, TemporalParentSchema, TemporalParentTable,
+             KeySourceIndex, UsageHint, QsPlanCount, WarningSeverity, HasForcedPlans,
              CommandText, CiDropCommand, VerifyCommand)
         SELECT
             @queue_id, database_name, schema_name, table_name, object_id, sort_order, action_chosen,
@@ -6471,6 +6489,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             heap_compression, replication_hint, lock_escalation,
             has_fk_references, fk_ref_count,
             is_temporal_history, temporal_parent_schema, temporal_parent_table,
+            key_source_index, usage_hint, qs_plan_count, warning_severity, has_forced_plans,
             command_text, ci_drop_command, verify_command
         FROM #Targets;
 
@@ -6669,8 +6688,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
         /*
         Parallel mode (Phase A): table variable for atomic UPDATE OUTPUT claim
         from dbo.QueueHeapRebuild. Columns mirror what we need for the rebuild
-        body; diagnostic fields not stored in the queue (QS snapshot, NCI count,
-        usage_hint, etc.) stay NULL when claiming from the queue.
+        body; the queue carries the safety and advisory fields needed by the
+        rebuild body and preserves them when a worker claims a target.
         */
         DECLARE @ClaimedTarget TABLE
         (
@@ -6693,6 +6712,11 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             IsTemporalHistory      bit            NULL,
             TemporalParentSchema   sysname        NULL,
             TemporalParentTable    sysname        NULL,
+            KeySourceIndex         sysname        NULL,
+            UsageHint              varchar(30)    NULL,
+            QsPlanCount            integer        NULL,
+            WarningSeverity        varchar(16)    NULL,
+            HasForcedPlans         bit            NULL,
             CommandText            nvarchar(max)  NOT NULL,
             CiDropCommand          nvarchar(max)  NULL,
             VerifyCommand          nvarchar(max)  NULL
@@ -6739,6 +6763,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                        inserted.ReplicationHint, inserted.LockEscalation,
                        inserted.HasFkReferences, inserted.FkRefCount,
                        inserted.IsTemporalHistory, inserted.TemporalParentSchema, inserted.TemporalParentTable,
+                       inserted.KeySourceIndex, inserted.UsageHint, inserted.QsPlanCount,
+                       inserted.WarningSeverity, inserted.HasForcedPlans,
                        inserted.CommandText, inserted.CiDropCommand, inserted.VerifyCommand
                 INTO @ClaimedTarget
                 FROM NextUnclaimed AS nu
@@ -6797,6 +6823,8 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                            inserted.ReplicationHint, inserted.LockEscalation,
                            inserted.HasFkReferences, inserted.FkRefCount,
                            inserted.IsTemporalHistory, inserted.TemporalParentSchema, inserted.TemporalParentTable,
+                           inserted.KeySourceIndex, inserted.UsageHint, inserted.QsPlanCount,
+                           inserted.WarningSeverity, inserted.HasForcedPlans,
                            inserted.CommandText, inserted.CiDropCommand, inserted.VerifyCommand
                     INTO @ClaimedTarget
                     FROM Stranded AS st
@@ -6830,6 +6858,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                      est_log_mb, heap_compression, replication_hint, lock_escalation,
                      has_fk_references, fk_ref_count,
                      is_temporal_history, temporal_parent_schema, temporal_parent_table,
+                     key_source_index, usage_hint, qs_plan_count, warning_severity, has_forced_plans,
                      sort_order)
                 SELECT
                     DatabaseName, ObjectID, SchemaName, TableName,
@@ -6838,6 +6867,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     EstLogMB, ISNULL(HeapCompression, 0), ReplicationHint, ISNULL(LockEscalation, 0),
                     ISNULL(HasFkReferences, 0), ISNULL(FkRefCount, 0),
                     ISNULL(IsTemporalHistory, 0), TemporalParentSchema, TemporalParentTable,
+                    KeySourceIndex, UsageHint, QsPlanCount, WarningSeverity, ISNULL(HasForcedPlans, 0),
                     ISNULL(SortOrder, 0)
                 FROM @ClaimedTarget;
 
@@ -7043,27 +7073,36 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
             The candidate NCI could be disabled between discovery and execution.
             If the key source NCI is now disabled, fall back to heap rebuild.
             */
-            IF @action = 'CI_SWAP_ONLINE' AND @cur_key_source_index IS NOT NULL
+            IF @action = 'CI_SWAP_ONLINE'
             BEGIN
-                SET @cur_nci_disabled = 0;
-                BEGIN TRY
-                    SET @verify_sql = N'SELECT @is_disabled = is_disabled
-                        FROM ' + QUOTENAME(@db) + N'.sys.indexes
-                        WHERE object_id = OBJECT_ID(@full_param)
-                          AND name = @idx_name;';
-                    EXECUTE sys.sp_executesql @verify_sql,
-                        N'@full_param nvarchar(512), @idx_name sysname, @is_disabled bit OUTPUT',
-                        @full_param = @full, @idx_name = @cur_key_source_index, @is_disabled = @cur_nci_disabled OUTPUT;
-                END TRY
-                BEGIN CATCH
-                    SET @cur_nci_disabled = 0; /* don't block on metadata errors */
-                END CATCH
+                /* A legacy queue row without the safety input cannot prove the
+                   candidate index is usable, so choose the safe heap rebuild. */
+                SET @cur_nci_disabled = CASE WHEN @cur_key_source_index IS NULL THEN 1 ELSE 0 END;
+                IF @cur_key_source_index IS NOT NULL
+                BEGIN
+                    BEGIN TRY
+                        SET @verify_sql = N'SELECT @is_disabled = is_disabled
+                            FROM ' + QUOTENAME(@db) + N'.sys.indexes
+                            WHERE object_id = OBJECT_ID(@full_param)
+                              AND name = @idx_name;';
+                        EXECUTE sys.sp_executesql @verify_sql,
+                            N'@full_param nvarchar(512), @idx_name sysname, @is_disabled bit OUTPUT',
+                            @full_param = @full, @idx_name = @cur_key_source_index, @is_disabled = @cur_nci_disabled OUTPUT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @cur_nci_disabled = 0; /* don't block on metadata errors */
+                    END CATCH
+                END
 
                 IF @cur_nci_disabled = 1
                 BEGIN
                     SET @Msg = N'  WARNING: CI swap key source index ['
-                             + CASE WHEN @obfuscate = 1 THEN N'[obfuscated]' ELSE @cur_key_source_index END
-                             + N'] on ' + @display_full + N' has been disabled since discovery. Falling back to heap rebuild.';
+                             + CASE WHEN @obfuscate = 1 THEN N'[obfuscated]'
+                                    ELSE ISNULL(@cur_key_source_index, N'unknown') END
+                             + N'] on ' + @display_full
+                             + CASE WHEN @cur_key_source_index IS NULL
+                                    THEN N' is unavailable from the parallel queue. Falling back to heap rebuild.'
+                                    ELSE N' has been disabled since discovery. Falling back to heap rebuild.' END;
                     RAISERROR(@Msg, 10, 1) WITH NOWAIT;
 
                     /* Generate fallback ALTER TABLE REBUILD command (same pattern as LOB fallback) */
