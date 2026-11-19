@@ -3106,10 +3106,23 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         WHERE Selected = 1 AND Completed = 0
         ORDER BY ID;
 
-        /* The collation name comes from sys.databases and is a SQL Server collation identifier. */
+        /* ID is local to @tmpDatabases; resolve the collation by database name. */
+        SET @discovery_collation_clause = NULL;
         SELECT @discovery_collation_clause = N'COLLATE ' + collation_name
         FROM sys.databases
-        WHERE database_id = @CurrentDatabaseID;
+        WHERE name = @CurrentDatabaseName;
+
+        IF @discovery_collation_clause IS NULL
+        BEGIN
+            SET @discovery_errors += 1;
+            SET @Msg = N'WARNING: database not scanned because its collation could not be resolved: '
+                     + @CurrentDatabaseName + N'.';
+            RAISERROR(@Msg, 10, 1) WITH NOWAIT;
+            UPDATE @tmpDatabases SET Completed = 1 WHERE ID = @CurrentDatabaseID;
+            INSERT INTO @DbScanStats (DatabaseName, HeapsQualified, ScanSeconds)
+            VALUES (@CurrentDatabaseName, 0, 0);
+            CONTINUE;
+        END
 
         SET @Msg = N'Scanning database: ' + @CurrentDatabaseName;
         RAISERROR(@Msg, 10, 1) WITH NOWAIT;

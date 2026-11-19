@@ -129,6 +129,26 @@ ELSE
     RAISERROR(N'FAIL 62C: forced plan matched a decoy table.', 10, 1) WITH NOWAIT;
 GO
 
+SELECT TOP (0) * INTO #CollationScan FROM dbo.ResultsTemplate;
+INSERT #CollationScan
+EXEC master.dbo.sp_HeapDoctor
+    @Databases=N'HeapDoctorCollationTest', @Tables=N'dbo.CollationHeap',
+    @CpuSource=N'NONE', @PlanOnly=1, @LogToTable=N'N',
+    @MinPages=1, @MinForwardedPct=0;
+DECLARE @collation_targets int =
+(
+    SELECT COUNT(*) FROM #CollationScan r
+    JOIN dbo.ExpectedVersion e ON e.version=r.version
+    WHERE r.database_name=N'HeapDoctorCollationTest'
+      AND r.table_name=N'CollationHeap'
+      AND r.action_chosen IS NOT NULL
+);
+IF @collation_targets=1
+    RAISERROR(N'PASS 62D: target collation selected only the requested case-sensitive heap.',10,1) WITH NOWAIT;
+ELSE
+    RAISERROR(N'FAIL 62D: the wrong collation selected a case-insensitive decoy or skipped the requested database.',10,1) WITH NOWAIT;
+GO
+
 /* Remove forced-plan state and fixtures so later tests start clean. */
 DECLARE @query_id bigint, @plan_id bigint;
 DECLARE cleanup_cursor CURSOR LOCAL FAST_FORWARD FOR

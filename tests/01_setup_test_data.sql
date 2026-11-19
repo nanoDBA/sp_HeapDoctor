@@ -595,6 +595,22 @@ BEGIN
     UPDATE dbo.CollationHeap SET Padding = REPLICATE('x', 1500) WHERE ID % 2 = 0;
     CREATE UNIQUE NONCLUSTERED INDEX UX_CollationHeap_ID ON dbo.CollationHeap(ID);
 END;
+IF OBJECT_ID(N'dbo.collationheap', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.collationheap
+    (
+        ID int NOT NULL,
+        Padding varchar(2000) NOT NULL
+    );
+    ;WITH N AS
+    (
+        SELECT n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM sys.all_columns AS a CROSS JOIN sys.all_columns AS b
+    )
+    INSERT dbo.collationheap (ID, Padding)
+    SELECT TOP (6000) n, 'x' FROM N;
+    UPDATE dbo.collationheap SET Padding = REPLICATE('x', 1500) WHERE ID % 2 = 0;
+END;
 GO
 USE HeapDoctorTest;
 GO

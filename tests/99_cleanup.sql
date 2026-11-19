@@ -9,6 +9,12 @@ Run with: sqlcmd -S YourServer -i 99_cleanup.sql
 
 SET NOCOUNT ON;
 
+IF DB_ID(N'HeapDoctorCollationTest') IS NOT NULL
+BEGIN
+    ALTER DATABASE [HeapDoctorCollationTest] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE [HeapDoctorCollationTest];
+END
+
 IF DB_ID(N'HeapDoctorTest') IS NOT NULL
 BEGIN
     RAISERROR(N'Dropping HeapDoctorTest database...', 10, 1) WITH NOWAIT;
