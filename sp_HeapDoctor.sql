@@ -982,18 +982,6 @@ COMMON PARAMETERS:
   @LockTimeoutMs     integer     = NULL    Lock ACQUISITION wait per rebuild in ms -- caps the wait to OBTAIN Sch-M, NOT how long the rebuild holds it. NULL=don''t set.
 ', 10, 1) WITH NOWAIT;
 
-        RAISERROR(N'LOW-PRIORITY SCHEMA-LOCK WAIT:
-  @WaitAtLowPriorityMaxDuration integer = NULL  Maximum low-priority wait, in minutes (1-10080).
-  @WaitAtLowPriorityAbortAfterWait nvarchar(10) = NULL  NONE, SELF, or BLOCKERS.
-  Supply both parameters or neither. Applies to online ALTER TABLE REBUILD on SQL Server 2014+.
-  CI-swap CREATE INDEX uses this option on SQL Server 2022+; the CI-swap DROP has no low-priority option.
-', 10, 1) WITH NOWAIT;
-
-        RAISERROR(N'QUERY STORE CPU ATTRIBUTION:
-  Table Scan and RID Lookup objects are matched by database, schema, and table.
-  Query Store reports whole-plan CPU, attributed to each matched heap.
-', 10, 1) WITH NOWAIT;
-
         RAISERROR(N'  @PlanCountWarnThreshold integer = 50   Warn before rebuild if target''s qs_plan_count >= N (recompile storm risk).
   @MaxRunSeconds     integer     = NULL    Stop after N seconds (NULL=no limit).
   @ScanThrottleMs    integer     = NULL    Wait ms between database scans (0-60000, NULL=off).
@@ -1008,6 +996,18 @@ COMMON PARAMETERS:
                                         LIMITED is NOT supported: it cannot see forwarded records (#189).
   @EstimateTime      bit     = 0       Show estimated rebuild time per target.
   @EstimateLookbackDays integer  = 90      CommandLog history window for throughput rates.
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'LOW-PRIORITY SCHEMA-LOCK WAIT:
+  @WaitAtLowPriorityMaxDuration integer = NULL  Maximum low-priority wait, in minutes (1-10080).
+  @WaitAtLowPriorityAbortAfterWait nvarchar(10) = NULL  NONE, SELF, or BLOCKERS.
+  Supply both parameters or neither. Applies to online ALTER TABLE REBUILD on SQL Server 2014+.
+  CI-swap CREATE INDEX uses this option on SQL Server 2022+; the CI-swap DROP has no low-priority option.
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'QUERY STORE CPU ATTRIBUTION:
+  Table Scan and RID Lookup objects are matched by database, schema, and table.
+  Query Store reports whole-plan CPU, attributed to each matched heap.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'  @BaselineRebuildMBPerMin integer = NULL  Cold-start: assumed MB/min when no CommandLog history
@@ -1507,10 +1507,14 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     SET @WaitAtLowPriorityAbortAfterWait = UPPER(LTRIM(RTRIM(@WaitAtLowPriorityAbortAfterWait)));
     IF @WaitAtLowPriorityMaxDuration IS NOT NULL
     BEGIN
+        /* Safe to concatenate: the duration is an integer validated to 1-10080 and the
+           abort action is one of three literals checked above. */
         SET @WaitAtLowPriorityClause = N' (WAIT_AT_LOW_PRIORITY (MAX_DURATION = '
             + CONVERT(nvarchar(10), @WaitAtLowPriorityMaxDuration)
             + N' MINUTES, ABORT_AFTER_WAIT = ' + @WaitAtLowPriorityAbortAfterWait + N'))';
+        /* Azure SQL Database and Managed Instance report major version 12 and support it. */
         IF CONVERT(integer, SERVERPROPERTY(N'ProductMajorVersion')) >= 16
+           OR CONVERT(integer, SERVERPROPERTY(N'EngineEdition')) IN (5, 8)
             SET @WaitAtLowPriorityCreateClause = @WaitAtLowPriorityClause;
         ELSE
             RAISERROR(N'NOTE: low-priority wait is omitted from CI-swap CREATE INDEX on SQL Server versions before 2022.', 10, 1) WITH NOWAIT;
@@ -2194,7 +2198,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             @LockTimeout = 60000;
 
         IF @queue_schema_lock_result < 0
+        BEGIN
             RAISERROR(N'Could not acquire the queue schema lock for parallel initialization.', 16, 1);
+            RETURN 1;
+        END
 
         BEGIN TRY
         /* Auto-create dbo.QueueHeapRebuild if missing (matches sp_StatUpdate pattern) */
