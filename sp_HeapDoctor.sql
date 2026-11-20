@@ -51,9 +51,17 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.11.19.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.11.20.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.11.19.1 - P2 fixes for queue recovery and claims, repeat runs, selection,
+History:    2026.11.20.1 - Parallel skips close their queue row (#222). Targets left after a
+                          database-wide stop get a recorded outcome and count as skipped
+                          (#225). Query Store CPU attribution counts RID Lookups and
+                          matches the database name (#231). Queue table creation is
+                          serialized across sessions (see #238). New opt-in parameters
+                          @WaitAtLowPriorityMaxDuration and
+                          @WaitAtLowPriorityAbortAfterWait (see #235). QUICKIESTORE
+                          documentation matches the real procedure (see #230).
+            2026.11.19.1 - P2 fixes for queue recovery and claims, repeat runs, selection,
                           collation-safe scans, forced-plan checks, safe CI swap keys,
                           and obfuscation (#220, #221, #223, #224, #226, #227, #228,
                           #229, #232, #233, #236, #240). ALL_DATABASES includes master,
@@ -857,7 +865,7 @@ BEGIN
         RETURN;
     END
 
-    DECLARE @Version nvarchar(20) = N'2026.11.19.1';
+    DECLARE @Version nvarchar(20) = N'2026.11.20.1';
     /* Ranking algorithm version: increment only when the ranking formula changes, not on every proc release. */
     /* v1 = LOG10-normalized weighted (0.4*fetch_rate + 0.4*cpu + 0.2*fwd_pct) * write_penalty. Since 2026.0218. */
     DECLARE @RankingAlgoVersion nvarchar(10) = N'v1';
