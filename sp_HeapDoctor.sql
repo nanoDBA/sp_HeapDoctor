@@ -1810,6 +1810,7 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         END
     END
 
+    BEGIN TRY
     /* Initialize obfuscation passphrase (after re-entrancy guard succeeds) */
     IF @obfuscate = 1
     BEGIN
@@ -9077,6 +9078,12 @@ DEALLOCATE fk_child_cursor;';
     /* Return non-zero so SQL Agent jobs see failure */
     IF @failed_cnt > 0
         RETURN 1;
+    END TRY
+    BEGIN CATCH
+        IF @HeapsInParallel = N'N' AND @lock_result >= 0
+            EXECUTE sys.sp_releaseapplock @Resource = N'sp_HeapDoctor', @LockOwner = N'Session';
+        THROW;
+    END CATCH;
 END
 GO
 
