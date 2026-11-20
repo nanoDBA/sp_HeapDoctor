@@ -822,7 +822,9 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
     point and silently break callers that pass arguments by position.
     */
     @Status                  varchar(10)    = NULL OUTPUT, /* SUCCESS | WARNING | ERROR */
-    @StatusMessage           nvarchar(1000) = NULL OUTPUT  /* names the most severe condition, with counts */
+    @StatusMessage           nvarchar(1000) = NULL OUTPUT, /* names the most severe condition, with counts */
+    @WaitAtLowPriorityMaxDuration integer = NULL,         /* #235: low-priority lock wait duration in minutes */
+    @WaitAtLowPriorityAbortAfterWait nvarchar(10) = NULL  /* #235: NONE, SELF, or BLOCKERS */
 )
 /*#endregion 00-HEADER */
 
@@ -867,6 +869,8 @@ BEGIN
     DECLARE @effective_seed nvarchar(128)  = NULL;
     DECLARE @logged_invocation_command nvarchar(max) = NULL;
     DECLARE @obfuscated_database_name sysname = NULL;
+    DECLARE @WaitAtLowPriorityClause nvarchar(200) = N'';
+    DECLARE @WaitAtLowPriorityCreateClause nvarchar(200) = N'';
 
     /* Reproducible invocation command for CommandLog (built after input validation) */
     DECLARE @invocation_command nvarchar(max) = NULL;
@@ -976,6 +980,13 @@ COMMON PARAMETERS:
   @FillFactor        tinyint = 0       Fill factor for CI swap CREATE INDEX (0=server default, 1-100).
   @Maxdop            integer     = NULL    MAXDOP on index ops (NULL=omit, 0=unlimited).
   @LockTimeoutMs     integer     = NULL    Lock ACQUISITION wait per rebuild in ms -- caps the wait to OBTAIN Sch-M, NOT how long the rebuild holds it. NULL=don''t set.
+', 10, 1) WITH NOWAIT;
+
+        RAISERROR(N'LOW-PRIORITY SCHEMA-LOCK WAIT:
+  @WaitAtLowPriorityMaxDuration integer = NULL  Maximum low-priority wait, in minutes (1-10080).
+  @WaitAtLowPriorityAbortAfterWait nvarchar(10) = NULL  NONE, SELF, or BLOCKERS.
+  Supply both parameters or neither. Applies to online ALTER TABLE REBUILD on SQL Server 2014+.
+  CI-swap CREATE INDEX uses this option on SQL Server 2022+; the CI-swap DROP has no low-priority option.
 ', 10, 1) WITH NOWAIT;
 
         RAISERROR(N'QUERY STORE CPU ATTRIBUTION:
@@ -1470,6 +1481,39 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
     BEGIN
         RAISERROR(N'Invalid @OnlinePreference. Use AUTO, ON, or OFF.', 16, 1);
         RETURN;
+    END
+
+    IF (@WaitAtLowPriorityMaxDuration IS NULL AND @WaitAtLowPriorityAbortAfterWait IS NOT NULL)
+       OR (@WaitAtLowPriorityMaxDuration IS NOT NULL AND @WaitAtLowPriorityAbortAfterWait IS NULL)
+    BEGIN
+        RAISERROR(N'Both @WaitAtLowPriorityMaxDuration and @WaitAtLowPriorityAbortAfterWait must be supplied together.', 16, 1);
+        RETURN;
+    END
+
+    IF @WaitAtLowPriorityMaxDuration IS NOT NULL
+       AND (@WaitAtLowPriorityMaxDuration < 1 OR @WaitAtLowPriorityMaxDuration > 10080)
+    BEGIN
+        RAISERROR(N'@WaitAtLowPriorityMaxDuration must be between 1 and 10080 minutes.', 16, 1);
+        RETURN;
+    END
+
+    IF @WaitAtLowPriorityAbortAfterWait IS NOT NULL
+       AND UPPER(LTRIM(RTRIM(@WaitAtLowPriorityAbortAfterWait))) NOT IN (N'NONE', N'SELF', N'BLOCKERS')
+    BEGIN
+        RAISERROR(N'@WaitAtLowPriorityAbortAfterWait must be NONE, SELF, or BLOCKERS.', 16, 1);
+        RETURN;
+    END
+
+    SET @WaitAtLowPriorityAbortAfterWait = UPPER(LTRIM(RTRIM(@WaitAtLowPriorityAbortAfterWait)));
+    IF @WaitAtLowPriorityMaxDuration IS NOT NULL
+    BEGIN
+        SET @WaitAtLowPriorityClause = N' (WAIT_AT_LOW_PRIORITY (MAX_DURATION = '
+            + CONVERT(nvarchar(10), @WaitAtLowPriorityMaxDuration)
+            + N' MINUTES, ABORT_AFTER_WAIT = ' + @WaitAtLowPriorityAbortAfterWait + N'))';
+        IF CONVERT(integer, SERVERPROPERTY(N'ProductMajorVersion')) >= 16
+            SET @WaitAtLowPriorityCreateClause = @WaitAtLowPriorityClause;
+        ELSE
+            RAISERROR(N'NOTE: low-priority wait is omitted from CI-swap CREATE INDEX on SQL Server versions before 2022.', 10, 1) WITH NOWAIT;
     END
 
     /* Parallel mode (Phase A): @HeapsInParallel must be Y or N, and dbo.Queue must exist when Y. */
@@ -1978,6 +2022,10 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         SET @invocation_command += N', @OnlinePreference = N''' + UPPER(@OnlinePreference) + N'''';
     IF @AllowCiSwap = 1
         SET @invocation_command += N', @AllowCiSwap = 1';
+    IF @WaitAtLowPriorityMaxDuration IS NOT NULL
+        SET @invocation_command += N', @WaitAtLowPriorityMaxDuration = '
+            + CONVERT(nvarchar(10), @WaitAtLowPriorityMaxDuration)
+            + N', @WaitAtLowPriorityAbortAfterWait = N''' + @WaitAtLowPriorityAbortAfterWait + N'''';
     IF @PreferCiSwap = 1
         SET @invocation_command += N', @PreferCiSwap = 1';
     IF @Maxdop IS NOT NULL
@@ -3940,7 +3988,7 @@ SELECT TOP (ISNULL(@TopN_param, 2147483647))
             N''CREATE CLUSTERED INDEX '' +
             QUOTENAME(N''CX__Temp__'' + LEFT(r.table_name, 108)) +
             N'' ON '' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) +
-            N'' ('' + r.temp_key_cols + N'') WITH (ONLINE = ON'' +
+            N'' ('' + r.temp_key_cols + N'') WITH (ONLINE = ON/*WAIT_AT_LOW_PRIORITY_CREATE*/'' +
             CASE WHEN r.heap_compression = 1 THEN N'', DATA_COMPRESSION = ROW''
                  WHEN r.heap_compression = 2 THEN N'', DATA_COMPRESSION = PAGE''
                  ELSE N'''' END +
@@ -3953,7 +4001,7 @@ SELECT TOP (ISNULL(@TopN_param, 2147483647))
         WHEN @Online_param = 1
         THEN
             N''ALTER TABLE '' + QUOTENAME(DB_NAME()) + N''.'' + QUOTENAME(r.schema_name) + N''.'' + QUOTENAME(r.table_name) +
-            N'' REBUILD WITH (ONLINE = ON'' +
+            N'' REBUILD WITH (ONLINE = ON/*WAIT_AT_LOW_PRIORITY_ALTER*/'' +
             CASE WHEN r.heap_compression = 1 THEN N'', DATA_COMPRESSION = ROW''
                  WHEN r.heap_compression = 2 THEN N'', DATA_COMPRESSION = PAGE''
                  ELSE N'''' END +
@@ -4309,6 +4357,8 @@ END
         /* Replace DATABASE_DEFAULT with the target database collation. The procedure
            runs in master and temp table columns inherit tempdb's collation. */
         SET @discovery_sql = REPLACE(@discovery_sql, N'COLLATE DATABASE_DEFAULT', @discovery_collation_clause);
+        SET @discovery_sql = REPLACE(@discovery_sql, N'/*WAIT_AT_LOW_PRIORITY_ALTER*/', @WaitAtLowPriorityClause);
+        SET @discovery_sql = REPLACE(@discovery_sql, N'/*WAIT_AT_LOW_PRIORITY_CREATE*/', @WaitAtLowPriorityCreateClause);
 
         /*
         #209: dynamic SQL must be printable before execution. Without this, a broken
@@ -7199,7 +7249,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     SET @cmd = N'ALTER TABLE ' + @full + N' REBUILD'
                         + CASE WHEN @Online = 1 OR @cur_heap_compression > 0 OR @Maxdop IS NOT NULL
                             THEN N' WITH ('
-                                + CASE WHEN @Online = 1 THEN N'ONLINE = ON' ELSE N'' END
+                                + CASE WHEN @Online = 1 THEN N'ONLINE = ON' + @WaitAtLowPriorityClause ELSE N'' END
                                 + CASE WHEN @Online = 1 AND (@cur_heap_compression > 0 OR @Maxdop IS NOT NULL) THEN N', ' ELSE N'' END
                                 + CASE WHEN @cur_heap_compression = 1 THEN N'DATA_COMPRESSION = ROW'
                                        WHEN @cur_heap_compression = 2 THEN N'DATA_COMPRESSION = PAGE'
@@ -7265,7 +7315,7 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                     SET @cmd = N'ALTER TABLE ' + @full + N' REBUILD'
                         + CASE WHEN @Online = 1 OR @cur_heap_compression > 0 OR @Maxdop IS NOT NULL
                             THEN N' WITH ('
-                                + CASE WHEN @Online = 1 THEN N'ONLINE = ON' ELSE N'' END
+                                + CASE WHEN @Online = 1 THEN N'ONLINE = ON' + @WaitAtLowPriorityClause ELSE N'' END
                                 + CASE WHEN @Online = 1 AND (@cur_heap_compression > 0 OR @Maxdop IS NOT NULL) THEN N', ' ELSE N'' END
                                 + CASE WHEN @cur_heap_compression = 1 THEN N'DATA_COMPRESSION = ROW'
                                        WHEN @cur_heap_compression = 2 THEN N'DATA_COMPRESSION = PAGE'

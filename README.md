@@ -426,6 +426,8 @@ Current `sp_QuickieStore` parameter names are `@top`, `@sort_order`, and `@forma
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@OnlinePreference` | `'AUTO'` | `AUTO` (edition-based), `ON` (prefer; falls back to offline with warning), `OFF` (force offline) |
+| `@WaitAtLowPriorityMaxDuration` | `NULL` | Optional low-priority schema-lock wait in minutes (1-10080). Supply together with `@WaitAtLowPriorityAbortAfterWait` |
+| `@WaitAtLowPriorityAbortAfterWait` | `NULL` | `NONE`, `SELF`, or `BLOCKERS`. Applies to online `ALTER TABLE ... REBUILD` on SQL Server 2014+ and CI-swap `CREATE INDEX` on SQL Server 2022+. The CI-swap `DROP INDEX` has no low-priority option |
 | `@AllowCiSwap` | `0` | Enable CI swap path |
 | `@PreferCiSwap` | `0` | Prefer CI swap when safe key exists + online allowed |
 | `@FillFactor` | `0` | Fill factor for CI swap CREATE INDEX (0 = server default, 1-100) |
