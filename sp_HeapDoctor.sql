@@ -978,6 +978,11 @@ COMMON PARAMETERS:
   @LockTimeoutMs     integer     = NULL    Lock ACQUISITION wait per rebuild in ms -- caps the wait to OBTAIN Sch-M, NOT how long the rebuild holds it. NULL=don''t set.
 ', 10, 1) WITH NOWAIT;
 
+        RAISERROR(N'QUERY STORE CPU ATTRIBUTION:
+  Table Scan and RID Lookup objects are matched by database, schema, and table.
+  Query Store reports whole-plan CPU, attributed to each matched heap.
+', 10, 1) WITH NOWAIT;
+
         RAISERROR(N'  @PlanCountWarnThreshold integer = 50   Warn before rebuild if target''s qs_plan_count >= N (recompile storm risk).
   @MaxRunSeconds     integer     = NULL    Stop after N seconds (NULL=no limit).
   @ScanThrottleMs    integer     = NULL    Wait ms between database scans (0-60000, NULL=off).
@@ -3637,6 +3642,7 @@ CREATE TABLE #PlanObjMap
     plan_id      bigint   NOT NULL,
     query_id     bigint   NOT NULL,
     query_hash   binary(8) NOT NULL,
+    database_name sysname NOT NULL,
     schema_name  sysname  NOT NULL,
     table_name   sysname  NOT NULL
 );
@@ -4208,15 +4214,16 @@ BEGIN
 
         /* XPath extraction: fan out parsed plans to all plan_ids sharing each plan_hash */
         ;WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan'')
-        INSERT INTO #PlanObjMap (plan_id, query_id, query_hash, schema_name, table_name)
+        INSERT INTO #PlanObjMap (plan_id, query_id, query_hash, database_name, schema_name, table_name)
         SELECT DISTINCT
             p.plan_id,
             p.query_id,
             q.query_hash,
+            REPLACE(REPLACE(COALESCE(obj.value(''(@Database)[1]'', ''sysname''), DB_NAME()), N''['', N''''), N'']'', N'''') AS database_name,
             REPLACE(REPLACE(obj.value(''@Schema'',''sysname''), N''['', N''''), N'']'', N'''') AS schema_name,
             REPLACE(REPLACE(obj.value(''@Table'', ''sysname''), N''['', N''''), N'']'', N'''') AS table_name
         FROM #ParsedPlans pp
-        CROSS APPLY pp.plan_xml.nodes(''//RelOp[@PhysicalOp="Table Scan"]/*/Object[@Schema and @Table]'') AS n(obj)
+        CROSS APPLY pp.plan_xml.nodes(''//RelOp[@PhysicalOp="Table Scan" or @PhysicalOp="RID Lookup"]/*/Object[@Schema and @Table]'') AS n(obj)
         JOIN sys.query_store_plan p ON p.query_plan_hash = pp.query_plan_hash
         JOIN #CpuByPlan cp ON cp.plan_id = p.plan_id
         JOIN sys.query_store_query q ON p.query_id = q.query_id
@@ -4224,7 +4231,7 @@ BEGIN
 ';
 
             SET @discovery_sql += N'
-        /* Aggregate metrics by object */
+        /* CPU from Query Store is whole-plan CPU attributed to each referenced heap. */
         INSERT INTO #CpuByObject(object_id, total_cpu_ms, total_logical_reads, total_physical_reads, total_duration_ms, total_executions, plan_count, query_count)
         SELECT h.object_id,
             SUM(cp.total_cpu_ms),
@@ -4235,7 +4242,8 @@ BEGIN
             COUNT_BIG(DISTINCT pm.plan_id),
             COUNT_BIG(DISTINCT pm.query_id)
         FROM #Heaps h
-        JOIN #PlanObjMap pm ON pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
+        JOIN #PlanObjMap pm ON pm.database_name COLLATE DATABASE_DEFAULT = DB_NAME() COLLATE DATABASE_DEFAULT
+                           AND pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
                            AND pm.table_name  COLLATE DATABASE_DEFAULT = h.table_name  COLLATE DATABASE_DEFAULT
         JOIN #CpuByPlan cp ON cp.plan_id = pm.plan_id
         GROUP BY h.object_id;
@@ -4245,7 +4253,8 @@ BEGIN
         (
             SELECT DISTINCT h.object_id, pm.query_hash
             FROM #Heaps h
-            JOIN #PlanObjMap pm ON pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
+            JOIN #PlanObjMap pm ON pm.database_name COLLATE DATABASE_DEFAULT = DB_NAME() COLLATE DATABASE_DEFAULT
+                               AND pm.schema_name COLLATE DATABASE_DEFAULT = h.schema_name COLLATE DATABASE_DEFAULT
                                AND pm.table_name  COLLATE DATABASE_DEFAULT = h.table_name  COLLATE DATABASE_DEFAULT
         )
         UPDATE cbo
