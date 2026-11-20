@@ -597,15 +597,15 @@ EXECUTE dbo.sp_HeapDoctor
     @OnlinePreference  = 'AUTO',
     @LockTimeoutMs     = 5000;
 
-5) Use sp_QuickieStore as CPU source (single-database only)
+5) QuickieStore integration status
 
-EXECUTE dbo.sp_HeapDoctor
-    @CpuSource           = 'QUICKIESTORE',
-    @QuickieExecSql      = N'EXECUTE dbo.sp_QuickieStore @Top=200, @SortOrder=''cpu'';',
-    @QuickiePlanIdColumn = N'plan_id',
-    @QuickieCpuUsColumn  = N'avg_cpu_time',
-    @QuickieCpuUnit      = 'us',
-    @PlanOnly            = 1;
+The current public sp_QuickieStore cannot be used by this adapter: SQL Server
+cannot describe its first result set (error 11528). Use @CpuSource='QUERY_STORE'
+until the adapter is updated and tested against the real procedure.
+
+The current sp_QuickieStore call shape uses @top, @sort_order='cpu', and
+@format_output=0. Its total CPU column is total_cpu_time_ms. This is reference
+information only; it is not a working sp_HeapDoctor invocation.
 
 6) CI-swap when safe unique key exists (Enterprise/Developer only)
 
@@ -736,9 +736,9 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 
     /* CPU source */
     @CpuSource               varchar(20)    = 'QUERY_STORE', /* QUERY_STORE | QUICKIESTORE | NONE */
-    @QuickieExecSql          nvarchar(max)  = NULL, /* e.g. N'EXECUTE dbo.sp_QuickieStore @Top=50, @SortOrder=''cpu'';' */
+    @QuickieExecSql          nvarchar(max)  = NULL, /* EXEC statement for a procedure with describable result metadata */
     @QuickiePlanIdColumn     sysname        = N'plan_id', /* column name in Quickie output */
-    @QuickieCpuUsColumn      sysname        = N'avg_cpu_time', /* OR cpu_us / cpu_ms etc; see @QuickieCpuUnit */
+    @QuickieCpuUsColumn      sysname        = N'avg_cpu_time', /* CPU column in describable output; see @QuickieCpuUnit */
     @QuickieCpuUnit          varchar(10)    = 'us', /* us | ms  (unit of @QuickieCpuUsColumn) */
 
     /* Actions */
@@ -1038,9 +1038,12 @@ COMMON PARAMETERS:
 
         RAISERROR(N'
 QUICKIESTORE PARAMETERS:
-  @QuickieExecSql    nvarchar(max) = NULL   EXECUTE statement for sp_QuickieStore.
+  The current public sp_QuickieStore is not supported by this adapter: SQL Server cannot
+  describe its first result set (error 11528). Use @CpuSource = QUERY_STORE instead.
+  Reference call uses @top, @sort_order = cpu, @format_output = 0; total_cpu_time_ms is milliseconds.
+  @QuickieExecSql    nvarchar(max) = NULL   EXECUTE statement for a procedure with describable output.
   @QuickiePlanIdColumn sysname = plan_id    Column name in Quickie output.
-  @QuickieCpuUsColumn  sysname = avg_cpu_time  CPU column in Quickie output.
+  @QuickieCpuUsColumn  sysname = avg_cpu_time  CPU column in Quickie output; choose a numeric column.
   @QuickieCpuUnit    varchar = us       Unit of CPU column: us | ms
 
 OBFUSCATION PARAMETERS:

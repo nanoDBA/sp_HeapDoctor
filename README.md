@@ -83,7 +83,7 @@ quietly doing something else -- a partial result is always reported as partial.
 - `forwarded_fetch_count` shows pointers actually traversed at runtime -- a heap that is 50%
   forwarded but never scanned is not hurting anyone
 - Flags write-heavy heaps where forwarded records will simply recur
-- sp_QuickieStore is supported as an alternative CPU source
+- An experimental QuickieStore adapter is present, but the current public `sp_QuickieStore` cannot be used because SQL Server cannot describe its first result set (error 11528). Use `@CpuSource = 'QUERY_STORE'` until the adapter is validated against the real procedure.
 
 **Doing it safely**
 
@@ -414,10 +414,12 @@ The proc detects Standard Edition automatically and falls back to offline with a
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@CpuSource` | `'QUERY_STORE'` | `QUERY_STORE`, `QUICKIESTORE`, or `NONE` |
-| `@QuickieExecSql` | `NULL` | EXEC statement for sp_QuickieStore |
+| `@QuickieExecSql` | `NULL` | EXEC statement for a procedure whose first result set SQL Server can describe. The current public `sp_QuickieStore` is unsupported by this adapter because metadata discovery fails with error 11528; use `@CpuSource = 'QUERY_STORE'` |
 | `@QuickiePlanIdColumn` | `'plan_id'` | Plan ID column name in Quickie output |
-| `@QuickieCpuUsColumn` | `'avg_cpu_time'` | CPU column name in Quickie output |
+| `@QuickieCpuUsColumn` | `'avg_cpu_time'` | Numeric CPU column in describable Quickie output. Current public `sp_QuickieStore` instead exposes `avg_cpu_time_ms` and `total_cpu_time_ms` |
 | `@QuickieCpuUnit` | `'us'` | Unit of CPU column: `us` or `ms` |
+
+Current `sp_QuickieStore` parameter names are `@top`, `@sort_order`, and `@format_output`. A call that requests its numeric output uses `@top=200, @sort_order='cpu', @format_output=0`; the total CPU column is `total_cpu_time_ms` in milliseconds. This call shape is documented for reference only. The current adapter cannot describe the procedure's first result set, so it is not a working `@QuickieExecSql` example.
 
 ### Actions
 
