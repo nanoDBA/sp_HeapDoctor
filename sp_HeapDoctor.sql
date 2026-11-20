@@ -2130,6 +2130,17 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Parallel mode: Initializing work queue...', 10, 1) WITH NOWAIT;
 
+        DECLARE @queue_schema_lock_result integer;
+        EXECUTE @queue_schema_lock_result = sys.sp_getapplock
+            @Resource = N'sp_HeapDoctor_QueueHeapRebuild_DDL',
+            @LockMode = N'Exclusive',
+            @LockOwner = N'Session',
+            @LockTimeout = 60000;
+
+        IF @queue_schema_lock_result < 0
+            RAISERROR(N'Could not acquire the queue schema lock for parallel initialization.', 16, 1);
+
+        BEGIN TRY
         /* Auto-create dbo.QueueHeapRebuild if missing (matches sp_StatUpdate pattern) */
         IF OBJECT_ID(N'dbo.QueueHeapRebuild', N'U') IS NULL
         BEGIN
@@ -2199,6 +2210,17 @@ TIME ZONES:   CommandLog = local (SYSDATETIME). QS snapshots = UTC (SYSUTCDATETI
             ALTER TABLE dbo.QueueHeapRebuild ADD WarningSeverity varchar(16) NULL;
         IF COL_LENGTH(N'dbo.QueueHeapRebuild', N'HasForcedPlans') IS NULL
             ALTER TABLE dbo.QueueHeapRebuild ADD HasForcedPlans bit NULL;
+
+            EXECUTE sys.sp_releaseapplock
+                @Resource = N'sp_HeapDoctor_QueueHeapRebuild_DDL',
+                @LockOwner = N'Session';
+        END TRY
+        BEGIN CATCH
+            EXECUTE sys.sp_releaseapplock
+                @Resource = N'sp_HeapDoctor_QueueHeapRebuild_DDL',
+                @LockOwner = N'Session';
+            THROW;
+        END CATCH;
 
         /* Join only a queue whose discovery or target work still has a live request. */
         SELECT TOP (1) @queue_id = q.QueueID
