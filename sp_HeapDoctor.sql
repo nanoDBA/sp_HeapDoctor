@@ -8635,6 +8635,70 @@ DEALLOCATE fk_child_cursor;';
         END
 
         /*
+        #225: materialize unattempted database-stop targets before deriving
+        the durable events and final skipped count from #ExecLog.
+        */
+        DECLARE @database_stop_remaining integer = 0;
+        SELECT @database_stop_remaining = COUNT_BIG(*)
+        FROM #Targets AS t
+        WHERE t.sort_order = -1
+          AND NOT EXISTS (SELECT 1 FROM #ExecLog AS el WHERE el.target_id = t.target_id);
+
+        IF @database_stop_remaining > 0
+        BEGIN
+            INSERT INTO #ExecLog
+                (target_id, database_name, full_name, action, start_time, end_time,
+                 succeeded, error_number, error_message, recovery_required)
+            SELECT
+                t.target_id,
+                CASE WHEN @obfuscate = 1 THEN t.pseudo_database_name ELSE t.database_name END,
+                CASE WHEN @obfuscate = 1
+                     THEN QUOTENAME(t.pseudo_database_name) + N'.' + QUOTENAME(t.pseudo_schema_name) + N'.' + QUOTENAME(t.pseudo_table_name)
+                     ELSE QUOTENAME(t.database_name) + N'.' + QUOTENAME(t.schema_name) + N'.' + QUOTENAME(t.table_name) END,
+                t.action_chosen,
+                SYSDATETIME(),
+                SYSDATETIME(),
+                NULL,
+                NULL,
+                N'SKIPPED: DATABASE_STOP_REMAINDER (a prior database-level safety condition stopped this scan).',
+                0
+            FROM #Targets AS t
+            WHERE t.sort_order = -1
+              AND NOT EXISTS (SELECT 1 FROM #ExecLog AS el WHERE el.target_id = t.target_id);
+
+            SET @skipped_cnt += @database_stop_remaining;
+
+            IF @LogToTable = N'Y' AND @commandlog_exists = 1
+            BEGIN
+                INSERT INTO dbo.CommandLog
+                    (DatabaseName, SchemaName, ObjectName, ObjectType, IndexName, IndexType,
+                     Command, CommandType, StartTime, EndTime, ErrorNumber, ErrorMessage, ExtendedInfo)
+                SELECT
+                    el.database_name,
+                    CASE WHEN @obfuscate = 1 THEN t.pseudo_schema_name ELSE t.schema_name END,
+                    CASE WHEN @obfuscate = 1 THEN t.pseudo_table_name ELSE t.table_name END,
+                    N'U',
+                    CASE WHEN t.action_chosen = 'CI_SWAP_ONLINE'
+                         THEN N'CX__Temp__' + LEFT(CASE WHEN @obfuscate = 1 THEN t.pseudo_table_name ELSE t.table_name END, 108)
+                         ELSE NULL END,
+                    0,
+                    CASE WHEN @obfuscate = 1 THEN t.pseudo_command_text ELSE t.command_text END,
+                    el.action,
+                    el.start_time,
+                    el.end_time,
+                    NULL,
+                    el.error_message,
+                    (
+                        SELECT @Version AS Version, @RunID AS RunID, el.target_id AS TargetId
+                        FOR XML RAW(N'ExtendedInfo'), ELEMENTS
+                    )
+                FROM #ExecLog AS el
+                JOIN #Targets AS t ON t.target_id = el.target_id
+                WHERE el.error_message = N'SKIPPED: DATABASE_STOP_REMAINDER (a prior database-level safety condition stopped this scan).';
+            END
+        END
+
+        /*
         #187: durable per-target disposition stream.
 
         Emitted here, once, from #ExecLog -- deliberately NOT at each disposition
