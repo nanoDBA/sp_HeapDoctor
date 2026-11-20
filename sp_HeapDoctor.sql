@@ -7084,6 +7084,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
                          ELSE @full END,
                     @action, SYSDATETIME(), SYSDATETIME(), NULL, N'SKIPPED: Object no longer exists.');
+                IF @HeapsInParallel = N'Y'
+                BEGIN
+                    UPDATE qhr
+                    SET qhr.TableEndTime = SYSDATETIME(),
+                        qhr.Status = N'SKIPPED',
+                        qhr.ErrorMessage = LEFT((SELECT TOP (1) error_message FROM #ExecLog AS el WHERE el.target_id = @tid ORDER BY el.start_time DESC), 2000)
+                    FROM dbo.QueueHeapRebuild AS qhr
+                    WHERE qhr.QueueID = @queue_id AND qhr.DatabaseName = @db
+                      AND qhr.SchemaName = @schema AND qhr.TableName = @tbl;
+                END
                 CONTINUE;
             END
 
@@ -7108,6 +7118,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          THEN QUOTENAME(@pseudo_db) + N'.' + QUOTENAME(@pseudo_schema) + N'.' + QUOTENAME(@pseudo_tbl)
                          ELSE @full END,
                     @action, SYSDATETIME(), SYSDATETIME(), NULL, N'SKIPPED: DATABASE_READONLY (AG failover suspected)');
+                IF @HeapsInParallel = N'Y'
+                BEGIN
+                    UPDATE qhr
+                    SET qhr.TableEndTime = SYSDATETIME(),
+                        qhr.Status = N'SKIPPED',
+                        qhr.ErrorMessage = LEFT((SELECT TOP (1) error_message FROM #ExecLog AS el WHERE el.target_id = @tid ORDER BY el.start_time DESC), 2000)
+                    FROM dbo.QueueHeapRebuild AS qhr
+                    WHERE qhr.QueueID = @queue_id AND qhr.DatabaseName = @db
+                      AND qhr.SchemaName = @schema AND qhr.TableName = @tbl;
+                END
                 CONTINUE;
             END
 
@@ -7302,6 +7322,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                             )
                         );
                     END
+                    IF @HeapsInParallel = N'Y'
+                    BEGIN
+                        UPDATE qhr
+                        SET qhr.TableEndTime = SYSDATETIME(),
+                            qhr.Status = N'SKIPPED',
+                            qhr.ErrorMessage = LEFT((SELECT TOP (1) error_message FROM #ExecLog AS el WHERE el.target_id = @tid ORDER BY el.start_time DESC), 2000)
+                        FROM dbo.QueueHeapRebuild AS qhr
+                        WHERE qhr.QueueID = @queue_id AND qhr.DatabaseName = @db
+                          AND qhr.SchemaName = @schema AND qhr.TableName = @tbl;
+                    END
                     CONTINUE;
                 END
             END
@@ -7389,6 +7419,17 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                         )
                     FROM #Targets
                     WHERE sort_order >= @cur_sort;
+                END
+
+                IF @HeapsInParallel = N'Y'
+                BEGIN
+                    UPDATE qhr
+                    SET qhr.TableEndTime = SYSDATETIME(),
+                        qhr.Status = N'SKIPPED',
+                        qhr.ErrorMessage = LEFT((SELECT TOP (1) error_message FROM #ExecLog AS el WHERE el.target_id = @tid ORDER BY el.start_time DESC), 2000)
+                    FROM dbo.QueueHeapRebuild AS qhr
+                    WHERE qhr.QueueID = @queue_id AND qhr.DatabaseName = @db
+                      AND qhr.SchemaName = @schema AND qhr.TableName = @tbl;
                 END
 
                 BREAK;
@@ -7604,6 +7645,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                          ELSE @full END,
                     @action, SYSDATETIME(), SYSDATETIME(), NULL,
                     N'SKIPPED: REPLICATION_PUBLISHED (use @AllowReplicationRebuild=1)');
+                IF @HeapsInParallel = N'Y'
+                BEGIN
+                    UPDATE qhr
+                    SET qhr.TableEndTime = SYSDATETIME(),
+                        qhr.Status = N'SKIPPED',
+                        qhr.ErrorMessage = LEFT((SELECT TOP (1) error_message FROM #ExecLog AS el WHERE el.target_id = @tid ORDER BY el.start_time DESC), 2000)
+                    FROM dbo.QueueHeapRebuild AS qhr
+                    WHERE qhr.QueueID = @queue_id AND qhr.DatabaseName = @db
+                      AND qhr.SchemaName = @schema AND qhr.TableName = @tbl;
+                END
                 CONTINUE;
             END
 
@@ -7765,6 +7816,16 @@ WHERE ' + QUOTENAME(@QuickiePlanIdColumn) + N' IS NOT NULL;
                              ELSE @full END,
                         @action, SYSDATETIME(), SYSDATETIME(), NULL,
                         N'SKIPPED: SYSTEM_VERSIONING_DISABLE_FAILED');
+                    IF @HeapsInParallel = N'Y'
+                    BEGIN
+                        UPDATE qhr
+                        SET qhr.TableEndTime = SYSDATETIME(),
+                            qhr.Status = N'SKIPPED',
+                            qhr.ErrorMessage = LEFT((SELECT TOP (1) error_message FROM #ExecLog AS el WHERE el.target_id = @tid ORDER BY el.start_time DESC), 2000)
+                        FROM dbo.QueueHeapRebuild AS qhr
+                        WHERE qhr.QueueID = @queue_id AND qhr.DatabaseName = @db
+                          AND qhr.SchemaName = @schema AND qhr.TableName = @tbl;
+                    END
                     CONTINUE;
                 END CATCH
             END
