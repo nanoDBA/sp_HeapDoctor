@@ -736,7 +736,7 @@ CREATE OR ALTER PROCEDURE dbo.sp_HeapDoctor
 
     /* CPU source */
     @CpuSource               varchar(20)    = 'QUERY_STORE', /* QUERY_STORE | QUICKIESTORE | NONE */
-    @QuickieExecSql          nvarchar(max)  = NULL, /* EXEC statement for a procedure with describable result metadata */
+    @QuickieExecSql          nvarchar(max)  = NULL, /* procedure call text when result metadata can be described */
     @QuickiePlanIdColumn     sysname        = N'plan_id', /* column name in Quickie output */
     @QuickieCpuUsColumn      sysname        = N'avg_cpu_time', /* CPU column in describable output; see @QuickieCpuUnit */
     @QuickieCpuUnit          varchar(10)    = 'us', /* us | ms  (unit of @QuickieCpuUsColumn) */
